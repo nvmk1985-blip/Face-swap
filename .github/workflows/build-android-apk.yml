@@ -65,14 +65,38 @@ jobs:
       - name: Build Debug Mobile APK
         run: gradle :app:assembleDebug --no-daemon --stacktrace
 
-      - name: Verify APK Output
+      - name: Prepare FaceSwap-Studio.apk
         run: |
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
+          cp app/build/outputs/apk/debug/app-debug.apk FaceSwap-Studio.apk
+          ls -lh FaceSwap-Studio.apk
 
       - name: Upload Mobile APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: FaceSwap-Studio-Mobile-APK
-          path: app/build/outputs/apk/debug/app-debug.apk
+          path: FaceSwap-Studio.apk
           if-no-files-found: error
           retention-days: 30
+
+      - name: Publish Direct APK to GitHub Releases (One-Click Mobile Download)
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git tag -f latest-apk
+          git push origin -f latest-apk
+          if gh release view latest-apk >/dev/null 2>&1; then
+            gh release upload latest-apk FaceSwap-Studio.apk --clobber
+          else
+            gh release create latest-apk FaceSwap-Studio.apk \
+              --title "FaceSwap Studio Mobile APK (Latest Build)" \
+              --notes "Direct installable Android APK for FaceSwap Studio (Offline Face Swap + GHOST Head Replacement)."
+          fi
+          DIRECT_URL="https://github.com/${GITHUB_REPOSITORY}/releases/download/latest-apk/FaceSwap-Studio.apk"
+          echo "=================================================================="
+          echo "DIRECT MOBILE APK DOWNLOAD LINK:"
+          echo "$DIRECT_URL"
+          echo "=================================================================="
+          echo "## 📱 Download FaceSwap Studio Android APK" >> $GITHUB_STEP_SUMMARY
+          echo "👉 **[⬇️ Click Here to Download FaceSwap-Studio.apk Directly]($DIRECT_URL)**" >> $GITHUB_STEP_SUMMARY
