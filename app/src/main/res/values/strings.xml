@@ -1,0 +1,23 @@
+<resources>
+    <string name="app_name">FaceSwap Studio</string>
+    <string name="subtitle_offline_engine">100% Offline Face Swap &amp; GHOST Head Replacement</string>
+    <string name="tab_studio">Swap Studio</string>
+    <string name="tab_models">Model Status</string>
+    <string name="tab_history">History &amp; Audit</string>
+    <string name="tab_ethics">Safety &amp; Licenses</string>
+    <string name="mode_face_swap">Face Swap</string>
+    <string name="mode_head_replacement">Head Replacement</string>
+    <string name="btn_select_source">Select Photo</string>
+    <string name="btn_select_target">Select Photo</string>
+    <string name="btn_detect_head">Detect Head</string>
+    <string name="btn_preview_head">Preview</string>
+    <string name="btn_replace_head">REPLACE HEAD</string>
+    <string name="btn_run_swap">Run Offline Face Swap</string>
+    <string name="btn_before_after">Before / After</string>
+    <string name="btn_save_gallery">Save Image</string>
+    <string name="btn_import_onnx">Import .onnx File</string>
+    <string name="consent_checkbox_label">I confirm I have explicit consent from all depicted individuals and will not create deceptive or non-consensual imagery.</string>
+    <string name="watermark_checkbox_label">Add ethical AI provenance badge to saved output</string>
+    <string name="color_transfer_checkbox_label">Apply LAB skin-tone &amp; lighting harmonization</string>
+    <string name="multi_face_mode_label">Replace All Detected Target Faces / Heads</string>
+</resources>

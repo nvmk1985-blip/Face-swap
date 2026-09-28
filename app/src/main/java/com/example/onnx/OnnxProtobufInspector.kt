@@ -1,0 +1,816 @@
+package com.example.onnx
+
+import ai.onnxruntime.NodeInfo
+import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
+import ai.onnxruntime.TensorInfo
+import android.content.Context
+import android.net.Uri
+import java.io.BufferedInputStream
+import java.io.File
+import java.io.FileInputStream
+import java.io.FileOutputStream
+import java.io.InputStream
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.security.MessageDigest
+
+enum class ModelRequirementLevel(val label: String) {
+    REQUIRED_CORE("Required (Core)"),
+    REQUIRED_IDENTITY("Required for Full Identity"),
+    OPTIONAL_HEAD_SWAP("Optional (Has Built-In CV Fallback)")
+}
+
+enum class ModelSlot(
+    val id: String,
+    val subdirectory: String,
+    val canonicalFileName: String,
+    val displayName: String,
+    val categoryTitle: String,
+    val approximateSizeLabel: String,
+    val requirementLevel: ModelRequirementLevel,
+    val roleSummary: String,
+    val expectedInputSignature: String,
+    val expectedOutputSignature: String,
+    val licenseSummary: String,
+    val downloadSourceUrl: String
+) {
+    DETECTOR(
+        id = "det_10g",
+        subdirectory = "face_swap",
+        canonicalFileName = "det_10g.onnx",
+        displayName = "det_10g.onnx (SCRFD-10G_KPS)",
+        categoryTitle = "models/face_swap/",
+        approximateSizeLabel = "~16.9 MB",
+        requirementLevel = ModelRequirementLevel.REQUIRED_CORE,
+        roleSummary = "Required for both Mode 1 (Face Swap) and Mode 2 (Full Head Replacement). Detects faces, head pose, and 5-point landmarks across strides 8, 16, and 32.",
+        expectedInputSignature = "input.1: FLOAT[1, 3, 640, 640] (RGB normalized (px - 127.5) / 128.0)",
+        expectedOutputSignature = "9 Tensors -> Scores: [12800,1], [3200,1], [800,1] | BBoxes: [12800,4], [3200,4], [800,4] | 5-Pt Landmarks: [12800,10], [3200,10], [800,10]",
+        licenseSummary = "InsightFace Model Zoo — Non-Commercial Research Only",
+        downloadSourceUrl = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip (det_10g.onnx)"
+    ),
+    RECOGNIZER(
+        id = "w600k_r50",
+        subdirectory = "face_swap",
+        canonicalFileName = "w600k_r50.onnx",
+        displayName = "w600k_r50.onnx (ArcFace IResNet50)",
+        categoryTitle = "models/face_swap/",
+        approximateSizeLabel = "~166 MB",
+        requirementLevel = ModelRequirementLevel.REQUIRED_IDENTITY,
+        roleSummary = "Android ONNX equivalent of GHOST 2.0's backbone50_1.pth. Extracts the 512-D ArcFace identity vector from a 112x112 aligned source face.",
+        expectedInputSignature = "input.1: FLOAT[1, 3, 112, 112] (RGB normalized (px - 127.5) / 127.5)",
+        expectedOutputSignature = "683 (embedding): FLOAT[1, 512] (512-D ArcFace identity vector)",
+        licenseSummary = "InsightFace Buffalo_L / WebFace600K — Non-Commercial Research Only",
+        downloadSourceUrl = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip (w600k_r50.onnx)"
+    ),
+    SWAPPER(
+        id = "inswapper_128",
+        subdirectory = "face_swap",
+        canonicalFileName = "inswapper_128.onnx",
+        displayName = "inswapper_128.onnx (InSwapper Generator)",
+        categoryTitle = "models/face_swap/",
+        approximateSizeLabel = "~529 MB",
+        requirementLevel = ModelRequirementLevel.REQUIRED_CORE,
+        roleSummary = "Synthesizes a 128x128 swapped face from an aligned 128x128 target crop and a 512-D source latent vector transformed by the embedded 512x512 emap matrix.",
+        expectedInputSignature = "target: FLOAT[1, 3, 128, 128] (RGB in [0.0, 1.0]) + source: FLOAT[1, 512]",
+        expectedOutputSignature = "output: FLOAT[1, 3, 128, 128] (Swapped 128x128 RGB face in [0.0, 1.0])",
+        licenseSummary = "InsightFace Model Zoo — Strict Non-Commercial Research Only",
+        downloadSourceUrl = "https://github.com/deepinsight/insightface/releases/download/model-zoo/inswapper_128.onnx"
+    ),
+    SEGMENTATION(
+        id = "segformer_b5_ce",
+        subdirectory = "segmentation",
+        canonicalFileName = "segformer_B5_ce.onnx",
+        displayName = "segformer_B5_ce.onnx (GHOST 2.0 Head/Hair Parser)",
+        categoryTitle = "models/segmentation/",
+        approximateSizeLabel = "~325 MB (or ~50 MB BiSeNet)",
+        requirementLevel = ModelRequirementLevel.OPTIONAL_HEAD_SWAP,
+        roleSummary = "Official GHOST 2.0 ONNX semantic parser separating face skin, hair, ears, hat, and neck from clothing and background. Falls back to built-in Chromatic-Geodesic Head/Hair/Neck Parser if absent.",
+        expectedInputSignature = "input: FLOAT[1, 3, 512, 512] (ImageNet normalized RGB)",
+        expectedOutputSignature = "logits: FLOAT[1, 19, 512, 512] (or [1, 19, 128, 128] semantic classes)",
+        licenseSummary = "NVIDIA SegFormer / GHOST 2.0 — Non-Commercial Research Only",
+        downloadSourceUrl = "https://github.com/start-life/ghost-2.0 (pretrained/segformer_B5_ce.onnx)"
+    ),
+    MATTING(
+        id = "modnet_matting",
+        subdirectory = "matting",
+        canonicalFileName = "modnet.onnx",
+        displayName = "modnet.onnx (Android Portrait Hair Alpha Matting)",
+        categoryTitle = "models/matting/",
+        approximateSizeLabel = "~25 MB",
+        requirementLevel = ModelRequirementLevel.OPTIONAL_HEAD_SWAP,
+        roleSummary = "ONNX replacement for GHOST 2.0's PyTorch stylematte_synth.pth. Computes fine hair-strand alpha mattes at 512x512. Falls back to built-in Joint Bilateral Guided Hair Matting if absent.",
+        expectedInputSignature = "input: FLOAT[1, 3, 512, 512] (RGB normalized (px - 127.5) / 127.5)",
+        expectedOutputSignature = "output: FLOAT[1, 1, 512, 512] (Alpha matte in [0.0, 1.0])",
+        licenseSummary = "Apache-2.0 License (MODNet)",
+        downloadSourceUrl = "https://github.com/ZHKKKe/MODNet (modnet_photographic_portrait_matting.onnx)"
+    ),
+    INPAINTING(
+        id = "lama_inpaint",
+        subdirectory = "inpainting",
+        canonicalFileName = "lama_fp32.onnx",
+        displayName = "lama_fp32.onnx (Background-Gap Inpainting)",
+        categoryTitle = "models/inpainting/",
+        approximateSizeLabel = "~205 MB",
+        requirementLevel = ModelRequirementLevel.OPTIONAL_HEAD_SWAP,
+        roleSummary = "ONNX equivalent of GHOST 2.0's big-lama.pt. Fills disoccluded background gaps when target hair/ears are larger than source hair. Falls back to built-in Multi-Scale Boundary Marching Inpainter if absent.",
+        expectedInputSignature = "image: FLOAT[1, 3, 512, 512] + mask: FLOAT[1, 1, 512, 512]",
+        expectedOutputSignature = "output: FLOAT[1, 3, 512, 512] (Inpainted background)",
+        licenseSummary = "Apache-2.0 License (Samsung AI Center LaMa)",
+        downloadSourceUrl = "https://huggingface.co/Carve/LaMa-ONNX/resolve/main/lama_fp32.onnx"
+    ),
+    ENHANCEMENT(
+        id = "gfpgan_enhance",
+        subdirectory = "enhancement",
+        canonicalFileName = "gfpgan_1.4.onnx",
+        displayName = "gfpgan_1.4.onnx (Optional Face & Hair Restoration)",
+        categoryTitle = "models/enhancement/",
+        approximateSizeLabel = "~340 MB",
+        requirementLevel = ModelRequirementLevel.OPTIONAL_HEAD_SWAP,
+        roleSummary = "Optional 512x512 facial detail enhancer after head replacement. Falls back to built-in Tiled Luminance Micro-Contrast & Detail Enhancer if absent.",
+        expectedInputSignature = "input: FLOAT[1, 3, 512, 512] (RGB normalized [-1, 1])",
+        expectedOutputSignature = "output: FLOAT[1, 3, 512, 512] (Restored RGB [-1, 1])",
+        licenseSummary = "Apache-2.0 License (Tencent ARC GFPGAN)",
+        downloadSourceUrl = "https://github.com/TencentARC/GFPGAN"
+    )
+}
+
+data class GhostComponentFeasibility(
+    val componentName: String,
+    val purpose: String,
+    val framework: String,
+    val inputOutputSpec: String,
+    val approxSize: String,
+    val license: String,
+    val runsDirectlyInAndroidOrt: Boolean,
+    val conversionAndReplacementStatus: String,
+    val expectedRam: String,
+    val hardwareCompatibility: String
+)
+
+data class TensorDescriptor(
+    val name: String,
+    val elementType: String,
+    val shape: List<Long>
+) {
+    fun formattedShape(): String = shape.joinToString(prefix = "[", postfix = "]") {
+        if (it < 0) "dynamic" else it.toString()
+    }
+}
+
+data class OnnxModelInspection(
+    val slot: ModelSlot,
+    val isPresent: Boolean,
+    val isValidOnnx: Boolean,
+    val filePath: String?,
+    val fileSizeBytes: Long,
+    val sha256Prefix: String?,
+    val irVersion: Long?,
+    val producerName: String?,
+    val opsetVersion: Long?,
+    val runtimeInputs: List<TensorDescriptor>,
+    val runtimeOutputs: List<TensorDescriptor>,
+    val hasEmbeddedEmap512x512: Boolean,
+    val verificationNote: String
+)
+
+object OnnxProtobufInspector {
+
+    private const val MODELS_ROOT_DIR = "models"
+    private const val EMAP_CACHE_FILE = "inswapper_emap_512x512.bin"
+    private const val EMAP_FLOATS = 512 * 512
+    private const val EMAP_BYTES = EMAP_FLOATS * 4
+
+    private val SUBDIRECTORIES = listOf(
+        "face_swap",
+        "head_swap",
+        "segmentation",
+        "matting",
+        "inpainting",
+        "enhancement"
+    )
+
+    /**
+     * Complete engineering feasibility matrix for official `start-life/ghost-2.0` components on Android.
+     */
+    val GHOST_2_FEASIBILITY_MATRIX: List<GhostComponentFeasibility> = listOf(
+        GhostComponentFeasibility(
+            componentName = "aligner_1020_gaze_final.ckpt",
+            purpose = "GHOST 2.0 Aligner: Reenacts source head/hair onto target 3D FLAME pose, expression & gaze.",
+            framework = "PyTorch Lightning (.ckpt) + PyTorch3D / Nvdiffrast C++/CUDA mesh renderer",
+            inputOutputSpec = "Source RGB + Target Driver + 3D FLAME UV/Normal meshes -> Aligned Head [1, 3, 512, 512]",
+            approxSize = "~1.15 GB",
+            license = "Non-Commercial Research Only (FLAME / EMOCA / InsightFace)",
+            runsDirectlyInAndroidOrt = false,
+            conversionAndReplacementStatus = "NOT directly runnable or trivial to export to ONNX due to custom PyTorch3D differentiable mesh rasterization ops. Replaced on Android by SCRFD 5-Point Cranial-Neck Pose Warp + InSwapper-128 Facial Reenactment.",
+            expectedRam = "~3.5 - 5.0 GB (Desktop GPU)",
+            hardwareCompatibility = "Desktop CUDA GPU; incompatible with Android NNAPI/NPU."
+        ),
+        GhostComponentFeasibility(
+            componentName = "blender_lama.ckpt",
+            purpose = "GHOST 2.0 Blender: Fuses aligned source head/hair into inpainted target background and adapts color/lighting.",
+            framework = "PyTorch Lightning (.ckpt) with Fast Fourier Convolutions (FFC)",
+            inputOutputSpec = "Aligned Head [1,3,512,512] + Inpainted Bg [1,3,512,512] + Masks -> Output [1,3,512,512]",
+            approxSize = "~680 MB",
+            license = "Non-Commercial Research Only",
+            runsDirectlyInAndroidOrt = false,
+            conversionAndReplacementStatus = "PyTorch .ckpt cannot run directly in ONNX Runtime. FFC uses 2D rFFT/irFFT ops unsupported by mobile GPU/NPU delegates. Replaced on Android by Multi-Region LAB Illumination/Skin Harmonization + Feathered Cranial-Neck Alpha Compositing.",
+            expectedRam = "~2.2 - 2.8 GB",
+            hardwareCompatibility = "CPU-only if exported with Opset 17 DFT; replaced by fast native CPU/SIMD blender."
+        ),
+        GhostComponentFeasibility(
+            componentName = "backbone50_1.pth",
+            purpose = "ArcFace IResNet-50 identity embedding extractor used to preserve source face identity.",
+            framework = "PyTorch (.pth state_dict)",
+            inputOutputSpec = "Input: FLOAT[1, 3, 112, 112] -> Output: FLOAT[1, 512]",
+            approxSize = "~166 MB",
+            license = "InsightFace Non-Commercial Research Only",
+            runsDirectlyInAndroidOrt = false,
+            conversionAndReplacementStatus = "YES via ONNX equivalent: w600k_r50.onnx (InsightFace Buffalo_L) runs natively in ONNX Runtime Mobile.",
+            expectedRam = "~350 MB",
+            hardwareCompatibility = "Android CPU, XNNPACK, GPU, and NNAPI supported."
+        ),
+        GhostComponentFeasibility(
+            componentName = "segformer_B5_ce.onnx",
+            purpose = "Semantic segmentation of 19 CelebAMask-HQ classes (face skin, hair, ears, neck, hat, cloth, background).",
+            framework = "ONNX (.onnx native graph)",
+            inputOutputSpec = "Input: FLOAT[1, 3, 512, 512] -> Output: FLOAT[1, 19, 512, 512] (or [1, 19, 128, 128])",
+            approxSize = "~325 MB",
+            license = "NVIDIA SegFormer Non-Commercial Research License",
+            runsDirectlyInAndroidOrt = true,
+            conversionAndReplacementStatus = "RUNS DIRECTLY in ONNX Runtime Mobile on Android! Supported as a drop-in model in models/segmentation/segformer_B5_ce.onnx (with built-in Chromatic-Geodesic Head/Hair/Neck Parser fallback).",
+            expectedRam = "~850 MB peak",
+            hardwareCompatibility = "Android CPU / XNNPACK (Attention ops fallback to CPU on NNAPI)."
+        ),
+        GhostComponentFeasibility(
+            componentName = "stylematte_synth.pth",
+            purpose = "High-precision hair-strand alpha matting around the head silhouette.",
+            framework = "PyTorch (.pth checkpoint)",
+            inputOutputSpec = "Image [1, 3, 512, 512] + Coarse Mask [1, 1, 512, 512] -> Alpha Matte [1, 1, 512, 512]",
+            approxSize = "~110 MB",
+            license = "MIT / Academic License",
+            runsDirectlyInAndroidOrt = false,
+            conversionAndReplacementStatus = "PyTorch .pth cannot run directly in ONNX Runtime. Replaced on Android by drop-in ONNX MODNet (models/matting/modnet.onnx, ~25 MB) + built-in Joint Bilateral Edge-Guided Hair Matting.",
+            expectedRam = "~400 MB",
+            hardwareCompatibility = "Android CPU, GPU, and NNAPI supported via MODNet ONNX."
+        ),
+        GhostComponentFeasibility(
+            componentName = "big-lama.pt",
+            purpose = "Inpainting disoccluded background gaps where the target's original hair/ears extend beyond the new source head.",
+            framework = "TorchScript (.pt JIT archive)",
+            inputOutputSpec = "Image [1, 3, 512, 512] + Gap Mask [1, 1, 512, 512] -> Inpainted Bg [1, 3, 512, 512]",
+            approxSize = "~205 MB",
+            license = "Apache-2.0 License",
+            runsDirectlyInAndroidOrt = false,
+            conversionAndReplacementStatus = "TorchScript .pt cannot run in ONNX Runtime directly, but LaMa ONNX (models/inpainting/lama_fp32.onnx) is supported via ONNX Runtime Mobile, with built-in Multi-Scale Boundary Marching Inpainter fallback.",
+            expectedRam = "~750 MB",
+            hardwareCompatibility = "Android CPU (Opset 17+); built-in inpainter runs in <45ms on CPU."
+        ),
+        GhostComponentFeasibility(
+            componentName = "EMOCA / ResNet50 3DMM Resources",
+            purpose = "3D FLAME morphable face/head parameter regression (shape, expression, jaw/neck pose).",
+            framework = "PyTorch + Pickle (FLAME_generic.pkl + ResNet50)",
+            inputOutputSpec = "Crop [1, 3, 224, 224] -> FLAME shape/exp/pose vectors + 3D mesh vertices",
+            approxSize = "~400 MB",
+            license = "Max Planck Institute FLAME Non-Commercial License",
+            runsDirectlyInAndroidOrt = false,
+            conversionAndReplacementStatus = "Cannot run directly in ONNX Runtime due to Python pickle + PyTorch3D dependencies. Replaced on Android by SCRFD-10G 5-Point Keypoint + Cranial Roll/Yaw/Scale Pose Estimation.",
+            expectedRam = "~900 MB",
+            hardwareCompatibility = "Replaced by lightweight native Kotlin + ONNX SCRFD geometry."
+        )
+    )
+
+    fun getModelsRootDir(context: Context): File {
+        val root = File(context.filesDir, MODELS_ROOT_DIR)
+        if (!root.exists()) root.mkdirs()
+        for (sub in SUBDIRECTORIES) {
+            val subDir = File(root, sub)
+            if (!subDir.exists()) subDir.mkdirs()
+        }
+        return root
+    }
+
+    /**
+     * Backward-compatible helper returning the root models dir while ensuring all structured
+     * subdirectories (`face_swap/`, `head_swap/`, `segmentation/`, `matting/`, `inpainting/`, `enhancement/`) exist.
+     */
+    fun getModelsDir(context: Context): File = getModelsRootDir(context)
+
+    /**
+     * Resolves the file location for a given `ModelSlot`. Checks the structured subdirectory first
+     * (`filesDir/models/<subdirectory>/<canonicalFileName>`), and falls back to `filesDir/models/<canonicalFileName>`
+     * so models imported previously remain immediately recognized.
+     */
+    fun resolveModelFile(context: Context, slot: ModelSlot): File {
+        val root = getModelsRootDir(context)
+        val subDirFile = File(File(root, slot.subdirectory), slot.canonicalFileName)
+        if (subDirFile.exists() && subDirFile.length() > 1024L) {
+            return subDirFile
+        }
+        val legacyRootFile = File(root, slot.canonicalFileName)
+        if (legacyRootFile.exists() && legacyRootFile.length() > 1024L) {
+            return legacyRootFile
+        }
+        return subDirFile
+    }
+
+    /**
+     * Creates a configured `OrtSession.SessionOptions` with optional Android NNAPI/GPU hardware
+     * acceleration and automatic CPU fallback, plus memory arena optimization.
+     */
+    fun createOptimizedSessionOptions(
+        preferHardwareAcceleration: Boolean = false,
+        intraOpThreads: Int = 4
+    ): OrtSession.SessionOptions {
+        val opts = OrtSession.SessionOptions()
+        opts.setIntraOpNumThreads(intraOpThreads)
+        opts.setMemoryPatternOptimization(true)
+        opts.setCPUArenaAllocator(true)
+        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        if (preferHardwareAcceleration) {
+            runCatching {
+                opts.addNnapi()
+            }
+        }
+        return opts
+    }
+
+    /**
+     * Copies any .onnx files bundled in APK assets/ (`assets/models/`, `assets/models/<subdir>/`, or `assets/`)
+     * into `filesDir/models/<subdir>/` so ONNX Runtime can memory-map them directly by file path.
+     */
+    fun syncBundledAssetsIfPresent(context: Context) {
+        val root = getModelsRootDir(context)
+        val aliases = mapOf(
+            ModelSlot.DETECTOR to listOf("det_10g.onnx", "scrfd_10g_bnkps.onnx", "det_2.5g.onnx"),
+            ModelSlot.RECOGNIZER to listOf("w600k_r50.onnx", "w600k_mbf.onnx", "arcface.onnx"),
+            ModelSlot.SWAPPER to listOf("inswapper_128.onnx", "inswapper_128_fp16.onnx"),
+            ModelSlot.SEGMENTATION to listOf("segformer_B5_ce.onnx", "bisenet.onnx", "face_parsing.onnx"),
+            ModelSlot.MATTING to listOf("modnet.onnx", "stylematte_synth.onnx"),
+            ModelSlot.INPAINTING to listOf("lama_fp32.onnx", "big-lama.onnx", "lama.onnx"),
+            ModelSlot.ENHANCEMENT to listOf("gfpgan_1.4.onnx", "codeformer.onnx")
+        )
+
+        for ((slot, names) in aliases) {
+            val existing = resolveModelFile(context, slot)
+            if (existing.exists() && existing.length() > 1024L) continue
+
+            val candidateAssetFolders = listOf(
+                "models/${slot.subdirectory}",
+                "models",
+                ""
+            )
+            val destFile = File(File(root, slot.subdirectory), slot.canonicalFileName)
+
+            for (assetFolder in candidateAssetFolders) {
+                val available = try {
+                    context.assets.list(assetFolder)?.toSet() ?: emptySet()
+                } catch (_: Exception) {
+                    emptySet()
+                }
+                val match = names.firstOrNull { it in available }
+                if (match != null) {
+                    val assetPath = if (assetFolder.isEmpty()) match else "$assetFolder/$match"
+                    try {
+                        context.assets.open(assetPath).use { input ->
+                            FileOutputStream(destFile).use { output ->
+                                input.copyTo(output, bufferSize = 64 * 1024)
+                            }
+                        }
+                    } catch (_: Exception) {
+                    }
+                    break
+                }
+            }
+        }
+    }
+
+    /**
+     * Imports an external .onnx file chosen via Android's document picker into `filesDir/models/<subdir>/`.
+     */
+    fun importModelFromUri(context: Context, uri: Uri, slot: ModelSlot): Result<File> {
+        return runCatching {
+            val root = getModelsRootDir(context)
+            val subDir = File(root, slot.subdirectory).apply { if (!exists()) mkdirs() }
+            val destFile = File(subDir, slot.canonicalFileName)
+            val tempFile = File(subDir, "${slot.canonicalFileName}.tmp")
+
+            context.contentResolver.openInputStream(uri)?.use { input ->
+                FileOutputStream(tempFile).use { output ->
+                    input.copyTo(output, bufferSize = 128 * 1024)
+                }
+            } ?: error("Unable to open selected file stream.")
+
+            if (tempFile.length() < 256L) {
+                tempFile.delete()
+                error("Selected file is too small (${tempFile.length()} bytes) to be a valid ONNX model.")
+            }
+
+            if (destFile.exists()) destFile.delete()
+            if (!tempFile.renameTo(destFile)) {
+                tempFile.copyTo(destFile, overwrite = true)
+                tempFile.delete()
+            }
+
+            // Also remove any stale duplicate in root folder to avoid ambiguity
+            val legacyRootFile = File(root, slot.canonicalFileName)
+            if (legacyRootFile.exists() && legacyRootFile.absolutePath != destFile.absolutePath) {
+                legacyRootFile.delete()
+            }
+
+            if (slot == ModelSlot.SWAPPER) {
+                File(root, EMAP_CACHE_FILE).delete()
+            }
+            destFile
+        }
+    }
+
+    fun inspectAllModels(context: Context, ortEnv: OrtEnvironment): List<OnnxModelInspection> {
+        syncBundledAssetsIfPresent(context)
+        return ModelSlot.entries.map { slot ->
+            inspectSlot(context, ortEnv, slot)
+        }
+    }
+
+    fun inspectSlot(context: Context, ortEnv: OrtEnvironment, slot: ModelSlot): OnnxModelInspection {
+        val file = resolveModelFile(context, slot)
+        if (!file.exists() || file.length() == 0L) {
+            val missingNote = when (slot) {
+                ModelSlot.RECOGNIZER ->
+                    "Missing ${slot.canonicalFileName} in ${slot.categoryTitle}. Required to extract 512-D ArcFace identity vectors for inswapper_128.onnx."
+                ModelSlot.DETECTOR, ModelSlot.SWAPPER ->
+                    "Missing required file ${slot.canonicalFileName} in ${slot.categoryTitle}. Tap 'Import .onnx' to load from device storage."
+                else ->
+                    "Optional ONNX enhancement (${slot.canonicalFileName} in ${slot.categoryTitle}) not installed. Built-in Android CV fallback will be used automatically."
+            }
+            return OnnxModelInspection(
+                slot = slot,
+                isPresent = false,
+                isValidOnnx = false,
+                filePath = null,
+                fileSizeBytes = 0L,
+                sha256Prefix = null,
+                irVersion = null,
+                producerName = null,
+                opsetVersion = null,
+                runtimeInputs = emptyList(),
+                runtimeOutputs = emptyList(),
+                hasEmbeddedEmap512x512 = false,
+                verificationNote = missingNote
+            )
+        }
+
+        val headerMeta = parseProtobufHeaderMetadata(file)
+        val shaPrefix = computeQuickSha256Prefix(file)
+
+        var runtimeInputs = emptyList<TensorDescriptor>()
+        var runtimeOutputs = emptyList<TensorDescriptor>()
+        var ortValid = false
+        var ortNote: String
+
+        try {
+            OrtSession.SessionOptions().use { opts ->
+                opts.setIntraOpNumThreads(2)
+                opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+                ortEnv.createSession(file.absolutePath, opts).use { session ->
+                    runtimeInputs = extractDescriptors(session.inputInfo)
+                    runtimeOutputs = extractDescriptors(session.outputInfo)
+                    ortValid = runtimeInputs.isNotEmpty() && runtimeOutputs.isNotEmpty()
+                }
+            }
+            ortNote = "Installed & verified by ONNX Runtime Mobile (${runtimeInputs.size} inputs, ${runtimeOutputs.size} outputs)."
+        } catch (t: Throwable) {
+            ortNote = "ONNX Runtime validation failed: ${t.message ?: t.javaClass.simpleName}"
+        }
+
+        var hasEmap = false
+        if (slot == ModelSlot.SWAPPER && ortValid) {
+            val emap = loadOrExtractInswapperEmap(context, file)
+            hasEmap = emap != null && emap.size == EMAP_FLOATS
+            if (hasEmap) {
+                ortNote += " Extracted [512, 512] emap latent matrix."
+            }
+        }
+
+        return OnnxModelInspection(
+            slot = slot,
+            isPresent = true,
+            isValidOnnx = ortValid,
+            filePath = file.absolutePath,
+            fileSizeBytes = file.length(),
+            sha256Prefix = shaPrefix,
+            irVersion = headerMeta.irVersion,
+            producerName = headerMeta.producerName,
+            opsetVersion = headerMeta.opsetVersion,
+            runtimeInputs = runtimeInputs,
+            runtimeOutputs = runtimeOutputs,
+            hasEmbeddedEmap512x512 = hasEmap,
+            verificationNote = ortNote
+        )
+    }
+
+    private fun extractDescriptors(infoMap: Map<String, NodeInfo>): List<TensorDescriptor> {
+        return infoMap.map { (name, nodeInfo) ->
+            val info = nodeInfo.info
+            if (info is TensorInfo) {
+                TensorDescriptor(
+                    name = name,
+                    elementType = info.type.name,
+                    shape = info.shape.toList()
+                )
+            } else {
+                TensorDescriptor(
+                    name = name,
+                    elementType = info.javaClass.simpleName,
+                    shape = emptyList()
+                )
+            }
+        }
+    }
+
+    fun loadOrExtractInswapperEmap(context: Context, inswapperFile: File): FloatArray? {
+        val cacheFile = File(getModelsRootDir(context), EMAP_CACHE_FILE)
+        if (cacheFile.exists() && cacheFile.length() == EMAP_BYTES.toLong()) {
+            return runCatching {
+                val bytes = cacheFile.readBytes()
+                val floats = FloatArray(EMAP_FLOATS)
+                ByteBuffer.wrap(bytes).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(floats)
+                floats
+            }.getOrNull()
+        }
+
+        if (!inswapperFile.exists()) return null
+
+        val extracted = runCatching {
+            scanOnnxFor512x512Initializer(inswapperFile)
+        }.getOrNull()
+
+        if (extracted != null && extracted.size == EMAP_FLOATS) {
+            runCatching {
+                val outBytes = ByteBuffer.allocate(EMAP_BYTES).order(ByteOrder.LITTLE_ENDIAN)
+                outBytes.asFloatBuffer().put(extracted)
+                FileOutputStream(cacheFile).use { it.write(outBytes.array()) }
+            }
+        }
+        return extracted
+    }
+
+    private data class HeaderMeta(
+        val irVersion: Long? = null,
+        val producerName: String? = null,
+        val opsetVersion: Long? = null
+    )
+
+    private fun parseProtobufHeaderMetadata(file: File): HeaderMeta {
+        var irVersion: Long? = null
+        var producerName: String? = null
+        var opsetVersion: Long? = null
+
+        runCatching {
+            BufferedInputStream(FileInputStream(file), 64 * 1024).use { input ->
+                val reader = ProtoStreamReader(input, maxBytesToRead = 32 * 1024L)
+                while (!reader.isEof()) {
+                    val tag = reader.readVarint32()
+                    if (tag <= 0) break
+                    val fieldNumber = tag ushr 3
+                    val wireType = tag and 0x07
+                    when (fieldNumber) {
+                        1 -> if (wireType == 0) irVersion = reader.readVarint64() else reader.skipField(wireType)
+                        2 -> if (wireType == 2) producerName = reader.readString() else reader.skipField(wireType)
+                        8 -> if (wireType == 2) {
+                            val len = reader.readVarint32()
+                            val subLimit = reader.bytesRead + len
+                            while (reader.bytesRead < subLimit && !reader.isEof()) {
+                                val subTag = reader.readVarint32()
+                                val subField = subTag ushr 3
+                                val subWire = subTag and 0x07
+                                if (subField == 2 && subWire == 0) {
+                                    opsetVersion = reader.readVarint64()
+                                } else {
+                                    reader.skipField(subWire)
+                                }
+                            }
+                        } else {
+                            reader.skipField(wireType)
+                        }
+                        7 -> break
+                        else -> reader.skipField(wireType)
+                    }
+                }
+            }
+        }
+        return HeaderMeta(irVersion, producerName, opsetVersion)
+    }
+
+    private fun scanOnnxFor512x512Initializer(file: File): FloatArray? {
+        var lastMatch: FloatArray? = null
+        BufferedInputStream(FileInputStream(file), 256 * 1024).use { input ->
+            val reader = ProtoStreamReader(input, maxBytesToRead = file.length())
+            while (!reader.isEof()) {
+                val tag = reader.readVarint32()
+                if (tag <= 0) break
+                val fieldNumber = tag ushr 3
+                val wireType = tag and 0x07
+                if (fieldNumber == 7 && wireType == 2) {
+                    val graphLen = reader.readVarint64()
+                    val graphEnd = reader.bytesRead + graphLen
+                    while (reader.bytesRead < graphEnd && !reader.isEof()) {
+                        val gTag = reader.readVarint32()
+                        if (gTag <= 0) break
+                        val gField = gTag ushr 3
+                        val gWire = gTag and 0x07
+                        if (gField == 5 && gWire == 2) {
+                            val tensorLen = reader.readVarint64()
+                            val candidate = parseTensorIf512x512(reader, tensorLen)
+                            if (candidate != null) {
+                                lastMatch = candidate
+                            }
+                        } else {
+                            reader.skipField(gWire)
+                        }
+                    }
+                } else {
+                    reader.skipField(wireType)
+                }
+            }
+        }
+        return lastMatch
+    }
+
+    private fun parseTensorIf512x512(reader: ProtoStreamReader, tensorLen: Long): FloatArray? {
+        val tensorEnd = reader.bytesRead + tensorLen
+        val dims = mutableListOf<Long>()
+        var dataType = 0
+        var matchedFloats: FloatArray? = null
+
+        while (reader.bytesRead < tensorEnd && !reader.isEof()) {
+            val tag = reader.readVarint32()
+            if (tag <= 0) break
+            val field = tag ushr 3
+            val wire = tag and 0x07
+            when (field) {
+                1 -> {
+                    if (wire == 0) {
+                        dims.add(reader.readVarint64())
+                    } else if (wire == 2) {
+                        val packLen = reader.readVarint32()
+                        val packEnd = reader.bytesRead + packLen
+                        while (reader.bytesRead < packEnd) {
+                            dims.add(reader.readVarint64())
+                        }
+                    } else {
+                        reader.skipField(wire)
+                    }
+                }
+                2 -> {
+                    if (wire == 0) dataType = reader.readVarint32() else reader.skipField(wire)
+                }
+                4 -> {
+                    if (wire == 2) {
+                        val byteLen = reader.readVarint64()
+                        if (dims.size == 2 && dims[0] == 512L && dims[1] == 512L && byteLen == EMAP_BYTES.toLong()) {
+                            val raw = reader.readExactBytes(EMAP_BYTES)
+                            val out = FloatArray(EMAP_FLOATS)
+                            ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(out)
+                            matchedFloats = out
+                        } else {
+                            reader.skipBytes(byteLen)
+                        }
+                    } else {
+                        reader.skipField(wire)
+                    }
+                }
+                9 -> {
+                    if (wire == 2) {
+                        val byteLen = reader.readVarint64()
+                        if ((dims.isEmpty() || (dims.size == 2 && dims[0] == 512L && dims[1] == 512L)) &&
+                            (dataType == 0 || dataType == 1) &&
+                            byteLen == EMAP_BYTES.toLong()
+                        ) {
+                            val raw = reader.readExactBytes(EMAP_BYTES)
+                            val out = FloatArray(EMAP_FLOATS)
+                            ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(out)
+                            matchedFloats = out
+                        } else {
+                            reader.skipBytes(byteLen)
+                        }
+                    } else {
+                        reader.skipField(wire)
+                    }
+                }
+                else -> reader.skipField(wire)
+            }
+        }
+        if (reader.bytesRead < tensorEnd) {
+            reader.skipBytes(tensorEnd - reader.bytesRead)
+        }
+        return if (dims.size == 2 && dims[0] == 512L && dims[1] == 512L) matchedFloats else null
+    }
+
+    private fun computeQuickSha256Prefix(file: File): String {
+        return runCatching {
+            val md = MessageDigest.getInstance("SHA-256")
+            FileInputStream(file).use { fis ->
+                val buf = ByteArray(64 * 1024)
+                var remaining = 1024 * 1024
+                while (remaining > 0) {
+                    val read = fis.read(buf, 0, minOf(buf.size, remaining))
+                    if (read <= 0) break
+                    md.update(buf, 0, read)
+                    remaining -= read
+                }
+            }
+            md.update(file.length().toString().toByteArray())
+            md.digest().take(6).joinToString("") { "%02x".format(it) }
+        }.getOrDefault("unknown")
+    }
+
+    private class ProtoStreamReader(
+        private val input: InputStream,
+        private val maxBytesToRead: Long
+    ) {
+        var bytesRead: Long = 0L
+            private set
+        private var eof = false
+
+        fun isEof(): Boolean = eof || bytesRead >= maxBytesToRead
+
+        fun readByte(): Int {
+            if (isEof()) {
+                eof = true
+                return -1
+            }
+            val b = input.read()
+            if (b == -1) {
+                eof = true
+            } else {
+                bytesRead++
+            }
+            return b
+        }
+
+        fun readVarint32(): Int = readVarint64().toInt()
+
+        fun readVarint64(): Long {
+            var result = 0L
+            var shift = 0
+            while (shift < 64) {
+                val b = readByte()
+                if (b == -1) return -1L
+                result = result or ((b.toLong() and 0x7FL) shl shift)
+                if ((b and 0x80) == 0) return result
+                shift += 7
+            }
+            return result
+        }
+
+        fun readString(): String {
+            val len = readVarint32()
+            if (len <= 0) return ""
+            val bytes = readExactBytes(len)
+            return String(bytes, Charsets.UTF_8)
+        }
+
+        fun readExactBytes(len: Int): ByteArray {
+            val out = ByteArray(len)
+            var offset = 0
+            while (offset < len) {
+                val read = input.read(out, offset, len - offset)
+                if (read <= 0) {
+                    eof = true
+                    break
+                }
+                offset += read
+                bytesRead += read
+            }
+            return out
+        }
+
+        fun skipBytes(count: Long) {
+            var remaining = count
+            while (remaining > 0 && !eof) {
+                val skipped = input.skip(remaining)
+                if (skipped > 0) {
+                    remaining -= skipped
+                    bytesRead += skipped
+                } else {
+                    if (readByte() == -1) break
+                    remaining--
+                }
+            }
+        }
+
+        fun skipField(wireType: Int) {
+            when (wireType) {
+                0 -> readVarint64()
+                1 -> skipBytes(8)
+                2 -> {
+                    val len = readVarint64()
+                    if (len > 0) skipBytes(len)
+                }
+                5 -> skipBytes(4)
+                else -> eof = true
+            }
+        }
+    }
+}

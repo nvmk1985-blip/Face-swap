@@ -1,0 +1,6 @@
+{
+  "name": "FaceSwap Studio",
+  "description": "Fully offline on-device Android Face Swap application powered by ONNX Runtime Mobile (SCRFD det_10g, ArcFace w600k_r50, and InSwapper 128).",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
