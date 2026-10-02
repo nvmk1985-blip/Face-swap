@@ -56,6 +56,7 @@ fun ModelsInspectorTab(
     isInspecting: Boolean,
     onImportModelForSlot: (ModelSlot) -> Unit,
     onRefreshModels: () -> Unit,
+    onImportAllFromFolder: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -89,7 +90,8 @@ fun ModelsInspectorTab(
                     ) {
                         Row(
                             verticalAlignment = Alignment.CenterVertically,
-                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            horizontalArrangement = Arrangement.spacedBy(8.dp),
+                            modifier = Modifier.weight(1f)
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Info,
@@ -116,6 +118,32 @@ fun ModelsInspectorTab(
                             Text("Rescan")
                         }
                     }
+
+                    Button(
+                        onClick = onImportAllFromFolder,
+                        enabled = !isInspecting,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .testTag("import_all_folder_button"),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Folder,
+                            contentDescription = "Auto-Import All from Folder",
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = "1-Tap Auto-Import All .onnx from Folder",
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    Text(
+                        text = "Tip: Put all your .onnx files in one folder (e.g. Downloads) and tap the button above once. The app will load all models at once and remember the folder!",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NeonEmerald
+                    )
 
                     Column(
                         modifier = Modifier

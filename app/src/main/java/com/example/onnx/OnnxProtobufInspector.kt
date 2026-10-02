@@ -335,9 +335,124 @@ object OnnxProtobufInspector {
         return opts
     }
 
+    private const val PREFS_NAME = "onnx_model_folder_prefs"
+    private const val KEY_LINKED_TREE_URI = "linked_tree_uri"
+
+    fun getLinkedModelsFolderUri(context: Context): Uri? {
+        val raw = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .getString(KEY_LINKED_TREE_URI, null)
+        return if (!raw.isNullOrBlank()) runCatching { Uri.parse(raw) }.getOrNull() else null
+    }
+
+    fun saveLinkedModelsFolderUri(context: Context, treeUri: Uri) {
+        runCatching {
+            context.contentResolver.takePersistableUriPermission(
+                treeUri,
+                android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+            )
+        }
+        context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_LINKED_TREE_URI, treeUri.toString())
+            .apply()
+    }
+
+    fun matchSlotForFileName(fileName: String): ModelSlot? {
+        val lower = fileName.trim().lowercase()
+        if (!lower.endsWith(".onnx")) return null
+        return when {
+            lower.contains("det_10g") || lower.contains("scrfd") || lower.contains("det_2.5g") ->
+                ModelSlot.DETECTOR
+            lower.contains("w600k") || lower.contains("arcface") || lower.contains("backbone50") ->
+                ModelSlot.RECOGNIZER
+            lower.contains("inswapper") ->
+                ModelSlot.SWAPPER
+            lower.contains("segformer") || lower.contains("bisenet") || lower.contains("face_parsing") ->
+                ModelSlot.SEGMENTATION
+            lower.contains("modnet") || lower.contains("stylematte") ->
+                ModelSlot.MATTING
+            lower.contains("lama") ->
+                ModelSlot.INPAINTING
+            lower.contains("gfpgan") || lower.contains("codeformer") ->
+                ModelSlot.ENHANCEMENT
+            else -> null
+        }
+    }
+
+    /**
+     * Scans a user-selected directory (SAF DocumentTree Uri) for all `.onnx` model files,
+     * automatically matching and importing all of them in a single tap, and remembering
+     * the folder URI for future launches.
+     */
+    fun importAllModelsFromTreeUri(
+        context: Context,
+        treeUri: Uri,
+        onlyMissing: Boolean = false
+    ): Result<List<ModelSlot>> {
+        return runCatching {
+            saveLinkedModelsFolderUri(context, treeUri)
+            val importedSlots = mutableListOf<ModelSlot>()
+            val resolver = context.contentResolver
+            val rootDocId = android.provider.DocumentsContract.getTreeDocumentId(treeUri)
+
+            fun scanDocumentDirectory(parentDocId: String, depth: Int) {
+                if (depth > 2) return
+                val childrenUri = android.provider.DocumentsContract.buildChildDocumentsUriUsingTree(
+                    treeUri,
+                    parentDocId
+                )
+                val projection = arrayOf(
+                    android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE
+                )
+                resolver.query(childrenUri, projection, null, null, null)?.use { cursor ->
+                    val idIdx = cursor.getColumnIndex(
+                        android.provider.DocumentsContract.Document.COLUMN_DOCUMENT_ID
+                    )
+                    val nameIdx = cursor.getColumnIndex(
+                        android.provider.DocumentsContract.Document.COLUMN_DISPLAY_NAME
+                    )
+                    val mimeIdx = cursor.getColumnIndex(
+                        android.provider.DocumentsContract.Document.COLUMN_MIME_TYPE
+                    )
+                    while (cursor.moveToNext()) {
+                        val docId = if (idIdx >= 0) cursor.getString(idIdx) else continue
+                        val displayName = if (nameIdx >= 0) cursor.getString(nameIdx).orEmpty() else ""
+                        val mimeType = if (mimeIdx >= 0) cursor.getString(mimeIdx).orEmpty() else ""
+
+                        if (mimeType == android.provider.DocumentsContract.Document.MIME_TYPE_DIR) {
+                            scanDocumentDirectory(docId, depth + 1)
+                        } else {
+                            val matchedSlot = matchSlotForFileName(displayName)
+                            if (matchedSlot != null && matchedSlot !in importedSlots) {
+                                val existing = resolveModelFile(context, matchedSlot)
+                                if (onlyMissing && existing.exists() && existing.length() > 1024L) {
+                                    continue
+                                }
+                                val docUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(
+                                    treeUri,
+                                    docId
+                                )
+                                val importRes = importModelFromUri(context, docUri, matchedSlot)
+                                if (importRes.isSuccess) {
+                                    importedSlots.add(matchedSlot)
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            scanDocumentDirectory(rootDocId, 0)
+            importedSlots
+        }
+    }
+
     /**
      * Copies any .onnx files bundled in APK assets/ (`assets/models/`, `assets/models/<subdir>/`, or `assets/`)
-     * into `filesDir/models/<subdir>/` so ONNX Runtime can memory-map them directly by file path.
+     * OR from a previously linked external folder into `filesDir/models/<subdir>/` so ONNX Runtime can
+     * memory-map them directly by file path.
      */
     fun syncBundledAssetsIfPresent(context: Context) {
         val root = getModelsRootDir(context)
@@ -380,6 +495,42 @@ object OnnxProtobufInspector {
                     } catch (_: Exception) {
                     }
                     break
+                }
+            }
+        }
+
+        // Also check app-specific external storage directory (/Android/data/<pkg>/files/models/)
+        runCatching {
+            val extRoot = context.getExternalFilesDir(null)
+            if (extRoot != null && extRoot.exists()) {
+                val candidateDirs = listOf(extRoot, File(extRoot, "models"))
+                for (dir in candidateDirs) {
+                    dir.walkTopDown().maxDepth(2).forEach { file ->
+                        if (file.isFile && file.length() > 1024L) {
+                            val slot = matchSlotForFileName(file.name)
+                            if (slot != null) {
+                                val existing = resolveModelFile(context, slot)
+                                if (!existing.exists() || existing.length() <= 1024L) {
+                                    val dest = File(File(root, slot.subdirectory), slot.canonicalFileName)
+                                    runCatching { file.copyTo(dest, overwrite = true) }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // Also auto-sync any missing models from the user's linked SAF folder if previously granted
+        val linkedTreeUri = getLinkedModelsFolderUri(context)
+        if (linkedTreeUri != null) {
+            val anyMissing = ModelSlot.entries.any { slot ->
+                val f = resolveModelFile(context, slot)
+                !f.exists() || f.length() <= 1024L
+            }
+            if (anyMissing) {
+                runCatching {
+                    importAllModelsFromTreeUri(context, linkedTreeUri, onlyMissing = true)
                 }
             }
         }

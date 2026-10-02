@@ -156,6 +156,20 @@ fun FaceSwapStudioApp(
         }
     }
 
+    val onnxFolderTreePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocumentTree()
+    ) { treeUri ->
+        if (treeUri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    treeUri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.importAllModelsFromFolder(treeUri)
+        }
+    }
+
     if (uiState.currentTab != AppTab.STUDIO) {
         BackHandler {
             viewModel.selectTab(AppTab.STUDIO)
@@ -330,7 +344,10 @@ fun FaceSwapStudioApp(
                         pendingImportSlot = slot
                         onnxDocumentPicker.launch(arrayOf("*/*"))
                     },
-                    onRefreshModels = viewModel::refreshModelInspections
+                    onRefreshModels = viewModel::refreshModelInspections,
+                    onImportAllFromFolder = {
+                        onnxFolderTreePicker.launch(null)
+                    }
                 )
 
                 AppTab.HISTORY -> HistoryAuditTab(

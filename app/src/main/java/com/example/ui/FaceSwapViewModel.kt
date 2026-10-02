@@ -289,6 +289,63 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         }
     }
 
+    fun importAllModelsFromFolder(treeUri: Uri) {
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isInspectingModels = true,
+                    statusBannerMessage = "Scanning folder & auto-importing all .onnx models...",
+                    errorBannerMessage = null
+                )
+            }
+            val result = withContext(Dispatchers.IO) {
+                OnnxProtobufInspector.importAllModelsFromTreeUri(
+                    context = getApplication(),
+                    treeUri = treeUri,
+                    onlyMissing = false
+                )
+            }
+            result.fold(
+                onSuccess = { importedSlots ->
+                    val inspections = withContext(Dispatchers.IO) {
+                        OnnxProtobufInspector.inspectAllModels(getApplication(), ortEnv)
+                    }
+                    _uiState.update {
+                        it.copy(
+                            modelInspections = inspections,
+                            isInspectingModels = false,
+                            statusBannerMessage = if (importedSlots.isNotEmpty()) {
+                                "Auto-imported ${importedSlots.size} model(s): ${
+                                    importedSlots.joinToString { s -> s.canonicalFileName }
+                                }. Folder linked for automatic startup sync!"
+                            } else {
+                                null
+                            },
+                            errorBannerMessage = if (importedSlots.isEmpty()) {
+                                "No matching .onnx files (det_10g, w600k_r50, inswapper_128, segformer, modnet, lama, gfpgan) found in selected folder."
+                            } else {
+                                null
+                            }
+                        )
+                    }
+                    if (ModelSlot.DETECTOR in importedSlots) {
+                        _uiState.value.sourceBitmap?.let { bmp -> detectFacesForBitmap(bmp, isSource = true) }
+                        _uiState.value.targetBitmap?.let { bmp -> detectFacesForBitmap(bmp, isSource = false) }
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            isInspectingModels = false,
+                            statusBannerMessage = null,
+                            errorBannerMessage = "Folder scan failed: ${err.message}"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
     fun onSourceImageSelected(uri: Uri) {
         viewModelScope.launch {
             _uiState.update {

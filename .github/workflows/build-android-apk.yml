@@ -12,6 +12,10 @@ on:
         description: "APK Build Variant (debug)"
         required: false
         default: "debug"
+      bundle_onnx_models:
+        description: "Pre-bundle ONNX models inside APK assets (true/false)"
+        required: false
+        default: "false"
 
 permissions:
   contents: write
@@ -45,10 +49,13 @@ jobs:
         with:
           gradle-version: "9.3.1"
 
-      - name: Ensure Debug Keystore and .env Exist
+      - name: Ensure Consistent Debug Keystore and .env Exist
         run: |
           if [ ! -f ".env" ] && [ -f ".env.example" ]; then
             cp .env.example .env
+          fi
+          if [ -f "debug.keystore.base64" ]; then
+            base64 -d debug.keystore.base64 > debug.keystore
           fi
           if [ ! -f "debug.keystore" ]; then
             keytool -genkeypair -v \
@@ -62,8 +69,23 @@ jobs:
               -dname "CN=Android Debug,O=Android,C=US"
           fi
 
+      - name: Optionally Bundle Core ONNX Models into APK Assets
+        if: ${{ github.event.inputs.bundle_onnx_models == 'true' }}
+        run: |
+          mkdir -p app/src/main/assets/models/face_swap
+          mkdir -p app/src/main/assets/models/matting
+          echo "Downloading buffalo_l.zip (det_10g.onnx + w600k_r50.onnx)..."
+          curl -L --retry 3 -o /tmp/buffalo_l.zip "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip"
+          unzip -o /tmp/buffalo_l.zip det_10g.onnx w600k_r50.onnx -d app/src/main/assets/models/face_swap/
+          rm -f /tmp/buffalo_l.zip
+          echo "Downloading inswapper_128.onnx..."
+          curl -L --retry 3 -o app/src/main/assets/models/face_swap/inswapper_128.onnx "https://huggingface.co/ezioruan/inswapper_128.onnx/resolve/main/inswapper_128.onnx"
+          echo "Downloading modnet.onnx..."
+          curl -L --retry 3 -o app/src/main/assets/models/matting/modnet.onnx "https://huggingface.co/gradio/modnet/resolve/main/modnet.onnx"
+          ls -lh app/src/main/assets/models/face_swap/ app/src/main/assets/models/matting/
+
       - name: Build Debug Mobile APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: gradle :app:assembleDebug --no-daemon --stacktrace -Dorg.gradle.jvmargs="-Xmx4g"
 
       - name: Prepare FaceSwap-Studio.apk
         run: |
