@@ -95,6 +95,8 @@ fun StudioTab(
     onSaveToGallery: () -> Unit,
     onToggleCompareOriginal: (Boolean) -> Unit,
     onOpenModelsTab: () -> Unit,
+    onBrowseSourceFile: () -> Unit = onPickSourcePhoto,
+    onBrowseTargetFile: () -> Unit = onPickTargetPhoto,
     modifier: Modifier = Modifier
 ) {
     val isHeadMode = uiState.studioMode == StudioMode.HEAD_REPLACEMENT
@@ -135,6 +137,7 @@ fun StudioTab(
                 },
                 buttonLabel = stringResource(R.string.btn_select_source),
                 buttonTestTag = "select_source_photo_button",
+                browseTestTag = "browse_source_file_button",
                 bitmap = uiState.sourceBitmap,
                 faces = uiState.sourceFaces,
                 selectedFaceIndex = uiState.selectedSourceFaceIndex,
@@ -142,6 +145,7 @@ fun StudioTab(
                 showCranialHeadBounds = isHeadMode,
                 isDetecting = uiState.isDetectingSource,
                 onPickPhoto = onPickSourcePhoto,
+                onBrowseFile = onBrowseSourceFile,
                 onSelectFace = onSelectSourceFace,
                 showMultiFaceToggle = false,
                 onToggleMultiFace = {}
@@ -157,6 +161,7 @@ fun StudioTab(
                 },
                 buttonLabel = stringResource(R.string.btn_select_target),
                 buttonTestTag = "select_target_photo_button",
+                browseTestTag = "browse_target_file_button",
                 bitmap = uiState.targetBitmap,
                 faces = uiState.targetFaces,
                 selectedFaceIndex = uiState.selectedTargetFaceIndex,
@@ -164,6 +169,7 @@ fun StudioTab(
                 showCranialHeadBounds = isHeadMode,
                 isDetecting = uiState.isDetectingTarget,
                 onPickPhoto = onPickTargetPhoto,
+                onBrowseFile = onBrowseTargetFile,
                 onSelectFace = onSelectTargetFace,
                 showMultiFaceToggle = uiState.targetFaces.size > 1,
                 onToggleMultiFace = onToggleReplaceAllFaces
@@ -656,6 +662,7 @@ private fun PhotoSelectionCard(
     subtitle: String,
     buttonLabel: String,
     buttonTestTag: String,
+    browseTestTag: String,
     bitmap: android.graphics.Bitmap?,
     faces: List<DetectedFace>,
     selectedFaceIndex: Int,
@@ -663,6 +670,7 @@ private fun PhotoSelectionCard(
     showCranialHeadBounds: Boolean,
     isDetecting: Boolean,
     onPickPhoto: () -> Unit,
+    onBrowseFile: () -> Unit,
     onSelectFace: (Int) -> Unit,
     showMultiFaceToggle: Boolean,
     onToggleMultiFace: (Boolean) -> Unit
@@ -676,12 +684,11 @@ private fun PhotoSelectionCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
-            Row(
+            Column(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(10.dp)
             ) {
-                Column(modifier = Modifier.weight(1f)) {
+                Column(modifier = Modifier.fillMaxWidth()) {
                     Text(
                         text = title,
                         style = MaterialTheme.typography.titleMedium,
@@ -693,19 +700,41 @@ private fun PhotoSelectionCard(
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
                 }
-                Spacer(modifier = Modifier.width(8.dp))
-                OutlinedButton(
-                    onClick = onPickPhoto,
-                    modifier = Modifier.testTag(buttonTestTag),
-                    shape = RoundedCornerShape(10.dp)
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.AddPhotoAlternate,
-                        contentDescription = buttonLabel,
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(text = buttonLabel)
+                    OutlinedButton(
+                        onClick = onPickPhoto,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag(buttonTestTag),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AddPhotoAlternate,
+                            contentDescription = buttonLabel,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = buttonLabel)
+                    }
+                    OutlinedButton(
+                        onClick = onBrowseFile,
+                        modifier = Modifier
+                            .weight(1f)
+                            .testTag(browseTestTag),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.AddPhotoAlternate,
+                            contentDescription = "Browse Files",
+                            modifier = Modifier.size(18.dp),
+                            tint = NeonEmerald
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(text = "Browse Files", color = NeonEmerald)
+                    }
                 }
             }
 

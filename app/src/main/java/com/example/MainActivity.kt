@@ -80,6 +80,7 @@ class MainActivity : ComponentActivity() {
 fun FaceSwapStudioApp(
     viewModel: FaceSwapViewModel = viewModel()
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
     val uiState by viewModel.uiState.collectAsStateWithLifecycle()
     val auditLogs by viewModel.auditLogs.collectAsStateWithLifecycle()
 
@@ -89,6 +90,12 @@ fun FaceSwapStudioApp(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
             viewModel.onSourceImageSelected(uri)
         }
     }
@@ -97,6 +104,40 @@ fun FaceSwapStudioApp(
         contract = ActivityResultContracts.PickVisualMedia()
     ) { uri ->
         if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.onTargetImageSelected(uri)
+        }
+    }
+
+    val sourceFilePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
+            viewModel.onSourceImageSelected(uri)
+        }
+    }
+
+    val targetFilePicker = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.OpenDocument()
+    ) { uri ->
+        if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
             viewModel.onTargetImageSelected(uri)
         }
     }
@@ -105,6 +146,12 @@ fun FaceSwapStudioApp(
         contract = ActivityResultContracts.OpenDocument()
     ) { uri ->
         if (uri != null) {
+            runCatching {
+                context.contentResolver.takePersistableUriPermission(
+                    uri,
+                    android.content.Intent.FLAG_GRANT_READ_URI_PERMISSION
+                )
+            }
             viewModel.importOnnxModel(uri, pendingImportSlot)
         }
     }
@@ -252,6 +299,12 @@ fun FaceSwapStudioApp(
                         targetPhotoPicker.launch(
                             PickVisualMediaRequest(ActivityResultContracts.PickVisualMedia.ImageOnly)
                         )
+                    },
+                    onBrowseSourceFile = {
+                        sourceFilePicker.launch(arrayOf("image/*"))
+                    },
+                    onBrowseTargetFile = {
+                        targetFilePicker.launch(arrayOf("image/*"))
                     },
                     onDetectHead = viewModel::detectHeadsOnLoadedPhotos,
                     onPreviewHead = viewModel::generateHeadReplacementPreview,

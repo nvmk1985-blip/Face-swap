@@ -222,15 +222,14 @@ private fun ModelInspectionCard(
             modifier = Modifier.padding(16.dp),
             verticalArrangement = Arrangement.spacedBy(10.dp)
         ) {
-            Row(
+            Column(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(6.dp)
             ) {
                 Row(
-                    modifier = Modifier.weight(1f),
+                    modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     Icon(
                         imageVector = if (isReady) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
@@ -373,8 +372,10 @@ private fun GhostFeasibilityCard(item: GhostComponentFeasibility) {
                 Text(
                     text = item.componentName,
                     style = MaterialTheme.typography.titleMedium,
-                    color = ElectricCyan
+                    color = ElectricCyan,
+                    modifier = Modifier.weight(1f)
                 )
+                Spacer(modifier = Modifier.width(8.dp))
                 Text(
                     text = if (item.runsDirectlyInAndroidOrt) "ONNX DIRECT: YES" else "PYTORCH CKPT: NO",
                     style = MaterialTheme.typography.labelMedium,
