@@ -305,6 +305,14 @@ fun StudioTab(
                 onLowMemoryChanged = onLowMemoryChanged
             )
 
+            // 3b. Checklist showing exactly what is required to enable the action button
+            if (!uiState.canExecuteSwap && !uiState.isSwapping) {
+                SwapRequirementsCard(
+                    uiState = uiState,
+                    onOpenModelsTab = onOpenModelsTab
+                )
+            }
+
             // 4. Primary Action Button: [ REPLACE HEAD ] or [ Run Offline Face Swap ]
             Button(
                 onClick = onRunSwap,
@@ -1180,3 +1188,154 @@ private fun AlignedCropThumb(
         )
     }
 }
+
+@Composable
+private fun SwapRequirementsCard(
+    uiState: FaceSwapUiState,
+    onOpenModelsTab: () -> Unit
+) {
+    val isHeadMode = uiState.studioMode == StudioMode.HEAD_REPLACEMENT
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(14.dp),
+        colors = CardDefaults.cardColors(
+            containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f)
+        )
+    ) {
+        Column(
+            modifier = Modifier.padding(14.dp),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.WarningAmber,
+                    contentDescription = null,
+                    tint = AmberWarning,
+                    modifier = Modifier.size(18.dp)
+                )
+                Text(
+                    text = if (isHeadMode) {
+                        "Requirements to enable Head Replacement:"
+                    } else {
+                        "Requirements to enable Face Swap button:"
+                    },
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = ElectricCyan
+                )
+            }
+
+            // 1. Source Face requirement
+            val hasSourceFace = uiState.sourceBitmap != null && uiState.sourceFaces.isNotEmpty()
+            RequirementRowItem(
+                isSatisfied = hasSourceFace,
+                text = if (uiState.sourceBitmap == null) {
+                    "1. Select Source Photo (Donor Face)"
+                } else if (uiState.sourceFaces.isEmpty()) {
+                    "1. No face detected in Source Photo (choose a clearer photo)"
+                } else {
+                    "1. Source face detected (${uiState.sourceFaces.size} face found)"
+                }
+            )
+
+            // 2. Target Face requirement
+            val hasTargetFace = uiState.targetBitmap != null && uiState.targetFaces.isNotEmpty()
+            RequirementRowItem(
+                isSatisfied = hasTargetFace,
+                text = if (uiState.targetBitmap == null) {
+                    "2. Select Target Photo (Scene Photo)"
+                } else if (uiState.targetFaces.isEmpty()) {
+                    "2. No face detected in Target Photo (choose a clearer photo)"
+                } else {
+                    "2. Target face detected (${uiState.targetFaces.size} face found)"
+                }
+            )
+
+            // 3. Models requirement (Face Swap mode requires det_10g, inswapper_128, and w600k_r50/fallback)
+            if (!isHeadMode) {
+                RequirementRowItem(
+                    isSatisfied = uiState.isDetectorReady,
+                    text = "det_10g.onnx installed"
+                )
+                RequirementRowItem(
+                    isSatisfied = uiState.isSwapperReady,
+                    text = "inswapper_128.onnx installed",
+                    actionLabel = if (!uiState.isSwapperReady) "Install" else null,
+                    onAction = onOpenModelsTab
+                )
+                val recognizerReady = uiState.isRecognizerReady || uiState.allowTwoModelFallbackForTesting
+                RequirementRowItem(
+                    isSatisfied = recognizerReady,
+                    text = if (uiState.isRecognizerReady) {
+                        "w600k_r50.onnx installed"
+                    } else if (uiState.allowTwoModelFallbackForTesting) {
+                        "2-Model Testing Mode enabled (w600k_r50 bypassed)"
+                    } else {
+                        "w600k_r50.onnx installed (or enable 2-Model Testing switch above)"
+                    },
+                    actionLabel = if (!recognizerReady) "Install" else null,
+                    onAction = onOpenModelsTab
+                )
+            }
+
+            // 4. Consent requirement
+            RequirementRowItem(
+                isSatisfied = uiState.consentConfirmed,
+                text = "Explicit consent confirmed (tick checkbox above)"
+            )
+        }
+    }
+}
+
+@Composable
+private fun RequirementRowItem(
+    isSatisfied: Boolean,
+    text: String,
+    actionLabel: String? = null,
+    onAction: (() -> Unit)? = null
+) {
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.SpaceBetween
+    ) {
+        Row(
+            modifier = Modifier.weight(1f),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            Icon(
+                imageVector = if (isSatisfied) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
+                contentDescription = null,
+                tint = if (isSatisfied) NeonEmerald else AmberWarning,
+                modifier = Modifier.size(16.dp)
+            )
+            Text(
+                text = text,
+                style = MaterialTheme.typography.bodyMedium,
+                color = if (isSatisfied) MaterialTheme.colorScheme.onSurface else AmberWarning
+            )
+        }
+        if (actionLabel != null && onAction != null) {
+            Surface(
+                modifier = Modifier.clickable(onClick = onAction),
+                shape = RoundedCornerShape(6.dp),
+                color = ElectricCyan.copy(alpha = 0.16f)
+            ) {
+                Text(
+                    text = actionLabel,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = ElectricCyan,
+                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
+                    fontWeight = FontWeight.Bold
+                )
+            }
+        }
+    }
+}
+
