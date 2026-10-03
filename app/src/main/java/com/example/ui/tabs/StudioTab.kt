@@ -316,15 +316,19 @@ fun StudioTab(
             // 4. Primary Action Button: [ REPLACE HEAD ] or [ Run Offline Face Swap ]
             Button(
                 onClick = onRunSwap,
-                enabled = uiState.canExecuteSwap,
+                enabled = !uiState.isSwapping,
                 modifier = Modifier
                     .fillMaxWidth()
                     .height(56.dp)
                     .testTag("run_face_swap_button"),
                 shape = RoundedCornerShape(14.dp),
                 colors = ButtonDefaults.buttonColors(
-                    containerColor = if (isHeadMode) NeonEmerald else ElectricCyan,
-                    contentColor = ObsidianBg
+                    containerColor = when {
+                        !uiState.canExecuteSwap -> MaterialTheme.colorScheme.surfaceVariant
+                        isHeadMode -> NeonEmerald
+                        else -> ElectricCyan
+                    },
+                    contentColor = if (!uiState.canExecuteSwap) AmberWarning else ObsidianBg
                 )
             ) {
                 if (uiState.isSwapping) {
@@ -342,6 +346,19 @@ fun StudioTab(
                         },
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold
+                    )
+                } else if (!uiState.canExecuteSwap) {
+                    Icon(
+                        imageVector = Icons.Default.WarningAmber,
+                        contentDescription = null,
+                        tint = AmberWarning
+                    )
+                    Spacer(modifier = Modifier.width(10.dp))
+                    Text(
+                        text = "Complete Checklist Above (Tap to Check)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = AmberWarning
                     )
                 } else {
                     Icon(
@@ -1260,7 +1277,9 @@ private fun SwapRequirementsCard(
             if (!isHeadMode) {
                 RequirementRowItem(
                     isSatisfied = uiState.isDetectorReady,
-                    text = "det_10g.onnx installed"
+                    text = "det_10g.onnx installed",
+                    actionLabel = if (!uiState.isDetectorReady) "Install" else null,
+                    onAction = onOpenModelsTab
                 )
                 RequirementRowItem(
                     isSatisfied = uiState.isSwapperReady,

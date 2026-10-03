@@ -580,14 +580,14 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                                 sourceFaces = faces,
                                 selectedSourceFaceIndex = 0,
                                 isDetectingSource = false,
-                                errorBannerMessage = warning ?: state.errorBannerMessage
+                                errorBannerMessage = warning
                             )
                         } else {
                             state.copy(
                                 targetFaces = faces,
                                 selectedTargetFaceIndex = 0,
                                 isDetectingTarget = false,
-                                errorBannerMessage = warning ?: state.errorBannerMessage
+                                errorBannerMessage = warning
                             )
                         }
                     }
@@ -618,21 +618,53 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         val srcBitmap = state.sourceBitmap
         val tgtBitmap = state.targetBitmap
 
+        if (srcBitmap == null) {
+            _uiState.update {
+                it.copy(errorBannerMessage = "Please select a Source Photo (Donor Face) first.")
+            }
+            return
+        }
+        if (state.sourceFaces.isEmpty()) {
+            _uiState.update {
+                it.copy(errorBannerMessage = "No face detected in source photo. Please choose a clearer portrait.")
+            }
+            return
+        }
+        if (tgtBitmap == null) {
+            _uiState.update {
+                it.copy(errorBannerMessage = "Please select a Target Photo (Scene Photo) first.")
+            }
+            return
+        }
+        if (state.targetFaces.isEmpty()) {
+            _uiState.update {
+                it.copy(errorBannerMessage = "No face detected in target photo. Please choose a clearer portrait.")
+            }
+            return
+        }
+        if (state.studioMode == StudioMode.FACE_SWAP) {
+            if (!state.isDetectorReady) {
+                _uiState.update {
+                    it.copy(errorBannerMessage = "det_10g.onnx is missing. Please import it in the ONNX Models tab.")
+                }
+                return
+            }
+            if (!state.isSwapperReady) {
+                _uiState.update {
+                    it.copy(errorBannerMessage = "inswapper_128.onnx is missing. Please import it in the ONNX Models tab.")
+                }
+                return
+            }
+            if (!state.isRecognizerReady && !state.allowTwoModelFallbackForTesting) {
+                _uiState.update {
+                    it.copy(errorBannerMessage = "w600k_r50.onnx is missing. Import it or turn ON 'Enable 2-Model Testing Mode' switch above.")
+                }
+                return
+            }
+        }
         if (!state.consentConfirmed) {
             _uiState.update {
-                it.copy(errorBannerMessage = "Please confirm ethical consent before running inference.")
-            }
-            return
-        }
-        if (srcBitmap == null || state.sourceFaces.isEmpty()) {
-            _uiState.update {
-                it.copy(errorBannerMessage = "Select a source photo with at least one detected face/head.")
-            }
-            return
-        }
-        if (tgtBitmap == null || state.targetFaces.isEmpty()) {
-            _uiState.update {
-                it.copy(errorBannerMessage = "Select a target photo with at least one detected face/head.")
+                it.copy(errorBannerMessage = "Please confirm ethical consent (tick the checkbox above the swap button).")
             }
             return
         }

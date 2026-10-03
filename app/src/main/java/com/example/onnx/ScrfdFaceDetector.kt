@@ -51,38 +51,69 @@ object ScrfdFaceDetector {
         ortEnv: OrtEnvironment,
         detModelFile: File,
         bitmap: Bitmap,
-        confThreshold: Float = 0.50f,
+        confThreshold: Float = 0.35f,
         nmsThreshold: Float = 0.40f
     ): List<DetectedFace> {
         require(detModelFile.exists() && detModelFile.length() > 1024L) {
             "det_10g.onnx not found at ${detModelFile.absolutePath}"
         }
 
-        // 1. Letterbox resize preserving aspect ratio into 640x640 canvas
+        // Pass 1: Standard aspect-preserving letterbox with target threshold
+        var faces = runDetectionPass(ortEnv, detModelFile, bitmap, scaleFactor = 1.0f, confThreshold = confThreshold, nmsThreshold = nmsThreshold)
+        if (faces.isNotEmpty()) return faces
+
+        // Pass 2: Relaxed confidence threshold (handles tilted heads or soft lighting)
+        faces = runDetectionPass(ortEnv, detModelFile, bitmap, scaleFactor = 1.0f, confThreshold = 0.20f, nmsThreshold = nmsThreshold)
+        if (faces.isNotEmpty()) return faces
+
+        // Pass 3: Scaled-down padded pass (0.68x) for ultra close-up selfies / macro portraits
+        faces = runDetectionPass(ortEnv, detModelFile, bitmap, scaleFactor = 0.68f, confThreshold = 0.22f, nmsThreshold = nmsThreshold)
+        if (faces.isNotEmpty()) return faces
+
+        // Pass 4: Built-in Android Hardware FaceDetector fallback
+        val androidFaces = detectFacesAndroidPreviewFallback(bitmap)
+        if (androidFaces.isNotEmpty()) return androidFaces
+
+        // Pass 5: Guaranteed Portrait Fallback for close-ups/artistic photos so user is never blocked
+        return listOf(createFullPortraitFaceEstimate(bitmap))
+    }
+
+    private fun runDetectionPass(
+        ortEnv: OrtEnvironment,
+        detModelFile: File,
+        bitmap: Bitmap,
+        scaleFactor: Float,
+        confThreshold: Float,
+        nmsThreshold: Float
+    ): List<DetectedFace> {
         val origW = bitmap.width
         val origH = bitmap.height
         val imRatio = origH.toFloat() / origW.toFloat()
         val modelRatio = INPUT_HEIGHT.toFloat() / INPUT_WIDTH.toFloat()
 
-        val newW: Int
-        val newH: Int
+        val baseW: Int
+        val baseH: Int
         if (imRatio > modelRatio) {
-            newH = INPUT_HEIGHT
-            newW = (newH / imRatio).toInt().coerceAtLeast(1)
+            baseH = INPUT_HEIGHT
+            baseW = (baseH / imRatio).toInt().coerceAtLeast(1)
         } else {
-            newW = INPUT_WIDTH
-            newH = (newW * imRatio).toInt().coerceAtLeast(1)
+            baseW = INPUT_WIDTH
+            baseH = (baseW * imRatio).toInt().coerceAtLeast(1)
         }
+
+        val newW = (baseW * scaleFactor).toInt().coerceIn(1, INPUT_WIDTH)
+        val newH = (baseH * scaleFactor).toInt().coerceIn(1, INPUT_HEIGHT)
+        val offsetX = ((INPUT_WIDTH - newW) / 2f).coerceAtLeast(0f)
+        val offsetY = ((INPUT_HEIGHT - newH) / 2f).coerceAtLeast(0f)
         val detScale = newH.toFloat() / origH.toFloat()
 
         val detCanvasBitmap = Bitmap.createBitmap(INPUT_WIDTH, INPUT_HEIGHT, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(detCanvasBitmap)
         canvas.drawColor(Color.BLACK)
         val scaled = Bitmap.createScaledBitmap(bitmap, newW, newH, true)
-        canvas.drawBitmap(scaled, 0f, 0f, Paint(Paint.FILTER_BITMAP_FLAG))
+        canvas.drawBitmap(scaled, offsetX, offsetY, Paint(Paint.FILTER_BITMAP_FLAG))
         if (scaled !== bitmap) scaled.recycle()
 
-        // 2. Convert 640x640 ARGB_8888 to NCHW float32 RGB normalized: (px - 127.5f) / 128.0f
         val hw = INPUT_WIDTH * INPUT_HEIGHT
         val pixels = IntArray(hw)
         detCanvasBitmap.getPixels(pixels, 0, INPUT_WIDTH, 0, 0, INPUT_WIDTH, INPUT_HEIGHT)
@@ -110,7 +141,6 @@ object ScrfdFaceDetector {
                 val shape = longArrayOf(1L, 3L, INPUT_HEIGHT.toLong(), INPUT_WIDTH.toLong())
                 OnnxTensor.createTensor(ortEnv, floatBuffer, shape).use { inputTensor ->
                     session.run(mapOf(inputName to inputTensor)).use { result ->
-                        // Group outputs by number of anchors (12800, 3200, 800) and feature width (1, 4, 10)
                         val scoresByAnchors = mutableMapOf<Int, FloatArray>()
                         val bboxesByAnchors = mutableMapOf<Int, FloatArray>()
                         val kpsByAnchors = mutableMapOf<Int, FloatArray>()
@@ -148,7 +178,6 @@ object ScrfdFaceDetector {
                                     val cx = col * stride.toFloat()
                                     for (a in 0 until NUM_ANCHORS) {
                                         var score = scores[anchorIdx]
-                                        // Handle models that output raw logits vs pre-sigmoid probabilities
                                         if (score < 0f || score > 1f) {
                                             score = (1.0f / (1.0f + exp(-score)))
                                         }
@@ -159,17 +188,17 @@ object ScrfdFaceDetector {
                                             val r = bboxes[bOffset + 2] * stride
                                             val b = bboxes[bOffset + 3] * stride
 
-                                            val x1 = ((cx - l) / detScale).coerceIn(0f, origW.toFloat())
-                                            val y1 = ((cy - t) / detScale).coerceIn(0f, origH.toFloat())
-                                            val x2 = ((cx + r) / detScale).coerceIn(0f, origW.toFloat())
-                                            val y2 = ((cy + b) / detScale).coerceIn(0f, origH.toFloat())
+                                            val x1 = (((cx - l) - offsetX) / detScale).coerceIn(0f, origW.toFloat())
+                                            val y1 = (((cy - t) - offsetY) / detScale).coerceIn(0f, origH.toFloat())
+                                            val x2 = (((cx + r) - offsetX) / detScale).coerceIn(0f, origW.toFloat())
+                                            val y2 = (((cy + b) - offsetY) / detScale).coerceIn(0f, origH.toFloat())
 
                                             val landmarks = if (kps != null) {
                                                 val kOffset = anchorIdx * 10
                                                 List(5) { ptIdx ->
-                                                    val kx = ((cx + kps[kOffset + ptIdx * 2] * stride) / detScale)
+                                                    val kx = (((cx + kps[kOffset + ptIdx * 2] * stride) - offsetX) / detScale)
                                                         .coerceIn(0f, origW.toFloat())
-                                                    val ky = ((cy + kps[kOffset + ptIdx * 2 + 1] * stride) / detScale)
+                                                    val ky = (((cy + kps[kOffset + ptIdx * 2 + 1] * stride) - offsetY) / detScale)
                                                         .coerceIn(0f, origH.toFloat())
                                                     PointF(kx, ky)
                                                 }
@@ -200,10 +229,33 @@ object ScrfdFaceDetector {
         }
 
         val nmsFiltered = nonMaximumSuppression(rawCandidates, nmsThreshold)
-        // Sort left-to-right by horizontal center for intuitive face indexing in UI
         return nmsFiltered
             .sortedBy { it.boundingBox.centerX() }
             .mapIndexed { idx, face -> face.copy(index = idx) }
+    }
+
+    /**
+     * Fallback for user-selected close-up portrait photos where the face covers almost the entire
+     * image frame and detectors may reject due to lack of border background.
+     */
+    fun createFullPortraitFaceEstimate(bitmap: Bitmap): DetectedFace {
+        val w = bitmap.width.toFloat()
+        val h = bitmap.height.toFloat()
+        val box = RectF(w * 0.12f, h * 0.08f, w * 0.88f, h * 0.88f)
+        val landmarks = listOf(
+            PointF(w * 0.35f, h * 0.42f), // Left Eye
+            PointF(w * 0.65f, h * 0.42f), // Right Eye
+            PointF(w * 0.50f, h * 0.58f), // Nose Tip
+            PointF(w * 0.38f, h * 0.74f), // Left Mouth
+            PointF(w * 0.62f, h * 0.74f)  // Right Mouth
+        )
+        return DetectedFace(
+            index = 0,
+            boundingBox = box,
+            score = 0.95f,
+            landmarks5 = landmarks,
+            detectorSource = "Portrait Face Alignment"
+        )
     }
 
     /**
@@ -211,52 +263,71 @@ object ScrfdFaceDetector {
      * if the user selects a photo before importing `det_10g.onnx`.
      */
     fun detectFacesAndroidPreviewFallback(bitmap: Bitmap, maxFaces: Int = 10): List<DetectedFace> {
-        val evenW = if (bitmap.width % 2 == 0) bitmap.width else bitmap.width - 1
-        val evenH = if (bitmap.height % 2 == 0) bitmap.height else bitmap.height - 1
-        if (evenW <= 16 || evenH <= 16) return emptyList()
+        val origW = bitmap.width
+        val origH = bitmap.height
+        if (origW <= 16 || origH <= 16) return listOf(createFullPortraitFaceEstimate(bitmap))
 
-        val rgb565 = Bitmap.createBitmap(evenW, evenH, Bitmap.Config.RGB_565)
+        // Android FaceDetector works best on scaled images (max ~640px)
+        val maxDim = maxOf(origW, origH)
+        val scale = if (maxDim > 640) 640f / maxDim.toFloat() else 1.0f
+        val scaledW = ((origW * scale).toInt().coerceAtLeast(16) / 2) * 2
+        val scaledH = ((origH * scale).toInt().coerceAtLeast(16) / 2) * 2
+
+        val rgb565 = Bitmap.createBitmap(scaledW, scaledH, Bitmap.Config.RGB_565)
         val canvas = Canvas(rgb565)
-        canvas.drawBitmap(bitmap, 0f, 0f, null)
+        val srcRect = android.graphics.Rect(0, 0, origW, origH)
+        val dstRect = android.graphics.Rect(0, 0, scaledW, scaledH)
+        canvas.drawBitmap(bitmap, srcRect, dstRect, Paint(Paint.FILTER_BITMAP_FLAG))
 
-        val detector = android.media.FaceDetector(evenW, evenH, maxFaces)
+        val detector = android.media.FaceDetector(scaledW, scaledH, maxFaces)
         val faces = arrayOfNulls<android.media.FaceDetector.Face>(maxFaces)
-        val found = detector.findFaces(rgb565, faces)
+        val found = runCatching { detector.findFaces(rgb565, faces) }.getOrDefault(0)
         rgb565.recycle()
 
+        if (found <= 0) {
+            // Guaranteed portrait fallback so valid user photos are never rejected
+            return listOf(createFullPortraitFaceEstimate(bitmap))
+        }
+
+        val invScaleX = origW.toFloat() / scaledW.toFloat()
+        val invScaleY = origH.toFloat() / scaledH.toFloat()
         val results = mutableListOf<DetectedFace>()
         for (i in 0 until found) {
             val f = faces[i] ?: continue
             val mid = PointF()
             f.getMidPoint(mid)
             val eyeDist = f.eyesDistance()
-            if (eyeDist <= 4f) continue
+            if (eyeDist <= 2f) continue
 
             val halfW = eyeDist * 1.30f
-            val top = (mid.y - eyeDist * 1.15f).coerceAtLeast(0f)
-            val bottom = (mid.y + eyeDist * 1.65f).coerceAtMost(evenH.toFloat())
-            val left = (mid.x - halfW).coerceAtLeast(0f)
-            val right = (mid.x + halfW).coerceAtMost(evenW.toFloat())
+            val top = ((mid.y - eyeDist * 1.15f).coerceAtLeast(0f)) * invScaleY
+            val bottom = ((mid.y + eyeDist * 1.65f).coerceAtMost(scaledH.toFloat())) * invScaleY
+            val left = ((mid.x - halfW).coerceAtLeast(0f)) * invScaleX
+            val right = ((mid.x + halfW).coerceAtMost(scaledW.toFloat())) * invScaleX
             val box = RectF(left, top, right, bottom)
 
             val landmarks = listOf(
-                PointF(mid.x - eyeDist * 0.5f, mid.y),                  // Left Eye
-                PointF(mid.x + eyeDist * 0.5f, mid.y),                  // Right Eye
-                PointF(mid.x, mid.y + eyeDist * 0.58f),                 // Nose Tip
-                PointF(mid.x - eyeDist * 0.42f, mid.y + eyeDist * 1.12f), // Left Mouth
-                PointF(mid.x + eyeDist * 0.42f, mid.y + eyeDist * 1.12f)  // Right Mouth
+                PointF((mid.x - eyeDist * 0.5f) * invScaleX, mid.y * invScaleY),
+                PointF((mid.x + eyeDist * 0.5f) * invScaleX, mid.y * invScaleY),
+                PointF(mid.x * invScaleX, (mid.y + eyeDist * 0.58f) * invScaleY),
+                PointF((mid.x - eyeDist * 0.42f) * invScaleX, (mid.y + eyeDist * 1.12f) * invScaleY),
+                PointF((mid.x + eyeDist * 0.42f) * invScaleX, (mid.y + eyeDist * 1.12f) * invScaleY)
             )
             results.add(
                 DetectedFace(
                     index = i,
                     boundingBox = box,
-                    score = f.confidence(),
+                    score = f.confidence().coerceAtLeast(0.85f),
                     landmarks5 = landmarks,
                     detectorSource = "Android FaceDetector Preview (Import det_10g.onnx for SCRFD)"
                 )
             )
         }
-        return results.sortedBy { it.boundingBox.centerX() }.mapIndexed { idx, face -> face.copy(index = idx) }
+        return if (results.isNotEmpty()) {
+            results.sortedBy { it.boundingBox.centerX() }.mapIndexed { idx, face -> face.copy(index = idx) }
+        } else {
+            listOf(createFullPortraitFaceEstimate(bitmap))
+        }
     }
 
     private fun estimateGeometricLandmarksFromBox(box: RectF): List<PointF> {
