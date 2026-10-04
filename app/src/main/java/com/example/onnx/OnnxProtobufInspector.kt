@@ -799,6 +799,12 @@ object OnnxProtobufInspector {
     }
 
     private fun parseTensorIf512x512(reader: ProtoStreamReader, tensorLen: Long): CandidateInitializer512? {
+        // A 512x512 float32 TensorProto is either ~1,048,576 bytes (raw_data/packed) or ~1,310,720 bytes (unpacked float_data).
+        // Fast-skip any initializer outside this byte size window in O(1) buffered stream skips.
+        if (tensorLen < EMAP_BYTES.toLong() || tensorLen > 1_315_000L) {
+            reader.skipBytes(tensorLen)
+            return null
+        }
         val tensorEnd = reader.bytesRead + tensorLen
         val dims = mutableListOf<Long>()
         var dataType = 0

@@ -123,6 +123,10 @@ object InSwapperEngine {
         targetBitmap.getPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)
 
         val featheredMask128 = FaceBlender.createFeatheredFaceMask128()
+        val srcM128 = FaceAlignment.estimateNorm(sourceFace.landmarks5, INSWAPPER_SIZE)
+        val alignedSource128 = FaceAlignment.warpAffineCrop(sourceBitmap, srcM128, INSWAPPER_SIZE)
+        val hasTrueArcFaceLatent = sourceEmbedding.usedArcFaceModel && sourceEmbedding.usedEmbeddedEmap
+
         var firstTargetCrop128: Bitmap? = null
         var firstRawSwapped128: Bitmap? = null
         var totalSwapMs = 0L
@@ -176,17 +180,19 @@ object InSwapperEngine {
                         onProgress(
                             SwapStageProgress(
                                 stepIndex = 5,
-                                stageTitle = "Stage 5/5: Eye Restoration, Color Harmonization & Blending",
-                                detailMessage = "Restoring eye iris/sclera clarity & blending swapped face #${targetFace.index + 1}...",
+                                stageTitle = "Stage 5/5: Anti-Negative Polarity, Eye Restoration & Blending",
+                                detailMessage = "Eliminating negative artifacts, restoring eye clarity & blending face #${targetFace.index + 1}...",
                                 progressFraction = 0.90f
                             )
                         )
 
-                        // 1. Eliminate negative/hollow eye artifacts & restore crisp iris/sclera polarity
+                        // 1. Eliminate negative/hollow eye & face artifacts and restore crisp positive polarity
                         val eyeRestored128 = FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
                             swapped128 = rawSwapped128,
                             alignedTarget128 = alignedTarget128,
-                            alignedSource112 = sourceEmbedding.aligned112Crop
+                            alignedSource112 = sourceEmbedding.aligned112Crop,
+                            alignedSource128 = alignedSource128,
+                            hasTrueArcFaceLatent = hasTrueArcFaceLatent
                         )
 
                         // 2. Run optional GFPGAN ONNX enhancement if gfpgan_1.4.onnx is installed
@@ -238,6 +244,7 @@ object InSwapperEngine {
                 }
             }
         }
+        alignedSource128.recycle()
 
         val finalBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
         finalBitmap.setPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)

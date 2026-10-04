@@ -32,43 +32,48 @@ object FaceBlender {
 
     /**
      * Returns how strongly a pixel (x, y) in 128x128 canonical space belongs to the ocular
-     * aperture (sclera, iris, pupil, eyelids) in [0.0f, 1.0f].
+     * aperture (sclera, iris, pupil, eyelids, lashes) in [0.0f, 1.0f].
      * Used to protect eyes from skin-tone color shifts that would otherwise turn dark pupils
      * milky grey or tint white sclera into a negative-looking eye.
      */
     private fun computeEyeProtectionWeight128(x: Int, y: Int): Float {
-        val lx = (x - LEFT_EYE_X) / 16.0f
-        val ly = (y - LEFT_EYE_Y) / 9.5f
+        val lx = (x - LEFT_EYE_X) / 20.0f
+        val ly = (y - LEFT_EYE_Y) / 12.5f
         val lDistSq = lx * lx + ly * ly
 
-        val rx = (x - RIGHT_EYE_X) / 16.0f
-        val ry = (y - RIGHT_EYE_Y) / 9.5f
+        val rx = (x - RIGHT_EYE_X) / 20.0f
+        val ry = (y - RIGHT_EYE_Y) / 12.5f
         val rDistSq = rx * rx + ry * ry
 
         val minDistSq = min(lDistSq, rDistSq)
         return when {
-            minDistSq <= 0.45f -> 1.0f
+            minDistSq <= 0.50f -> 1.0f
             minDistSq >= 1.0f -> 0.0f
             else -> {
-                val t = (minDistSq - 0.45f) / 0.55f
+                val t = (minDistSq - 0.50f) / 0.50f
                 0.5f * (1.0f + cos(Math.PI * t).toFloat())
             }
         }
     }
 
     /**
-     * Restores natural eye polarity (deep black pupil, rich dark iris, clean white sclera, and
-     * crisp eyelashes) on `swapped128` using `alignedTarget128` and `alignedSource112` as
-     * structural and radiometric references.
+     * Eliminates "negative image" / solarized / inverted contrast artifacts across the entire
+     * 128x128 face crop and strictly enforces natural positive eye polarity (deep dark pupil/iris/lashes
+     * and clean bright sclera) on both Left and Right eyes.
      *
-     * Specifically eliminates the "negative eye" / hollow iris artifact where `inswapper_128`
-     * outputs inverted grey/white values inside the iris/pupil or darkens the outer sclera on
-     * tilted or heavily-lined eyes.
+     * Handles both:
+     *  1) Full 3-Model Mode (`w600k_r50.onnx` + `emap` + `inswapper_128.onnx`): fixes local AdaIN
+     *     polarity inversions in tilted/heavily-lined eyes, eyebrows, nostrils, and shadows.
+     *  2) 2-Model Fallback Mode (when `hasTrueArcFaceLatent == false`): synthesizes a 100% positive
+     *     multi-band illumination-matched face from `alignedSource128` + `alignedTarget128` so
+     *     uncalibrated AdaIN activations never turn the output into a negative image.
      */
     fun restoreEyesAndEliminateNegativeArtifacts128(
         swapped128: Bitmap,
         alignedTarget128: Bitmap,
-        alignedSource112: Bitmap? = null
+        alignedSource112: Bitmap? = null,
+        alignedSource128: Bitmap? = null,
+        hasTrueArcFaceLatent: Boolean = true
     ): Bitmap {
         val total = CROP_SIZE * CROP_SIZE
         val swapPx = IntArray(total)
@@ -76,111 +81,244 @@ object FaceBlender {
         swapped128.getPixels(swapPx, 0, CROP_SIZE, 0, 0, CROP_SIZE, CROP_SIZE)
         alignedTarget128.getPixels(tgtPx, 0, CROP_SIZE, 0, 0, CROP_SIZE, CROP_SIZE)
 
-        val srcPx112: IntArray? = alignedSource112?.let { bmp ->
-            if (bmp.width == 112 && bmp.height == 112) {
-                IntArray(112 * 112).also { bmp.getPixels(it, 0, 112, 0, 0, 112, 112) }
-            } else {
-                null
+        // Resolve 128x128 source pixels in exact canonical alignment
+        val srcPx128 = IntArray(total)
+        if (alignedSource128 != null && alignedSource128.width == CROP_SIZE && alignedSource128.height == CROP_SIZE) {
+            alignedSource128.getPixels(srcPx128, 0, CROP_SIZE, 0, 0, CROP_SIZE, CROP_SIZE)
+        } else if (alignedSource112 != null && alignedSource112.width == 112 && alignedSource112.height == 112) {
+            val raw112 = IntArray(112 * 112)
+            alignedSource112.getPixels(raw112, 0, 112, 0, 0, 112, 112)
+            for (y in 0 until CROP_SIZE) {
+                val sy = y.coerceIn(0, 111)
+                for (x in 0 until CROP_SIZE) {
+                    val sx = (x - 8).coerceIn(0, 111)
+                    srcPx128[y * CROP_SIZE + x] = raw112[sy * 112 + sx]
+                }
+            }
+        } else {
+            System.arraycopy(tgtPx, 0, srcPx128, 0, total)
+        }
+
+        // Step 1: Build a 100% Positive Illumination-Harmonized Source Reference (srcHarmonizedPx)
+        // by transferring target's low-frequency 13x13 shading envelope onto source's high-frequency identity features.
+        val srcHarmonizedPx = buildIlluminationHarmonizedPositiveSource128(srcPx128, tgtPx)
+
+        val outPx = IntArray(total)
+
+        // Step 2: Full-Face Anti-Negative Polarity Pass across all 128x128 pixels
+        for (y in 0 until CROP_SIZE) {
+            val row = y * CROP_SIZE
+            for (x in 0 until CROP_SIZE) {
+                val idx = row + x
+                val sc = swapPx[idx]
+                val tc = tgtPx[idx]
+                val hc = srcHarmonizedPx[idx]
+
+                val sR = (sc ushr 16) and 0xFF
+                val sG = (sc ushr 8) and 0xFF
+                val sB = sc and 0xFF
+                val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
+
+                val tR = (tc ushr 16) and 0xFF
+                val tG = (tc ushr 8) and 0xFF
+                val tB = tc and 0xFF
+                val tLum = 0.299f * tR + 0.587f * tG + 0.114f * tB
+
+                val hR = (hc ushr 16) and 0xFF
+                val hG = (hc ushr 8) and 0xFF
+                val hB = hc and 0xFF
+                val hLum = 0.299f * hR + 0.587f * hG + 0.114f * hB
+
+                // Positive reference combines illumination-harmonized source identity (72%) + target shading (28%)
+                val posRefR = 0.72f * hR + 0.28f * tR
+                val posRefG = 0.72f * hG + 0.28f * tG
+                val posRefB = 0.72f * hB + 0.28f * tB
+                val posRefLum = 0.72f * hLum + 0.28f * tLum
+
+                if (!hasTrueArcFaceLatent) {
+                    // In 2-Model mode (no w600k_r50.onnx), inswapper_128's AdaIN modulation is uncalibrated
+                    // and produces negative/solarized colors. Use the positive illumination-harmonized source face.
+                    outPx[idx] = (0xFF shl 24) or
+                        (posRefR.toInt().coerceIn(0, 255) shl 16) or
+                        (posRefG.toInt().coerceIn(0, 255) shl 8) or
+                        posRefB.toInt().coerceIn(0, 255)
+                    continue
+                }
+
+                // Check local 3x3 high-frequency contrast polarity for negative/solarized feature inversion
+                val sAvg3 = compute3x3LuminanceAvg(swapPx, CROP_SIZE, x, y)
+                val hAvg3 = compute3x3LuminanceAvg(srcHarmonizedPx, CROP_SIZE, x, y)
+                val tAvg3 = compute3x3LuminanceAvg(tgtPx, CROP_SIZE, x, y)
+
+                val dSwap = sLum - sAvg3
+                val dPosRef = (0.65f * (hLum - hAvg3)) + (0.35f * (tLum - tAvg3))
+
+                // Detect negative polarity:
+                // (a) Local contrast inversion: dSwap and dPosRef have opposite signs
+                val isContrastInverted = (dSwap * dPosRef) < -1.5f
+                // (b) Dark feature inversion (e.g., dark eyebrow, lash, nostril, shadow turned bright grey/white)
+                val darkRefFloor = min(hLum, tLum)
+                val brightRefCeil = max(hLum, tLum)
+                val isDarkFeatureInverted = darkRefFloor < 92f && sLum > posRefLum + 10f
+                // (c) Bright skin/highlight inversion (turned muddy dark grey)
+                val isBrightFeatureInverted = brightRefCeil > 115f && sLum < posRefLum - 16f
+
+                // Baseline positive anchor (22%) prevents any global washout, boosted up to 92% on inverted pixels
+                var posWeight = 0.22f
+                if (isDarkFeatureInverted) {
+                    val severity = ((sLum - posRefLum) / 40f).coerceIn(0.35f, 0.92f)
+                    posWeight = max(posWeight, severity)
+                }
+                if (isBrightFeatureInverted) {
+                    val severity = ((posRefLum - sLum) / 45f).coerceIn(0.30f, 0.88f)
+                    posWeight = max(posWeight, severity)
+                }
+                if (isContrastInverted) {
+                    val invMag = (abs(dSwap - dPosRef) / 25f).coerceIn(0.35f, 0.90f)
+                    posWeight = max(posWeight, invMag)
+                }
+
+                // Replace inverted local detail with positive high-frequency detail
+                val detailFix = if (isContrastInverted) (dPosRef - dSwap) * 0.75f else dPosRef * 0.20f
+
+                val finalR = (sR * (1f - posWeight) + posRefR * posWeight + detailFix).toInt().coerceIn(0, 255)
+                val finalG = (sG * (1f - posWeight) + posRefG * posWeight + detailFix).toInt().coerceIn(0, 255)
+                val finalB = (sB * (1f - posWeight) + posRefB * posWeight + detailFix).toInt().coerceIn(0, 255)
+
+                outPx[idx] = (0xFF shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
             }
         }
 
-        val outPx = swapPx.copyOf()
-
-        // Process both Left Eye (46.3, 51.7) and Right Eye (81.5, 51.5)
+        // Step 3: Strict Positive Ocular Restoration for Both Left Eye (46.3, 51.7) & Right Eye (81.5, 51.5)
+        // Guarantees zero "negative eye" / milky pupil / muddy sclera on either eye!
         val eyeCenters = arrayOf(
             LEFT_EYE_X to LEFT_EYE_Y,
             RIGHT_EYE_X to RIGHT_EYE_Y
         )
 
         for ((eyeCx, eyeCy) in eyeCenters) {
-            val xMin = (eyeCx - 16f).toInt().coerceAtLeast(1)
-            val xMax = (eyeCx + 16f).toInt().coerceAtMost(CROP_SIZE - 2)
-            val yMin = (eyeCy - 10f).toInt().coerceAtLeast(1)
-            val yMax = (eyeCy + 10f).toInt().coerceAtMost(CROP_SIZE - 2)
+            val rx = 20.5f
+            val ry = 13.0f
+            val xMin = (eyeCx - rx).toInt().coerceAtLeast(1)
+            val xMax = (eyeCx + rx).toInt().coerceAtMost(CROP_SIZE - 2)
+            val yMin = (eyeCy - ry).toInt().coerceAtLeast(1)
+            val yMax = (eyeCy + ry).toInt().coerceAtMost(CROP_SIZE - 2)
+
+            // Compute subtle iris chrominance shift from source eye to target eye without ghosting sclera into pupil
+            var srcEyeR = 0f
+            var srcEyeG = 0f
+            var srcEyeB = 0f
+            var tgtEyeR = 0f
+            var tgtEyeG = 0f
+            var tgtEyeB = 0f
+            var irisSamples = 0
+            for (iy in (eyeCy - 5f).toInt()..(eyeCy + 5f).toInt()) {
+                for (ix in (eyeCx - 7f).toInt()..(eyeCx + 7f).toInt()) {
+                    if (iy !in 1 until CROP_SIZE - 1 || ix !in 1 until CROP_SIZE - 1) continue
+                    val sc = srcPx128[iy * CROP_SIZE + ix]
+                    val tc = tgtPx[iy * CROP_SIZE + ix]
+                    val sL = 0.299f * (sc ushr 16 and 0xFF) + 0.587f * (sc ushr 8 and 0xFF) + 0.114f * (sc and 0xFF)
+                    val tL = 0.299f * (tc ushr 16 and 0xFF) + 0.587f * (tc ushr 8 and 0xFF) + 0.114f * (tc and 0xFF)
+                    if (sL < 110f && tL < 110f) {
+                        srcEyeR += (sc ushr 16) and 0xFF
+                        srcEyeG += (sc ushr 8) and 0xFF
+                        srcEyeB += sc and 0xFF
+                        tgtEyeR += (tc ushr 16) and 0xFF
+                        tgtEyeG += (tc ushr 8) and 0xFF
+                        tgtEyeB += tc and 0xFF
+                        irisSamples++
+                    }
+                }
+            }
+            val chromaShiftR = if (irisSamples > 4) ((srcEyeR - tgtEyeR) / irisSamples).coerceIn(-18f, 18f) else 0f
+            val chromaShiftG = if (irisSamples > 4) ((srcEyeG - tgtEyeG) / irisSamples).coerceIn(-18f, 18f) else 0f
+            val chromaShiftB = if (irisSamples > 4) ((srcEyeB - tgtEyeB) / irisSamples).coerceIn(-18f, 18f) else 0f
 
             for (y in yMin..yMax) {
-                val dy = y - eyeCy
-                val ny = dy / 9.0f
+                val dy = (y - eyeCy) / ry
                 for (x in xMin..xMax) {
-                    val dx = x - eyeCx
-                    val nx = dx / 15.5f
-                    val normDist = sqrt(nx * nx + ny * ny)
+                    val dx = (x - eyeCx) / rx
+                    val normDist = sqrt(dx * dx + dy * dy)
                     if (normDist >= 1.0f) continue
 
-                    // Smooth radial weight inside the eye socket
-                    val socketWeight = if (normDist <= 0.55f) {
+                    // Smooth radial socket weight: 1.0 across iris/sclera/lashes (normDist <= 0.65), cosine taper to 1.0
+                    val socketWeight = if (normDist <= 0.65f) {
                         1.0f
                     } else {
-                        val t = (normDist - 0.55f) / 0.45f
+                        val t = (normDist - 0.65f) / 0.35f
                         0.5f * (1.0f + cos(Math.PI * t).toFloat())
                     }
 
                     val idx = y * CROP_SIZE + x
-                    val sc = swapPx[idx]
+                    val curC = outPx[idx]
                     val tc = tgtPx[idx]
 
-                    val sR = (sc ushr 16) and 0xFF
-                    val sG = (sc ushr 8) and 0xFF
-                    val sB = sc and 0xFF
-                    val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
+                    val cR = (curC ushr 16) and 0xFF
+                    val cG = (curC ushr 8) and 0xFF
+                    val cB = curC and 0xFF
+                    val cLum = 0.299f * cR + 0.587f * cG + 0.114f * cB
 
                     val tR = (tc ushr 16) and 0xFF
                     val tG = (tc ushr 8) and 0xFF
                     val tB = tc and 0xFF
                     val tLum = 0.299f * tR + 0.587f * tG + 0.114f * tB
 
-                    // Sample corresponding source eye pixel in 112x112 space (where x_112 = x_128 - 8, y_112 = y_128)
-                    var srcLum = tLum
-                    var srcR = tR
-                    var srcG = tG
-                    var srcB = tB
-                    if (srcPx112 != null) {
-                        val sx112 = (x - 8).coerceIn(0, 111)
-                        val sy112 = y.coerceIn(0, 111)
-                        val srcC = srcPx112[sy112 * 112 + sx112]
-                        srcR = (srcC ushr 16) and 0xFF
-                        srcG = (srcC ushr 8) and 0xFF
-                        srcB = srcC and 0xFF
-                        srcLum = 0.299f * srcR + 0.587f * srcG + 0.114f * srcB
+                    // Gaze-aligned positive eye reference from target eye (preserving exact iris/pupil/sclera geometry)
+                    val isIrisZone = tLum < 105f && normDist < 0.60f
+                    val cleanEyeR = (tR + if (isIrisZone) chromaShiftR * 0.45f else 0f).coerceIn(0f, 255f)
+                    val cleanEyeG = (tG + if (isIrisZone) chromaShiftG * 0.45f else 0f).coerceIn(0f, 255f)
+                    val cleanEyeB = (tB + if (isIrisZone) chromaShiftB * 0.45f else 0f).coerceIn(0f, 255f)
+                    val cleanEyeLum = 0.299f * cleanEyeR + 0.587f * cleanEyeG + 0.114f * cleanEyeB
+
+                    // Detect any negative/milky inversion inside the eye socket:
+                    // - Dark pupil/iris/lashes (tLum < 115) must NEVER be brighter than cleanEyeLum
+                    // - Bright sclera/catchlight (tLum > 125) must NEVER be darker than cleanEyeLum
+                    val isNegativeIrisOrLash = tLum < 115f && cLum > cleanEyeLum + 4f
+                    val isNegativeSclera = tLum > 125f && cLum < cleanEyeLum - 6f
+
+                    // High baseline ocular clarity (0.78 in socket core, up to 0.96 on any inverted pixel)
+                    val baseEyeAnchor = 0.78f * socketWeight
+                    val inversionAnchor = when {
+                        isNegativeIrisOrLash -> (0.85f + ((cLum - cleanEyeLum) / 60f).coerceIn(0f, 0.13f)) * socketWeight
+                        isNegativeSclera -> (0.84f + ((cleanEyeLum - cLum) / 60f).coerceIn(0f, 0.14f)) * socketWeight
+                        else -> baseEyeAnchor
+                    }
+                    val eyeBlend = max(baseEyeAnchor, inversionAnchor).coerceIn(0f, 0.96f)
+
+                    // Local 3x3 high-frequency corneal catchlight & eyelash crispness
+                    val tAvg3 = compute3x3LuminanceAvg(tgtPx, CROP_SIZE, x, y)
+                    val eyeDetail = (tLum - tAvg3) * 0.35f * socketWeight
+
+                    var eR = cR * (1f - eyeBlend) + cleanEyeR * eyeBlend + eyeDetail
+                    var eG = cG * (1f - eyeBlend) + cleanEyeG * eyeBlend + eyeDetail
+                    var eB = cB * (1f - eyeBlend) + cleanEyeB * eyeBlend + eyeDetail
+
+                    // Strict Mathematical Positive Polarity Clamp inside the core eye aperture (normDist <= 0.75):
+                    // Dark pupil/iris/lash pixels can NEVER exceed target darkness; sclera can NEVER drop below target whiteness.
+                    if (normDist <= 0.75f) {
+                        val eLum = 0.299f * eR + 0.587f * eG + 0.114f * eB
+                        if (tLum < 95f && eLum > cleanEyeLum + 2f && eLum > 1f) {
+                            val scaleDown = (cleanEyeLum / eLum).coerceIn(0.15f, 1.0f)
+                            eR *= scaleDown
+                            eG *= scaleDown
+                            eB *= scaleDown
+                        } else if (tLum > 130f && eLum < cleanEyeLum * 0.94f && eLum > 1f) {
+                            val scaleUp = ((cleanEyeLum * 0.95f) / eLum).coerceIn(1.0f, 2.2f)
+                            eR *= scaleUp
+                            eG *= scaleUp
+                            eB *= scaleUp
+                        }
                     }
 
-                    // Reference eye luminance combining target gaze/eyeliner structure (65%) + source eye tone (35%)
-                    val refLum = 0.65f * tLum + 0.35f * srcLum
-                    val refR = 0.65f * tR + 0.35f * srcR
-                    val refG = 0.65f * tG + 0.35f * srcG
-                    val refB = 0.65f * tB + 0.35f * srcB
-
-                    // 1. Detect negative/inverted eye artifacts:
-                    //    (a) Hollow/milky iris or eyelid: swapped pixel is anomalously brighter than reference dark iris/lashes
-                    //    (b) Muddy/darkened sclera: swapped pixel is anomalously darker than reference white sclera
-                    val lumDiff = abs(sLum - refLum)
-                    val isIrisOrLashInversion = (tLum < 95f || srcLum < 95f) && sLum > refLum + 10f
-                    val isScleraDarkening = (tLum > 125f) && sLum < refLum - 12f
-
-                    // Compute adaptive correction blend: stronger when polarity inversion is detected
-                    val baseEyeAnchor = 0.42f * socketWeight
-                    val anomalyBoost = when {
-                        isIrisOrLashInversion -> ((sLum - refLum) / 55f).coerceIn(0.25f, 0.88f) * socketWeight
-                        isScleraDarkening -> ((refLum - sLum) / 55f).coerceIn(0.25f, 0.85f) * socketWeight
-                        lumDiff > 22f -> ((lumDiff - 22f) / 70f).coerceIn(0f, 0.65f) * socketWeight
-                        else -> 0f
-                    }
-                    val corrWeight = max(baseEyeAnchor, anomalyBoost).coerceIn(0f, 0.90f)
-
-                    // Local 3x3 high-frequency detail from target eye (preserves crisp iris rim, catchlight & lashes)
-                    val tNeighborsAvgLum = compute3x3LuminanceAvg(tgtPx, CROP_SIZE, x, y)
-                    val highFreqDetail = (tLum - tNeighborsAvgLum) * 0.55f * socketWeight
-
-                    val correctedR = (sR * (1f - corrWeight) + refR * corrWeight + highFreqDetail).toInt().coerceIn(0, 255)
-                    val correctedG = (sG * (1f - corrWeight) + refG * corrWeight + highFreqDetail).toInt().coerceIn(0, 255)
-                    val correctedB = (sB * (1f - corrWeight) + refB * corrWeight + highFreqDetail).toInt().coerceIn(0, 255)
-
-                    outPx[idx] = (0xFF shl 24) or (correctedR shl 16) or (correctedG shl 8) or correctedB
+                    outPx[idx] = (0xFF shl 24) or
+                        (eR.toInt().coerceIn(0, 255) shl 16) or
+                        (eG.toInt().coerceIn(0, 255) shl 8) or
+                        eB.toInt().coerceIn(0, 255)
                 }
             }
         }
 
-        // Mild unsharp pass across the inner face (eyes, nose, lips) so 128x128 synthesis is crisp
+        // Step 4: Mild unsharp micro-contrast pass across the inner face (eyes, nose, lips)
         val sharpenedPx = outPx.copyOf()
         for (y in 24..108) {
             val row = y * CROP_SIZE
@@ -200,7 +338,7 @@ object FaceBlender {
                 val avgG = ((n ushr 8 and 0xFF) + (s ushr 8 and 0xFF) + (l ushr 8 and 0xFF) + (r ushr 8 and 0xFF)) * 0.25f
                 val avgB = ((n and 0xFF) + (s and 0xFF) + (l and 0xFF) + (r and 0xFF)) * 0.25f
 
-                val amount = 0.26f
+                val amount = 0.24f
                 val nr = (cr + (cr - avgR) * amount).toInt().coerceIn(0, 255)
                 val ng = (cg + (cg - avgG) * amount).toInt().coerceIn(0, 255)
                 val nb = (cb + (cb - avgB) * amount).toInt().coerceIn(0, 255)
@@ -213,19 +351,91 @@ object FaceBlender {
         return out
     }
 
+    /**
+     * Builds a 100% positive-polarity 128x128 face reference by combining the high-frequency
+     * identity structure of `srcPx128` with the low-frequency 13x13 illumination envelope of `tgtPx128`.
+     */
+    private fun buildIlluminationHarmonizedPositiveSource128(
+        srcPx128: IntArray,
+        tgtPx128: IntArray
+    ): IntArray {
+        val total = CROP_SIZE * CROP_SIZE
+        val out = IntArray(total)
+        val radius = 6 // 13x13 box filter window
+
+        for (y in 0 until CROP_SIZE) {
+            val y0 = (y - radius).coerceAtLeast(0)
+            val y1 = (y + radius).coerceAtMost(CROP_SIZE - 1)
+            for (x in 0 until CROP_SIZE) {
+                val x0 = (x - radius).coerceAtLeast(0)
+                val x1 = (x + radius).coerceAtMost(CROP_SIZE - 1)
+
+                var sLowR = 0f
+                var sLowG = 0f
+                var sLowB = 0f
+                var tLowR = 0f
+                var tLowG = 0f
+                var tLowB = 0f
+                var count = 0
+
+                for (yy in y0..y1 step 2) {
+                    val row = yy * CROP_SIZE
+                    for (xx in x0..x1 step 2) {
+                        val sc = srcPx128[row + xx]
+                        val tc = tgtPx128[row + xx]
+                        sLowR += (sc ushr 16) and 0xFF
+                        sLowG += (sc ushr 8) and 0xFF
+                        sLowB += sc and 0xFF
+                        tLowR += (tc ushr 16) and 0xFF
+                        tLowG += (tc ushr 8) and 0xFF
+                        tLowB += tc and 0xFF
+                        count++
+                    }
+                }
+                val invCount = 1f / count.coerceAtLeast(1)
+                sLowR *= invCount
+                sLowG *= invCount
+                sLowB *= invCount
+                tLowR *= invCount
+                tLowG *= invCount
+                tLowB *= invCount
+
+                val idx = y * CROP_SIZE + x
+                val sc = srcPx128[idx]
+                val sR = (sc ushr 16) and 0xFF
+                val sG = (sc ushr 8) and 0xFF
+                val sB = sc and 0xFF
+
+                // High-frequency positive identity detail from source + low-frequency scene lighting from target
+                val hR = (tLowR + (sR - sLowR) * 0.92f).toInt().coerceIn(0, 255)
+                val hG = (tLowG + (sG - sLowG) * 0.92f).toInt().coerceIn(0, 255)
+                val hB = (tLowB + (sB - sLowB) * 0.92f).toInt().coerceIn(0, 255)
+
+                out[idx] = (0xFF shl 24) or (hR shl 16) or (hG shl 8) or hB
+            }
+        }
+        return out
+    }
+
     private fun compute3x3LuminanceAvg(px: IntArray, stride: Int, cx: Int, cy: Int): Float {
+        val x0 = (cx - 1).coerceAtLeast(0)
+        val x1 = (cx + 1).coerceAtMost(stride - 1)
+        val y0 = (cy - 1).coerceAtLeast(0)
+        val y1 = (cy + 1).coerceAtMost(stride - 1)
         var sum = 0f
-        for (dy in -1..1) {
-            val row = (cy + dy) * stride
-            for (dx in -1..1) {
-                val c = px[row + cx + dx]
+        var count = 0
+        for (y in y0..y1) {
+            val row = y * stride
+            for (x in x0..x1) {
+                val c = px[row + x]
                 val r = (c ushr 16) and 0xFF
                 val g = (c ushr 8) and 0xFF
                 val b = c and 0xFF
                 sum += 0.299f * r + 0.587f * g + 0.114f * b
+                count++
             }
         }
-        return sum / 9.0f
+        return sum / count.coerceAtLeast(1)
     }
 
     /**

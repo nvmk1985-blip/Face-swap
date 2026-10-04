@@ -373,12 +373,14 @@ object GhostHeadReplacementEngine {
             }
         }
 
+        val hasTrueArcFaceLatent = sourceEmbedding.usedArcFaceModel && sourceEmbedding.usedEmbeddedEmap
         val rawSwappedBmp = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
         rawSwappedBmp.setPixels(rawSwappedPixels128, 0, 128, 0, 0, 128, 128)
         val eyeRestoredBmp = FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
             swapped128 = rawSwappedBmp,
             alignedTarget128 = targetCrop128,
-            alignedSource112 = sourceEmbedding.aligned112Crop
+            alignedSource112 = sourceEmbedding.aligned112Crop,
+            hasTrueArcFaceLatent = hasTrueArcFaceLatent
         )
         rawSwappedBmp.recycle()
         targetCrop128.recycle()
@@ -393,6 +395,7 @@ object GhostHeadReplacementEngine {
         val featheredMask128 = FaceBlender.createFeatheredFaceMask128()
         val headPixels = IntArray(headCropSize * headCropSize)
         synthesizedHeadCrop.getPixels(headPixels, 0, headCropSize, 0, 0, headCropSize, headCropSize)
+        val expressionBlendScale = if (hasTrueArcFaceLatent) 0.45f else 0.15f
 
         for (y in 0 until headCropSize) {
             for (x in 0 until headCropSize) {
@@ -401,7 +404,7 @@ object GhostHeadReplacementEngine {
                 if (u in 6f..121f && v in 6f..121f) {
                     val u0 = u.toInt().coerceIn(0, 126)
                     val v0 = v.toInt().coerceIn(0, 126)
-                    val w = featheredMask128[v0 * 128 + u0]
+                    val w = featheredMask128[v0 * 128 + u0] * expressionBlendScale
                     if (w > 0.005f) {
                         val swapC = FaceAlignment.sampleBilinearClamped(swappedPixels128, 128, 128, u, v)
                         val srcC = headPixels[y * headCropSize + x]
