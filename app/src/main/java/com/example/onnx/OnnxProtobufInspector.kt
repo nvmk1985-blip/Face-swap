@@ -177,7 +177,7 @@ data class OnnxModelInspection(
 object OnnxProtobufInspector {
 
     private const val MODELS_ROOT_DIR = "models"
-    private const val EMAP_CACHE_FILE = "inswapper_emap_512x512.bin"
+    private const val EMAP_CACHE_FILE = "inswapper_emap_v2_512x512.bin"
     private const val EMAP_FLOATS = 512 * 512
     private const val EMAP_BYTES = EMAP_FLOATS * 4
 
@@ -753,7 +753,13 @@ object OnnxProtobufInspector {
         return HeaderMeta(irVersion, producerName, opsetVersion)
     }
 
+    private data class CandidateInitializer512(
+        val name: String,
+        val floats: FloatArray
+    )
+
     private fun scanOnnxFor512x512Initializer(file: File): FloatArray? {
+        var namedEmapMatch: FloatArray? = null
         var lastMatch: FloatArray? = null
         BufferedInputStream(FileInputStream(file), 256 * 1024).use { input ->
             val reader = ProtoStreamReader(input, maxBytesToRead = file.length())
@@ -774,7 +780,11 @@ object OnnxProtobufInspector {
                             val tensorLen = reader.readVarint64()
                             val candidate = parseTensorIf512x512(reader, tensorLen)
                             if (candidate != null) {
-                                lastMatch = candidate
+                                lastMatch = candidate.floats
+                                val lower = candidate.name.lowercase()
+                                if (lower == "buffalo" || lower.contains("emap")) {
+                                    namedEmapMatch = candidate.floats
+                                }
                             }
                         } else {
                             reader.skipField(gWire)
@@ -785,14 +795,16 @@ object OnnxProtobufInspector {
                 }
             }
         }
-        return lastMatch
+        return namedEmapMatch ?: lastMatch
     }
 
-    private fun parseTensorIf512x512(reader: ProtoStreamReader, tensorLen: Long): FloatArray? {
+    private fun parseTensorIf512x512(reader: ProtoStreamReader, tensorLen: Long): CandidateInitializer512? {
         val tensorEnd = reader.bytesRead + tensorLen
         val dims = mutableListOf<Long>()
         var dataType = 0
+        var tensorName = ""
         var matchedFloats: FloatArray? = null
+        var unpackedFloatCursor = 0
 
         while (reader.bytesRead < tensorEnd && !reader.isEof()) {
             val tag = reader.readVarint32()
@@ -819,7 +831,9 @@ object OnnxProtobufInspector {
                 4 -> {
                     if (wire == 2) {
                         val byteLen = reader.readVarint64()
-                        if (dims.size == 2 && dims[0] == 512L && dims[1] == 512L && byteLen == EMAP_BYTES.toLong()) {
+                        if ((dims.isEmpty() || (dims.size == 2 && dims[0] == 512L && dims[1] == 512L)) &&
+                            byteLen == EMAP_BYTES.toLong()
+                        ) {
                             val raw = reader.readExactBytes(EMAP_BYTES)
                             val out = FloatArray(EMAP_FLOATS)
                             ByteBuffer.wrap(raw).order(ByteOrder.LITTLE_ENDIAN).asFloatBuffer().get(out)
@@ -827,6 +841,25 @@ object OnnxProtobufInspector {
                         } else {
                             reader.skipBytes(byteLen)
                         }
+                    } else if (wire == 5) {
+                        // Proto2 unpacked repeated float float_data = 4
+                        val isCandidate = dims.isEmpty() || (dims.size == 2 && dims[0] == 512L && dims[1] == 512L)
+                        if (isCandidate) {
+                            val arr = matchedFloats ?: FloatArray(EMAP_FLOATS).also { matchedFloats = it }
+                            val raw4 = reader.readExactBytes(4)
+                            if (unpackedFloatCursor < EMAP_FLOATS) {
+                                arr[unpackedFloatCursor++] = ByteBuffer.wrap(raw4).order(ByteOrder.LITTLE_ENDIAN).float
+                            }
+                        } else {
+                            reader.skipBytes(4)
+                        }
+                    } else {
+                        reader.skipField(wire)
+                    }
+                }
+                8 -> {
+                    if (wire == 2) {
+                        tensorName = reader.readString()
                     } else {
                         reader.skipField(wire)
                     }
@@ -855,7 +888,13 @@ object OnnxProtobufInspector {
         if (reader.bytesRead < tensorEnd) {
             reader.skipBytes(tensorEnd - reader.bytesRead)
         }
-        return if (dims.size == 2 && dims[0] == 512L && dims[1] == 512L) matchedFloats else null
+        val validFloats = matchedFloats
+        val isComplete = validFloats != null && (unpackedFloatCursor == 0 || unpackedFloatCursor == EMAP_FLOATS)
+        return if (dims.size == 2 && dims[0] == 512L && dims[1] == 512L && isComplete && validFloats != null) {
+            CandidateInitializer512(tensorName, validFloats)
+        } else {
+            null
+        }
     }
 
     private fun computeQuickSha256Prefix(file: File): String {

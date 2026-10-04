@@ -177,6 +177,7 @@ object GhostHeadReplacementEngine {
                         targetFace = targetFace,
                         synthesizedHeadCrop = synthesizedHeadCrop,
                         headCropSize = headCropSize,
+                        srcYawRatio = srcHeadPose.yawRatio,
                         preferHardwareAccel = preferHardwareAccel
                     )
                 }
@@ -325,6 +326,7 @@ object GhostHeadReplacementEngine {
         targetFace: DetectedFace,
         synthesizedHeadCrop: Bitmap,
         headCropSize: Int,
+        srcYawRatio: Float,
         preferHardwareAccel: Boolean
     ) {
         val m128 = FaceAlignment.estimateNorm(targetFace.landmarks5, 128)
@@ -332,7 +334,6 @@ object GhostHeadReplacementEngine {
         val hw = 128 * 128
         val pixels128 = IntArray(hw)
         targetCrop128.getPixels(pixels128, 0, 128, 0, 0, 128, 128)
-        targetCrop128.recycle()
 
         val targetBuf = java.nio.FloatBuffer.allocate(3 * hw)
         for (i in 0 until hw) {
@@ -343,7 +344,7 @@ object GhostHeadReplacementEngine {
         }
         targetBuf.rewind()
 
-        val swappedPixels128 = IntArray(hw)
+        val rawSwappedPixels128 = IntArray(hw)
         OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
             ortEnv.createSession(swapFile.absolutePath, opts).use { session ->
                 var targetName = "target"
@@ -364,7 +365,7 @@ object GhostHeadReplacementEngine {
                                 val r = (outFloats[i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
                                 val g = (outFloats[hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
                                 val b = (outFloats[2 * hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
-                                swappedPixels128[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                                rawSwappedPixels128[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                             }
                         }
                     }
@@ -372,9 +373,24 @@ object GhostHeadReplacementEngine {
             }
         }
 
-        // Map canonical head keypoints to 128x128 InSwapper coordinates and blend inner eyes/mouth at 38%
-        val headPts = HeadSegmentationAndInpainting.getCanonicalHeadTemplate(headCropSize).toList()
+        val rawSwappedBmp = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
+        rawSwappedBmp.setPixels(rawSwappedPixels128, 0, 128, 0, 0, 128, 128)
+        val eyeRestoredBmp = FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
+            swapped128 = rawSwappedBmp,
+            alignedTarget128 = targetCrop128,
+            alignedSource112 = sourceEmbedding.aligned112Crop
+        )
+        rawSwappedBmp.recycle()
+        targetCrop128.recycle()
+
+        val swappedPixels128 = IntArray(hw)
+        eyeRestoredBmp.getPixels(swappedPixels128, 0, 128, 0, 0, 128, 128)
+        eyeRestoredBmp.recycle()
+
+        // Map canonical head keypoints (with matching srcYawRatio) to 128x128 InSwapper coordinates
+        val headPts = HeadSegmentationAndInpainting.getCanonicalHeadTemplate(headCropSize, srcYawRatio).toList()
         val headTo128 = FaceAlignment.estimateNorm(headPts, 128)
+        val featheredMask128 = FaceBlender.createFeatheredFaceMask128()
         val headPixels = IntArray(headCropSize * headCropSize)
         synthesizedHeadCrop.getPixels(headPixels, 0, headCropSize, 0, 0, headCropSize, headCropSize)
 
@@ -382,12 +398,11 @@ object GhostHeadReplacementEngine {
             for (x in 0 until headCropSize) {
                 val u = headTo128[0] * x + headTo128[1] * y + headTo128[2]
                 val v = headTo128[3] * x + headTo128[4] * y + headTo128[5]
-                if (u in 22f..106f && v in 26f..104f) {
-                    val dx = (u - 64f) / 38f
-                    val dy = (v - 66f) / 36f
-                    val rSq = dx * dx + dy * dy
-                    if (rSq < 1.0f) {
-                        val w = (1.0f - rSq) * 0.38f
+                if (u in 6f..121f && v in 6f..121f) {
+                    val u0 = u.toInt().coerceIn(0, 126)
+                    val v0 = v.toInt().coerceIn(0, 126)
+                    val w = featheredMask128[v0 * 128 + u0]
+                    if (w > 0.005f) {
                         val swapC = FaceAlignment.sampleBilinearClamped(swappedPixels128, 128, 128, u, v)
                         val srcC = headPixels[y * headCropSize + x]
                         val r = ((srcC ushr 16 and 0xFF) * (1f - w) + (swapC ushr 16 and 0xFF) * w).toInt().coerceIn(0, 255)
@@ -403,7 +418,7 @@ object GhostHeadReplacementEngine {
 
     /**
      * Adapts skin and neck illumination/color statistics to match the target scene while preserving
-     * the source hairstyle's natural color (using `skinAndNeckWeight` on skin vs gentle ambient luminance on hair).
+     * the source hairstyle's natural color and protecting the eye sockets from pupil/sclera washout.
      */
     private fun adaptHeadSkinAndLightingSelective(
         sourceHeadCrop: Bitmap,
@@ -417,7 +432,7 @@ object GhostHeadReplacementEngine {
         sourceHeadCrop.getPixels(srcPx, 0, size, 0, 0, size, size)
         targetHeadCrop.getPixels(tgtPx, 0, size, 0, 0, size, size)
 
-        // Compute mean & std in the central facial region (x in 0.38..0.62, y in 0.44..0.68)
+        // Compute mean & std strictly on mid-face skin (cheeks & nose bridge, y in 0.50..0.66, excluding eye row ~0.44)
         var sRMean = 0.0
         var sGMean = 0.0
         var sBMean = 0.0
@@ -428,8 +443,8 @@ object GhostHeadReplacementEngine {
 
         val x0 = (size * 0.38f).toInt()
         val x1 = (size * 0.62f).toInt()
-        val y0 = (size * 0.44f).toInt()
-        val y1 = (size * 0.68f).toInt()
+        val y0 = (size * 0.50f).toInt()
+        val y1 = (size * 0.66f).toInt()
 
         for (y in y0..y1) {
             for (x in x0..x1) {
@@ -481,38 +496,54 @@ object GhostHeadReplacementEngine {
             }
         }
 
-        val scaleR = (sqrt(tRVar / count).coerceAtLeast(5.0) / sqrt(sRVar / count).coerceAtLeast(5.0)).coerceIn(0.75, 1.30)
-        val scaleG = (sqrt(tGVar / count).coerceAtLeast(5.0) / sqrt(sGVar / count).coerceAtLeast(5.0)).coerceIn(0.75, 1.30)
-        val scaleB = (sqrt(tBVar / count).coerceAtLeast(5.0) / sqrt(sBVar / count).coerceAtLeast(5.0)).coerceIn(0.75, 1.30)
+        val scaleR = (sqrt(tRVar / count).coerceAtLeast(6.0) / sqrt(sRVar / count).coerceAtLeast(6.0)).coerceIn(0.80, 1.25)
+        val scaleG = (sqrt(tGVar / count).coerceAtLeast(6.0) / sqrt(sGVar / count).coerceAtLeast(6.0)).coerceIn(0.80, 1.25)
+        val scaleB = (sqrt(tBVar / count).coerceAtLeast(6.0) / sqrt(sBVar / count).coerceAtLeast(6.0)).coerceIn(0.80, 1.25)
 
         // Ambient luminance ratio for gentle hair exposure adaptation
         val srcLum = 0.299 * sRMean + 0.587 * sGMean + 0.114 * sBMean
         val tgtLum = 0.299 * tRMean + 0.587 * tGMean + 0.114 * tBMean
-        val hairAmbientScale = (tgtLum / srcLum.coerceAtLeast(15.0)).coerceIn(0.82, 1.20).toFloat()
+        val hairAmbientScale = (tgtLum / srcLum.coerceAtLeast(15.0)).coerceIn(0.85, 1.18).toFloat()
+
+        val leftEyeX = size * (98.0f / 256.0f)
+        val rightEyeX = size * (158.0f / 256.0f)
+        val eyeY = size * (114.0f / 256.0f)
+        val eyeRx = size * (26.0f / 256.0f)
+        val eyeRy = size * (16.0f / 256.0f)
 
         val outPx = IntArray(total)
-        for (i in 0 until total) {
-            val sc = srcPx[i]
-            val r = (sc ushr 16) and 0xFF
-            val g = (sc ushr 8) and 0xFF
-            val b = sc and 0xFF
+        for (y in 0 until size) {
+            val row = y * size
+            val dy = (y - eyeY) / eyeRy
+            for (x in 0 until size) {
+                val i = row + x
+                val sc = srcPx[i]
+                val r = (sc ushr 16) and 0xFF
+                val g = (sc ushr 8) and 0xFF
+                val b = sc and 0xFF
 
-            val skinAdaptR = ((r - sRMean) * scaleR + tRMean).toFloat()
-            val skinAdaptG = ((g - sGMean) * scaleG + tGMean).toFloat()
-            val skinAdaptB = ((b - sBMean) * scaleB + tBMean).toFloat()
+                val ldx = (x - leftEyeX) / eyeRx
+                val rdx = (x - rightEyeX) / eyeRx
+                val eyeDistSq = min(ldx * ldx + dy * dy, rdx * rdx + dy * dy)
+                val eyeProt = (1.0f - eyeDistSq).coerceIn(0f, 1f)
 
-            val hairAdaptR = r * hairAmbientScale
-            val hairAdaptG = g * hairAmbientScale
-            val hairAdaptB = b * hairAmbientScale
+                val skinAdaptR = ((r - sRMean) * scaleR + tRMean).toFloat()
+                val skinAdaptG = ((g - sGMean) * scaleG + tGMean).toFloat()
+                val skinAdaptB = ((b - sBMean) * scaleB + tBMean).toFloat()
 
-            val sw = (skinAndNeckWeight[i] * 0.78f).coerceIn(0f, 0.82f)
-            val hw = (1f - sw) * 0.25f
-            val origW = 1f - sw - hw
+                val hairAdaptR = r * hairAmbientScale
+                val hairAdaptG = g * hairAmbientScale
+                val hairAdaptB = b * hairAmbientScale
 
-            val finalR = (r * origW + skinAdaptR * sw + hairAdaptR * hw).toInt().coerceIn(0, 255)
-            val finalG = (g * origW + skinAdaptG * sw + hairAdaptG * hw).toInt().coerceIn(0, 255)
-            val finalB = (b * origW + skinAdaptB * sw + hairAdaptB * hw).toInt().coerceIn(0, 255)
-            outPx[i] = (0xFF shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
+                val sw = (skinAndNeckWeight[i] * 0.72f * (1.0f - 0.90f * eyeProt)).coerceIn(0f, 0.78f)
+                val hw = (1f - skinAndNeckWeight[i]).coerceIn(0f, 1f) * 0.22f
+                val origW = (1f - sw - hw).coerceIn(0f, 1f)
+
+                val finalR = (r * origW + skinAdaptR * sw + hairAdaptR * hw).toInt().coerceIn(0, 255)
+                val finalG = (g * origW + skinAdaptG * sw + hairAdaptG * hw).toInt().coerceIn(0, 255)
+                val finalB = (b * origW + skinAdaptB * sw + hairAdaptB * hw).toInt().coerceIn(0, 255)
+                outPx[i] = (0xFF shl 24) or (finalR shl 16) or (finalG shl 8) or finalB
+            }
         }
 
         val out = Bitmap.createBitmap(size, size, Bitmap.Config.ARGB_8888)

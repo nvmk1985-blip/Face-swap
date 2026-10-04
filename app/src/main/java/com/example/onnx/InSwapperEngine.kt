@@ -176,16 +176,36 @@ object InSwapperEngine {
                         onProgress(
                             SwapStageProgress(
                                 stepIndex = 5,
-                                stageTitle = "Stage 5/5: Color Harmonization & Inverse Affine Blending",
-                                detailMessage = "Blending swapped face #${targetFace.index + 1} with feathered mask...",
+                                stageTitle = "Stage 5/5: Eye Restoration, Color Harmonization & Blending",
+                                detailMessage = "Restoring eye iris/sclera clarity & blending swapped face #${targetFace.index + 1}...",
                                 progressFraction = 0.90f
                             )
                         )
 
-                        val colorCorrected128 = if (enableColorTransfer) {
-                            FaceBlender.transferSkinToneStatistics128(rawSwapped128, alignedTarget128)
+                        // 1. Eliminate negative/hollow eye artifacts & restore crisp iris/sclera polarity
+                        val eyeRestored128 = FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
+                            swapped128 = rawSwapped128,
+                            alignedTarget128 = alignedTarget128,
+                            alignedSource112 = sourceEmbedding.aligned112Crop
+                        )
+
+                        // 2. Run optional GFPGAN ONNX enhancement if gfpgan_1.4.onnx is installed
+                        val gfpganFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
+                        val gfpEnhanced128 = if (gfpganFile.exists() && gfpganFile.length() > 1024L) {
+                            FaceBlender.runOptionalGfpganEnhancement128(
+                                ortEnv = ortEnv,
+                                gfpganFile = gfpganFile,
+                                crop128 = eyeRestored128
+                            )
                         } else {
-                            rawSwapped128
+                            eyeRestored128
+                        }
+
+                        // 3. Harmonize skin tone while protecting eyes from color/contrast washout
+                        val colorCorrected128 = if (enableColorTransfer) {
+                            FaceBlender.transferSkinToneStatistics128(gfpEnhanced128, alignedTarget128)
+                        } else {
+                            gfpEnhanced128
                         }
 
                         FaceBlender.blendSwappedFaceIntoTarget(
@@ -197,15 +217,20 @@ object InSwapperEngine {
                             featheredMask128 = featheredMask128
                         )
 
-                        if (colorCorrected128 !== rawSwapped128) {
+                        if (gfpEnhanced128 !== eyeRestored128) {
+                            gfpEnhanced128.recycle()
+                        }
+                        if (colorCorrected128 !== gfpEnhanced128 && colorCorrected128 !== eyeRestored128) {
                             colorCorrected128.recycle()
                         }
 
                         if (firstTargetCrop128 == null) {
                             firstTargetCrop128 = alignedTarget128
-                            firstRawSwapped128 = rawSwapped128
+                            firstRawSwapped128 = eyeRestored128
+                            rawSwapped128.recycle()
                         } else {
                             alignedTarget128.recycle()
+                            eyeRestored128.recycle()
                             rawSwapped128.recycle()
                         }
                         totalBlendMs += (System.currentTimeMillis() - tBlend0).coerceAtLeast(1L)
