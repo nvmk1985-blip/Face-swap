@@ -43,7 +43,8 @@ object ArcFaceRecognizer {
         sourceLandmarks5: List<PointF>,
         arcFaceModelFile: File?,
         emap512x512: FloatArray?,
-        allowTwoModelFallbackForTesting: Boolean
+        allowTwoModelFallbackForTesting: Boolean,
+        preloadedArcFaceSession: OrtSession? = null
     ): SourceEmbeddingResult {
         // 1. Align source face to 112x112 canonical ArcFace coordinate frame via 5-point Umeyama transform
         val m112 = FaceAlignment.estimateNorm(sourceLandmarks5, ARCFACE_SIZE)
@@ -52,7 +53,10 @@ object ArcFaceRecognizer {
         val rawEmbedding: FloatArray
         val usedArcFace: Boolean
 
-        if (arcFaceModelFile != null && arcFaceModelFile.exists() && arcFaceModelFile.length() > 1024L) {
+        if (preloadedArcFaceSession != null) {
+            rawEmbedding = runArcFaceSession(ortEnv, preloadedArcFaceSession, aligned112)
+            usedArcFace = true
+        } else if (arcFaceModelFile != null && arcFaceModelFile.exists() && arcFaceModelFile.length() > 1024L) {
             rawEmbedding = runArcFaceOnnx(ortEnv, arcFaceModelFile, aligned112)
             usedArcFace = true
         } else if (allowTwoModelFallbackForTesting) {
@@ -90,7 +94,13 @@ object ArcFaceRecognizer {
         }
 
         val summary = buildString {
-            append(if (usedArcFace) "w600k_r50.onnx (ArcFace 512-D)" else "2-Model Spatial Descriptor (512-D)")
+            append(
+                when {
+                    preloadedArcFaceSession != null -> "w600k_r50.onnx (In-Memory Session 512-D)"
+                    usedArcFace -> "w600k_r50.onnx (ArcFace 512-D)"
+                    else -> "2-Model Spatial Descriptor (512-D)"
+                }
+            )
             append(if (usedEmap) " + inswapper emap[512x512]" else " (direct L2 norm)")
         }
 
@@ -104,9 +114,9 @@ object ArcFaceRecognizer {
         )
     }
 
-    private fun runArcFaceOnnx(
+    fun runArcFaceSession(
         ortEnv: OrtEnvironment,
-        arcFaceFile: File,
+        session: OrtSession,
         aligned112: Bitmap
     ): FloatArray {
         val hw = ARCFACE_SIZE * ARCFACE_SIZE
@@ -126,22 +136,30 @@ object ArcFaceRecognizer {
         }
         floatBuffer.rewind()
 
+        val inputName = session.inputNames.first()
+        val shape = longArrayOf(1L, 3L, ARCFACE_SIZE.toLong(), ARCFACE_SIZE.toLong())
+        OnnxTensor.createTensor(ortEnv, floatBuffer, shape).use { inputTensor ->
+            session.run(mapOf(inputName to inputTensor)).use { results ->
+                val outTensor = results[0] as OnnxTensor
+                val fb = outTensor.floatBuffer
+                val out = FloatArray(EMBEDDING_DIM)
+                val count = minOf(fb.remaining(), EMBEDDING_DIM)
+                fb.get(out, 0, count)
+                return out
+            }
+        }
+    }
+
+    private fun runArcFaceOnnx(
+        ortEnv: OrtEnvironment,
+        arcFaceFile: File,
+        aligned112: Bitmap
+    ): FloatArray {
         OrtSession.SessionOptions().use { opts ->
             opts.setIntraOpNumThreads(4)
             opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
             ortEnv.createSession(arcFaceFile.absolutePath, opts).use { session ->
-                val inputName = session.inputNames.first()
-                val shape = longArrayOf(1L, 3L, ARCFACE_SIZE.toLong(), ARCFACE_SIZE.toLong())
-                OnnxTensor.createTensor(ortEnv, floatBuffer, shape).use { inputTensor ->
-                    session.run(mapOf(inputName to inputTensor)).use { results ->
-                        val outTensor = results[0] as OnnxTensor
-                        val fb = outTensor.floatBuffer
-                        val out = FloatArray(EMBEDDING_DIM)
-                        val count = minOf(fb.remaining(), EMBEDDING_DIM)
-                        fb.get(out, 0, count)
-                        return out
-                    }
-                }
+                return runArcFaceSession(ortEnv, session, aligned112)
             }
         }
     }

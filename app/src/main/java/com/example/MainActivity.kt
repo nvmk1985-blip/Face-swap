@@ -340,6 +340,7 @@ fun FaceSwapStudioApp(
                 AppTab.MODELS -> ModelsInspectorTab(
                     inspections = uiState.modelInspections,
                     isInspecting = uiState.isInspectingModels,
+                    memoryServiceState = uiState.memoryServiceState,
                     onImportModelForSlot = { slot ->
                         pendingImportSlot = slot
                         onnxDocumentPicker.launch(arrayOf("*/*"))
@@ -347,7 +348,9 @@ fun FaceSwapStudioApp(
                     onRefreshModels = viewModel::refreshModelInspections,
                     onImportAllFromFolder = {
                         onnxFolderTreePicker.launch(null)
-                    }
+                    },
+                    onPreloadMemoryModels = viewModel::preloadModelsIntoMemory,
+                    onReleaseMemoryModels = viewModel::releaseModelsFromMemory
                 )
 
                 AppTab.HISTORY -> HistoryAuditTab(

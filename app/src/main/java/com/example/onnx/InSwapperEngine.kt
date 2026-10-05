@@ -52,6 +52,10 @@ object InSwapperEngine {
         enableColorTransfer: Boolean,
         enableProvenanceWatermark: Boolean,
         allowTwoModelFallbackForTesting: Boolean,
+        preloadedArcFaceSession: OrtSession? = null,
+        preloadedSwapSession: OrtSession? = null,
+        preloadedGfpganSession: OrtSession? = null,
+        preloadedEmap512x512: FloatArray? = null,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val tStart = System.currentTimeMillis()
@@ -59,7 +63,7 @@ object InSwapperEngine {
         val recFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.RECOGNIZER)
         val swapFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.SWAPPER)
 
-        require(swapFile.exists() && swapFile.length() > 1024L) {
+        require(preloadedSwapSession != null || (swapFile.exists() && swapFile.length() > 1024L)) {
             "inswapper_128.onnx is not loaded. Please import inswapper_128.onnx in the ONNX Models tab or place it in app/src/main/assets/models/."
         }
         require(detFile.exists() && detFile.length() > 1024L) {
@@ -91,13 +95,14 @@ object InSwapperEngine {
                 progressFraction = 0.32f
             )
         )
-        val emap512x512 = OnnxProtobufInspector.loadOrExtractInswapperEmap(context, swapFile)
+        val emap512x512 = preloadedEmap512x512
+            ?: OnnxProtobufInspector.loadOrExtractInswapperEmap(context, swapFile)
 
         onProgress(
             SwapStageProgress(
                 stepIndex = 3,
                 stageTitle = "Stage 3/5: Source 512-D Identity Embedding",
-                detailMessage = if (recFile.exists()) {
+                detailMessage = if (preloadedArcFaceSession != null || recFile.exists()) {
                     "Running w600k_r50.onnx [1, 3, 112, 112] -> [1, 512] + emap projection..."
                 } else {
                     "Computing 512-D source embedding + emap projection..."
@@ -111,18 +116,17 @@ object InSwapperEngine {
             sourceLandmarks5 = sourceFace.landmarks5,
             arcFaceModelFile = if (recFile.exists()) recFile else null,
             emap512x512 = emap512x512,
-            allowTwoModelFallbackForTesting = allowTwoModelFallbackForTesting
+            allowTwoModelFallbackForTesting = allowTwoModelFallbackForTesting,
+            preloadedArcFaceSession = preloadedArcFaceSession
         )
         val embMs = (System.currentTimeMillis() - tEmbStart).coerceAtLeast(1L)
 
         // Stage 4: Run inswapper_128.onnx for each selected target face
-        val tSwapStart = System.currentTimeMillis()
         val targetW = targetBitmap.width
         val targetH = targetBitmap.height
         val compositePixels = IntArray(targetW * targetH)
         targetBitmap.getPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)
 
-        val featheredMask128 = FaceBlender.createFeatheredFaceMask128()
         val srcM128 = FaceAlignment.estimateNorm(sourceFace.landmarks5, INSWAPPER_SIZE)
         val alignedSource128 = FaceAlignment.warpAffineCrop(sourceBitmap, srcM128, INSWAPPER_SIZE)
         val hasTrueArcFaceLatent = sourceEmbedding.usedArcFaceModel && sourceEmbedding.usedEmbeddedEmap
@@ -132,115 +136,120 @@ object InSwapperEngine {
         var totalSwapMs = 0L
         var totalBlendMs = 0L
 
-        OrtSession.SessionOptions().use { sessionOpts ->
-            sessionOpts.setIntraOpNumThreads(4)
-            sessionOpts.setMemoryPatternOptimization(true)
-            sessionOpts.setCPUArenaAllocator(true)
-            sessionOpts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        val executeWithSwapSession: (OrtSession) -> Unit = { swapSession ->
+            // Identify target [1, 3, 128, 128] and source [1, 512] input names dynamically
+            var targetInputName = "target"
+            var sourceInputName = "source"
+            for ((name, nodeInfo) in swapSession.inputInfo) {
+                val tInfo = nodeInfo.info as? ai.onnxruntime.TensorInfo ?: continue
+                if (tInfo.shape.size == 4) targetInputName = name
+                if (tInfo.shape.size == 2) sourceInputName = name
+            }
 
-            ortEnv.createSession(swapFile.absolutePath, sessionOpts).use { swapSession ->
-                // Identify target [1, 3, 128, 128] and source [1, 512] input names dynamically
-                var targetInputName = "target"
-                var sourceInputName = "source"
-                for ((name, nodeInfo) in swapSession.inputInfo) {
-                    val tInfo = nodeInfo.info as? ai.onnxruntime.TensorInfo ?: continue
-                    if (tInfo.shape.size == 4) targetInputName = name
-                    if (tInfo.shape.size == 2) sourceInputName = name
-                }
+            val sourceFloatBuffer = FloatBuffer.wrap(sourceEmbedding.latentSourceVector512)
+            val sourceShape = longArrayOf(1L, 512L)
 
-                val sourceFloatBuffer = FloatBuffer.wrap(sourceEmbedding.latentSourceVector512)
-                val sourceShape = longArrayOf(1L, 512L)
-
-                OnnxTensor.createTensor(ortEnv, sourceFloatBuffer, sourceShape).use { sourceTensor ->
-                    targetFacesToReplace.forEachIndexed { idx, targetFace ->
-                        val stepFrac = 0.55f + (0.30f * (idx.toFloat() / targetFacesToReplace.size.coerceAtLeast(1)))
-                        onProgress(
-                            SwapStageProgress(
-                                stepIndex = 4,
-                                stageTitle = "Stage 4/5: InSwapper-128 ONNX Inference (${idx + 1}/${targetFacesToReplace.size})",
-                                detailMessage = "Running inswapper_128.onnx on aligned 128x128 target crop #${targetFace.index + 1}...",
-                                progressFraction = stepFrac
-                            )
+            OnnxTensor.createTensor(ortEnv, sourceFloatBuffer, sourceShape).use { sourceTensor ->
+                targetFacesToReplace.forEachIndexed { idx, targetFace ->
+                    val stepFrac = 0.55f + (0.30f * (idx.toFloat() / targetFacesToReplace.size.coerceAtLeast(1)))
+                    onProgress(
+                        SwapStageProgress(
+                            stepIndex = 4,
+                            stageTitle = "Stage 4/5: InSwapper-128 ONNX Inference (${idx + 1}/${targetFacesToReplace.size})",
+                            detailMessage = "Running inswapper_128.onnx on aligned 128x128 target crop #${targetFace.index + 1}...",
+                            progressFraction = stepFrac
                         )
+                    )
 
-                        val tFaceSwap0 = System.currentTimeMillis()
-                        val m128 = FaceAlignment.estimateNorm(targetFace.landmarks5, INSWAPPER_SIZE)
-                        val alignedTarget128 = FaceAlignment.warpAffineCrop(targetBitmap, m128, INSWAPPER_SIZE)
-                        val rawSwapped128 = runInswapperSingleFace(
-                            ortEnv = ortEnv,
-                            swapSession = swapSession,
-                            targetInputName = targetInputName,
-                            sourceInputName = sourceInputName,
-                            alignedTarget128 = alignedTarget128,
-                            sourceTensor = sourceTensor
+                    val tFaceSwap0 = System.currentTimeMillis()
+                    val m128 = FaceAlignment.estimateNorm(targetFace.landmarks5, INSWAPPER_SIZE)
+                    val alignedTarget128 = FaceAlignment.warpAffineCrop(targetBitmap, m128, INSWAPPER_SIZE)
+                    val rawSwapped128 = runInswapperSingleFace(
+                        ortEnv = ortEnv,
+                        swapSession = swapSession,
+                        targetInputName = targetInputName,
+                        sourceInputName = sourceInputName,
+                        alignedTarget128 = alignedTarget128,
+                        sourceTensor = sourceTensor
+                    )
+                    totalSwapMs += (System.currentTimeMillis() - tFaceSwap0).coerceAtLeast(1L)
+
+                    val tBlend0 = System.currentTimeMillis()
+                    onProgress(
+                        SwapStageProgress(
+                            stepIndex = 5,
+                            stageTitle = "Stage 5/5: 512x512 Online-Style HD Restoration & Glitch-Free Blending",
+                            detailMessage = "Restoring dynamic eye/brow landmarks, 512x512 skin pores & blending face #${targetFace.index + 1}...",
+                            progressFraction = 0.90f
                         )
-                        totalSwapMs += (System.currentTimeMillis() - tFaceSwap0).coerceAtLeast(1L)
+                    )
 
-                        val tBlend0 = System.currentTimeMillis()
-                        onProgress(
-                            SwapStageProgress(
-                                stepIndex = 5,
-                                stageTitle = "Stage 5/5: Anti-Negative Polarity, Eye Restoration & Blending",
-                                detailMessage = "Eliminating negative artifacts, restoring eye clarity & blending face #${targetFace.index + 1}...",
-                                progressFraction = 0.90f
-                            )
-                        )
+                    // 1. Zero-ghosting cheek/brow glitch removal + dynamic landmark eye & eyebrow restoration
+                    val eyeRestored128 = FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
+                        swapped128 = rawSwapped128,
+                        alignedTarget128 = alignedTarget128,
+                        alignedSource112 = sourceEmbedding.aligned112Crop,
+                        alignedSource128 = alignedSource128,
+                        hasTrueArcFaceLatent = hasTrueArcFaceLatent,
+                        forwardMatrix128 = m128,
+                        targetLandmarks5 = targetFace.landmarks5
+                    )
 
-                        // 1. Eliminate negative/hollow eye & face artifacts and restore crisp positive polarity
-                        val eyeRestored128 = FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
-                            swapped128 = rawSwapped128,
-                            alignedTarget128 = alignedTarget128,
-                            alignedSource112 = sourceEmbedding.aligned112Crop,
-                            alignedSource128 = alignedSource128,
-                            hasTrueArcFaceLatent = hasTrueArcFaceLatent
-                        )
-
-                        // 2. Run optional GFPGAN ONNX enhancement if gfpgan_1.4.onnx is installed
-                        val gfpganFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
-                        val gfpEnhanced128 = if (gfpganFile.exists() && gfpganFile.length() > 1024L) {
-                            FaceBlender.runOptionalGfpganEnhancement128(
-                                ortEnv = ortEnv,
-                                gfpganFile = gfpganFile,
-                                crop128 = eyeRestored128
-                            )
-                        } else {
-                            eyeRestored128
-                        }
-
-                        // 3. Harmonize skin tone while protecting eyes from color/contrast washout
-                        val colorCorrected128 = if (enableColorTransfer) {
-                            FaceBlender.transferSkinToneStatistics128(gfpEnhanced128, alignedTarget128)
-                        } else {
-                            gfpEnhanced128
-                        }
-
-                        FaceBlender.blendSwappedFaceIntoTarget(
-                            targetPixels = compositePixels,
-                            targetWidth = targetW,
-                            targetHeight = targetH,
-                            swapped128 = colorCorrected128,
+                    // 2. Harmonize skin tone strictly on skin while protecting dynamic eye & eyebrow zones
+                    val colorCorrected128 = if (enableColorTransfer) {
+                        FaceBlender.transferSkinToneStatistics128(
+                            swapped128 = eyeRestored128,
+                            targetCrop128 = alignedTarget128,
                             forwardMatrix128 = m128,
-                            featheredMask128 = featheredMask128
+                            targetLandmarks5 = targetFace.landmarks5
                         )
-
-                        if (gfpEnhanced128 !== eyeRestored128) {
-                            gfpEnhanced128.recycle()
-                        }
-                        if (colorCorrected128 !== gfpEnhanced128 && colorCorrected128 !== eyeRestored128) {
-                            colorCorrected128.recycle()
-                        }
-
-                        if (firstTargetCrop128 == null) {
-                            firstTargetCrop128 = alignedTarget128
-                            firstRawSwapped128 = eyeRestored128
-                            rawSwapped128.recycle()
-                        } else {
-                            alignedTarget128.recycle()
-                            eyeRestored128.recycle()
-                            rawSwapped128.recycle()
-                        }
-                        totalBlendMs += (System.currentTimeMillis() - tBlend0).coerceAtLeast(1L)
+                    } else {
+                        eyeRestored128
                     }
+
+                    // 3. Direct 512x512 Online Photo Style HD Super-Resolution, Pore Transfer & Biometric Feather Blending
+                    val gfpganFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
+                    FaceBlender.enhanceAndBlendOnlineHdFace512(
+                        ortEnv = ortEnv,
+                        gfpganFile = if (gfpganFile.exists() && gfpganFile.length() > 1024L) gfpganFile else null,
+                        targetBitmap = targetBitmap,
+                        targetPixels = compositePixels,
+                        targetWidth = targetW,
+                        targetHeight = targetH,
+                        colorCorrected128 = colorCorrected128,
+                        forwardMatrix128 = m128,
+                        targetLandmarks5 = targetFace.landmarks5,
+                        preloadedGfpganSession = preloadedGfpganSession
+                    )
+
+                    if (colorCorrected128 !== eyeRestored128) {
+                        colorCorrected128.recycle()
+                    }
+
+                    if (firstTargetCrop128 == null) {
+                        firstTargetCrop128 = alignedTarget128
+                        firstRawSwapped128 = eyeRestored128
+                        rawSwapped128.recycle()
+                    } else {
+                        alignedTarget128.recycle()
+                        eyeRestored128.recycle()
+                        rawSwapped128.recycle()
+                    }
+                    totalBlendMs += (System.currentTimeMillis() - tBlend0).coerceAtLeast(1L)
+                }
+            }
+        }
+
+        if (preloadedSwapSession != null) {
+            executeWithSwapSession(preloadedSwapSession)
+        } else {
+            OrtSession.SessionOptions().use { sessionOpts ->
+                sessionOpts.setIntraOpNumThreads(4)
+                sessionOpts.setMemoryPatternOptimization(true)
+                sessionOpts.setCPUArenaAllocator(true)
+                sessionOpts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+                ortEnv.createSession(swapFile.absolutePath, sessionOpts).use { swapSession ->
+                    executeWithSwapSession(swapSession)
                 }
             }
         }
@@ -254,6 +263,13 @@ object InSwapperEngine {
         }
 
         val totalMs = (System.currentTimeMillis() - tStart).coerceAtLeast(1L)
+        val gfpTag = if (preloadedGfpganSession != null ||
+            OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT).let { it.exists() && it.length() > 1024L }
+        ) {
+            " -> gfpgan_1.4.onnx (512x512 HD)"
+        } else {
+            " -> 512x512 Online HD Blend"
+        }
 
         return FaceSwapExecutionResult(
             outputBitmap = finalBitmap,
@@ -268,7 +284,7 @@ object InSwapperEngine {
             inswapperMs = totalSwapMs.coerceAtLeast(1L),
             blendingMs = totalBlendMs.coerceAtLeast(1L),
             totalMs = totalMs,
-            pipelineSummary = "det_10g.onnx -> ${sourceEmbedding.providerSummary} -> inswapper_128.onnx"
+            pipelineSummary = "det_10g.onnx -> ${sourceEmbedding.providerSummary} -> inswapper_128.onnx$gfpTag"
         )
     }
 

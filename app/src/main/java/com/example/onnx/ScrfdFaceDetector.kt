@@ -52,22 +52,74 @@ object ScrfdFaceDetector {
         detModelFile: File,
         bitmap: Bitmap,
         confThreshold: Float = 0.35f,
-        nmsThreshold: Float = 0.40f
+        nmsThreshold: Float = 0.40f,
+        preloadedSession: OrtSession? = null
     ): List<DetectedFace> {
+        if (preloadedSession != null) {
+            return detectFacesWithSession(
+                ortEnv = ortEnv,
+                session = preloadedSession,
+                bitmap = bitmap,
+                confThreshold = confThreshold,
+                nmsThreshold = nmsThreshold
+            )
+        }
         require(detModelFile.exists() && detModelFile.length() > 1024L) {
             "det_10g.onnx not found at ${detModelFile.absolutePath}"
         }
+        OrtSession.SessionOptions().use { sessionOpts ->
+            sessionOpts.setIntraOpNumThreads(4)
+            sessionOpts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+            ortEnv.createSession(detModelFile.absolutePath, sessionOpts).use { session ->
+                return detectFacesWithSession(
+                    ortEnv = ortEnv,
+                    session = session,
+                    bitmap = bitmap,
+                    confThreshold = confThreshold,
+                    nmsThreshold = nmsThreshold
+                )
+            }
+        }
+    }
 
+    fun detectFacesWithSession(
+        ortEnv: OrtEnvironment,
+        session: OrtSession,
+        bitmap: Bitmap,
+        confThreshold: Float = 0.35f,
+        nmsThreshold: Float = 0.40f
+    ): List<DetectedFace> {
         // Pass 1: Standard aspect-preserving letterbox with target threshold
-        var faces = runDetectionPass(ortEnv, detModelFile, bitmap, scaleFactor = 1.0f, confThreshold = confThreshold, nmsThreshold = nmsThreshold)
+        var faces = runDetectionPass(
+            ortEnv = ortEnv,
+            session = session,
+            bitmap = bitmap,
+            scaleFactor = 1.0f,
+            confThreshold = confThreshold,
+            nmsThreshold = nmsThreshold
+        )
         if (faces.isNotEmpty()) return faces
 
         // Pass 2: Relaxed confidence threshold (handles tilted heads or soft lighting)
-        faces = runDetectionPass(ortEnv, detModelFile, bitmap, scaleFactor = 1.0f, confThreshold = 0.20f, nmsThreshold = nmsThreshold)
+        faces = runDetectionPass(
+            ortEnv = ortEnv,
+            session = session,
+            bitmap = bitmap,
+            scaleFactor = 1.0f,
+            confThreshold = 0.20f,
+            nmsThreshold = nmsThreshold
+        )
         if (faces.isNotEmpty()) return faces
 
         // Pass 3: Scaled-down padded pass (0.68x) for ultra close-up selfies / macro portraits
-        faces = runDetectionPass(ortEnv, detModelFile, bitmap, scaleFactor = 0.68f, confThreshold = 0.22f, nmsThreshold = nmsThreshold)
+        faces = runDetectionPass(
+            ortEnv = ortEnv,
+            session = session,
+            bitmap = bitmap,
+            scaleFactor = 0.68f,
+            confThreshold = 0.22f,
+            nmsThreshold = nmsThreshold
+        )
         if (faces.isNotEmpty()) return faces
 
         // Pass 4: Built-in Android Hardware FaceDetector fallback
@@ -80,7 +132,7 @@ object ScrfdFaceDetector {
 
     private fun runDetectionPass(
         ortEnv: OrtEnvironment,
-        detModelFile: File,
+        session: OrtSession,
         bitmap: Bitmap,
         scaleFactor: Float,
         confThreshold: Float,
@@ -133,94 +185,88 @@ object ScrfdFaceDetector {
 
         val rawCandidates = mutableListOf<DetectedFace>()
 
-        OrtSession.SessionOptions().use { sessionOpts ->
-            sessionOpts.setIntraOpNumThreads(4)
-            sessionOpts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            ortEnv.createSession(detModelFile.absolutePath, sessionOpts).use { session ->
-                val inputName = session.inputNames.first()
-                val shape = longArrayOf(1L, 3L, INPUT_HEIGHT.toLong(), INPUT_WIDTH.toLong())
-                OnnxTensor.createTensor(ortEnv, floatBuffer, shape).use { inputTensor ->
-                    session.run(mapOf(inputName to inputTensor)).use { result ->
-                        val scoresByAnchors = mutableMapOf<Int, FloatArray>()
-                        val bboxesByAnchors = mutableMapOf<Int, FloatArray>()
-                        val kpsByAnchors = mutableMapOf<Int, FloatArray>()
+        val inputName = session.inputNames.first()
+        val shape = longArrayOf(1L, 3L, INPUT_HEIGHT.toLong(), INPUT_WIDTH.toLong())
+        OnnxTensor.createTensor(ortEnv, floatBuffer, shape).use { inputTensor ->
+            session.run(mapOf(inputName to inputTensor)).use { result ->
+                val scoresByAnchors = mutableMapOf<Int, FloatArray>()
+                val bboxesByAnchors = mutableMapOf<Int, FloatArray>()
+                val kpsByAnchors = mutableMapOf<Int, FloatArray>()
 
-                        for (entry in result) {
-                            val onnxVal = entry.value as? OnnxTensor ?: continue
-                            val tShape = onnxVal.info.shape
-                            val flat = onnxVal.floatBuffer
-                            val data = FloatArray(flat.remaining())
-                            flat.get(data)
+                for (entry in result) {
+                    val onnxVal = entry.value as? OnnxTensor ?: continue
+                    val tShape = onnxVal.info.shape
+                    val flat = onnxVal.floatBuffer
+                    val data = FloatArray(flat.remaining())
+                    flat.get(data)
 
-                            val lastDim = tShape.last().toInt()
-                            val anchorCount = if (tShape.size == 3) tShape[1].toInt() else tShape[0].toInt()
+                    val lastDim = tShape.last().toInt()
+                    val anchorCount = if (tShape.size == 3) tShape[1].toInt() else tShape[0].toInt()
 
-                            when (lastDim) {
-                                1 -> scoresByAnchors[anchorCount] = data
-                                4 -> bboxesByAnchors[anchorCount] = data
-                                10 -> kpsByAnchors[anchorCount] = data
-                            }
-                        }
+                    when (lastDim) {
+                        1 -> scoresByAnchors[anchorCount] = data
+                        4 -> bboxesByAnchors[anchorCount] = data
+                        10 -> kpsByAnchors[anchorCount] = data
+                    }
+                }
 
-                        for (stride in STRIDES) {
-                            val featW = INPUT_WIDTH / stride
-                            val featH = INPUT_HEIGHT / stride
-                            val anchorCount = featW * featH * NUM_ANCHORS
+                for (stride in STRIDES) {
+                    val featW = INPUT_WIDTH / stride
+                    val featH = INPUT_HEIGHT / stride
+                    val anchorCount = featW * featH * NUM_ANCHORS
 
-                            val scores = scoresByAnchors[anchorCount] ?: continue
-                            val bboxes = bboxesByAnchors[anchorCount] ?: continue
-                            val kps = kpsByAnchors[anchorCount]
+                    val scores = scoresByAnchors[anchorCount] ?: continue
+                    val bboxes = bboxesByAnchors[anchorCount] ?: continue
+                    val kps = kpsByAnchors[anchorCount]
 
-                            var anchorIdx = 0
-                            for (row in 0 until featH) {
-                                val cy = row * stride.toFloat()
-                                for (col in 0 until featW) {
-                                    val cx = col * stride.toFloat()
-                                    for (a in 0 until NUM_ANCHORS) {
-                                        var score = scores[anchorIdx]
-                                        if (score < 0f || score > 1f) {
-                                            score = (1.0f / (1.0f + exp(-score)))
+                    var anchorIdx = 0
+                    for (row in 0 until featH) {
+                        val cy = row * stride.toFloat()
+                        for (col in 0 until featW) {
+                            val cx = col * stride.toFloat()
+                            for (a in 0 until NUM_ANCHORS) {
+                                var score = scores[anchorIdx]
+                                if (score < 0f || score > 1f) {
+                                    score = (1.0f / (1.0f + exp(-score)))
+                                }
+                                if (score >= confThreshold) {
+                                    val bOffset = anchorIdx * 4
+                                    val l = bboxes[bOffset] * stride
+                                    val t = bboxes[bOffset + 1] * stride
+                                    val r = bboxes[bOffset + 2] * stride
+                                    val b = bboxes[bOffset + 3] * stride
+
+                                    val x1 = (((cx - l) - offsetX) / detScale).coerceIn(0f, origW.toFloat())
+                                    val y1 = (((cy - t) - offsetY) / detScale).coerceIn(0f, origH.toFloat())
+                                    val x2 = (((cx + r) - offsetX) / detScale).coerceIn(0f, origW.toFloat())
+                                    val y2 = (((cy + b) - offsetY) / detScale).coerceIn(0f, origH.toFloat())
+
+                                    val landmarks = if (kps != null) {
+                                        val kOffset = anchorIdx * 10
+                                        List(5) { ptIdx ->
+                                            val kx = (((cx + kps[kOffset + ptIdx * 2] * stride) - offsetX) / detScale)
+                                                .coerceIn(0f, origW.toFloat())
+                                            val ky = (((cy + kps[kOffset + ptIdx * 2 + 1] * stride) - offsetY) / detScale)
+                                                .coerceIn(0f, origH.toFloat())
+                                            PointF(kx, ky)
                                         }
-                                        if (score >= confThreshold) {
-                                            val bOffset = anchorIdx * 4
-                                            val l = bboxes[bOffset] * stride
-                                            val t = bboxes[bOffset + 1] * stride
-                                            val r = bboxes[bOffset + 2] * stride
-                                            val b = bboxes[bOffset + 3] * stride
+                                    } else {
+                                        estimateGeometricLandmarksFromBox(RectF(x1, y1, x2, y2))
+                                    }
 
-                                            val x1 = (((cx - l) - offsetX) / detScale).coerceIn(0f, origW.toFloat())
-                                            val y1 = (((cy - t) - offsetY) / detScale).coerceIn(0f, origH.toFloat())
-                                            val x2 = (((cx + r) - offsetX) / detScale).coerceIn(0f, origW.toFloat())
-                                            val y2 = (((cy + b) - offsetY) / detScale).coerceIn(0f, origH.toFloat())
-
-                                            val landmarks = if (kps != null) {
-                                                val kOffset = anchorIdx * 10
-                                                List(5) { ptIdx ->
-                                                    val kx = (((cx + kps[kOffset + ptIdx * 2] * stride) - offsetX) / detScale)
-                                                        .coerceIn(0f, origW.toFloat())
-                                                    val ky = (((cy + kps[kOffset + ptIdx * 2 + 1] * stride) - offsetY) / detScale)
-                                                        .coerceIn(0f, origH.toFloat())
-                                                    PointF(kx, ky)
-                                                }
-                                            } else {
-                                                estimateGeometricLandmarksFromBox(RectF(x1, y1, x2, y2))
-                                            }
-
-                                            if (x2 - x1 > 12f && y2 - y1 > 12f) {
-                                                rawCandidates.add(
-                                                    DetectedFace(
-                                                        index = 0,
-                                                        boundingBox = RectF(x1, y1, x2, y2),
-                                                        score = score,
-                                                        landmarks5 = landmarks,
-                                                        detectorSource = "det_10g.onnx (SCRFD-10G_KPS)"
-                                                    )
-                                                )
-                                            }
-                                        }
-                                        anchorIdx++
+                                    if (x2 - x1 > 12f && y2 - y1 > 12f) {
+                                        rawCandidates.add(
+                                            DetectedFace(
+                                                index = 0,
+                                                boundingBox = RectF(x1, y1, x2, y2),
+                                                score = score,
+                                                landmarks5 = landmarks,
+                                                detectorSource = "det_10g.onnx (SCRFD-10G_KPS)"
+                                            )
+                                        )
                                     }
                                 }
+                                anchorIdx++
                             }
                         }
                     }

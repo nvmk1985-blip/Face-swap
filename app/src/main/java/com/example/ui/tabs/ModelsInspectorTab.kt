@@ -47,6 +47,7 @@ import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.CoralError
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.NeonEmerald
+import com.example.onnx.OnnxMemoryServiceState
 import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.RoyalViolet
 
@@ -54,9 +55,12 @@ import com.example.ui.theme.RoyalViolet
 fun ModelsInspectorTab(
     inspections: List<OnnxModelInspection>,
     isInspecting: Boolean,
+    memoryServiceState: OnnxMemoryServiceState = OnnxMemoryServiceState(),
     onImportModelForSlot: (ModelSlot) -> Unit,
     onRefreshModels: () -> Unit,
     onImportAllFromFolder: () -> Unit = {},
+    onPreloadMemoryModels: () -> Unit = {},
+    onReleaseMemoryModels: () -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     Column(
@@ -73,6 +77,87 @@ fun ModelsInspectorTab(
                 .widthIn(max = 640.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
+            // 0. ONNX Runtime In-Memory Model Service Card (w600k_r50.onnx, gfpgan_1.4.onnx, segformer_B5_ce.onnx)
+            Card(
+                modifier = Modifier.fillMaxWidth(),
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+            ) {
+                Column(
+                    modifier = Modifier.padding(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Text(
+                        text = "ONNX Runtime In-Memory Service (OnnxRuntimeModelService)",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = NeonEmerald
+                    )
+                    Text(
+                        text = "Keeps w600k_r50.onnx (Identity), gfpgan_1.4.onnx (512x512 Restoration), and segformer_B5_ce.onnx (Head/Hair Parser) + det_10g / inswapper_128 warm in native memory for instant Face Detection, Swapping, and Restoration.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(10.dp))
+                            .background(ObsidianBg)
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        MemorySlotRow(
+                            label = "w600k_r50.onnx (ArcFace 512-D Identity)",
+                            isLoaded = memoryServiceState.w600kLoaded,
+                            note = memoryServiceState.loadedSessions[ModelSlot.RECOGNIZER]?.statusNote
+                        )
+                        MemorySlotRow(
+                            label = "gfpgan_1.4.onnx (512x512 Face Restoration)",
+                            isLoaded = memoryServiceState.gfpganLoaded,
+                            note = memoryServiceState.loadedSessions[ModelSlot.ENHANCEMENT]?.statusNote
+                        )
+                        MemorySlotRow(
+                            label = "segformer_B5_ce.onnx (Head/Hair/Neck Parser)",
+                            isLoaded = memoryServiceState.segformerLoaded,
+                            note = memoryServiceState.loadedSessions[ModelSlot.SEGMENTATION]?.statusNote
+                        )
+                        MemorySlotRow(
+                            label = "det_10g.onnx + inswapper_128.onnx + emap",
+                            isLoaded = memoryServiceState.detectorLoaded && memoryServiceState.inswapperLoaded,
+                            note = if (memoryServiceState.emapLoaded) "emap[512x512] cached in RAM" else null
+                        )
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        Button(
+                            onClick = onPreloadMemoryModels,
+                            enabled = !isInspecting && !memoryServiceState.isLoading,
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("preload_memory_models_button"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text(
+                                text = if (memoryServiceState.isLoading) "Loading..." else "Load Into Memory",
+                                fontWeight = FontWeight.Bold
+                            )
+                        }
+                        OutlinedButton(
+                            onClick = onReleaseMemoryModels,
+                            enabled = memoryServiceState.activeSessionCount > 0 && !memoryServiceState.isLoading,
+                            modifier = Modifier.testTag("release_memory_models_button"),
+                            shape = RoundedCornerShape(10.dp)
+                        ) {
+                            Text("Release RAM")
+                        }
+                    }
+                }
+            }
+
             // 1. GHOST 2.0 Feasibility Statement & Directory Structure Card
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -437,3 +522,41 @@ private fun GhostFeasibilityCard(item: GhostComponentFeasibility) {
         }
     }
 }
+
+@Composable
+private fun MemorySlotRow(
+    label: String,
+    isLoaded: Boolean,
+    note: String?
+) {
+    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = label,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                modifier = Modifier.weight(1f)
+            )
+            Spacer(modifier = Modifier.width(8.dp))
+            Text(
+                text = if (isLoaded) "IN RAM ●" else "ON DISK ○",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = if (isLoaded) NeonEmerald else ElectricCyan
+            )
+        }
+        if (!note.isNullOrBlank()) {
+            Text(
+                text = note,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        }
+    }
+}
+

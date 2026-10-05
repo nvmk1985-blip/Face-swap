@@ -2,6 +2,7 @@ package com.example.onnx
 
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import android.graphics.Bitmap
 import android.graphics.Color
 import android.graphics.PointF
@@ -156,12 +157,16 @@ object HeadSegmentationAndInpainting {
         alignedHeadCrop: Bitmap,
         segModelFile: File?,
         mattingModelFile: File?,
-        preferHardwareAccel: Boolean = false
+        preferHardwareAccel: Boolean = false,
+        preloadedSegformerSession: OrtSession? = null
     ): HeadSegmentationMasks {
-        val cropSize = alignedHeadCrop.width
         var masks: HeadSegmentationMasks? = null
 
-        if (ortEnv != null && segModelFile != null && segModelFile.exists() && segModelFile.length() > 1024L) {
+        if (ortEnv != null && preloadedSegformerSession != null) {
+            masks = runCatching {
+                runSegformerSession(ortEnv, preloadedSegformerSession, alignedHeadCrop, isPreloaded = true)
+            }.getOrNull()
+        } else if (ortEnv != null && segModelFile != null && segModelFile.exists() && segModelFile.length() > 1024L) {
             masks = runCatching {
                 runSegformerOnnx(ortEnv, segModelFile, alignedHeadCrop, preferHardwareAccel)
             }.getOrNull()
@@ -189,11 +194,11 @@ object HeadSegmentationAndInpainting {
         return baseMasks
     }
 
-    private fun runSegformerOnnx(
+    fun runSegformerSession(
         ortEnv: OrtEnvironment,
-        segModelFile: File,
+        session: OrtSession,
         alignedHeadCrop: Bitmap,
-        preferHardwareAccel: Boolean
+        isPreloaded: Boolean = false
     ): HeadSegmentationMasks {
         val cropSize = alignedHeadCrop.width
         val modelInputSize = 512
@@ -224,44 +229,40 @@ object HeadSegmentationAndInpainting {
         val headMaskCrop = FloatArray(cropSize * cropSize)
         val skinMaskCrop = FloatArray(cropSize * cropSize)
 
-        OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
-            ortEnv.createSession(segModelFile.absolutePath, opts).use { session ->
-                val inputName = session.inputNames.first()
-                val shape = longArrayOf(1L, 3L, modelInputSize.toLong(), modelInputSize.toLong())
-                OnnxTensor.createTensor(ortEnv, floatBuffer, shape).use { inputTensor ->
-                    session.run(mapOf(inputName to inputTensor)).use { result ->
-                        val outTensor = result[0] as OnnxTensor
-                        val outShape = outTensor.info.shape // [1, numClasses, outH, outW]
-                        val numClasses = outShape[1].toInt()
-                        val outH = outShape[2].toInt()
-                        val outW = outShape[3].toInt()
-                        val outFloats = FloatArray(numClasses * outH * outW)
-                        outTensor.floatBuffer.get(outFloats)
+        val inputName = session.inputNames.first()
+        val shape = longArrayOf(1L, 3L, modelInputSize.toLong(), modelInputSize.toLong())
+        OnnxTensor.createTensor(ortEnv, floatBuffer, shape).use { inputTensor ->
+            session.run(mapOf(inputName to inputTensor)).use { result ->
+                val outTensor = result[0] as OnnxTensor
+                val outShape = outTensor.info.shape // [1, numClasses, outH, outW]
+                val numClasses = outShape[1].toInt()
+                val outH = outShape[2].toInt()
+                val outW = outShape[3].toInt()
+                val outFloats = FloatArray(numClasses * outH * outW)
+                outTensor.floatBuffer.get(outFloats)
 
-                        val planeSize = outH * outW
-                        for (y in 0 until cropSize) {
-                            val sy = (y * outH / cropSize).coerceIn(0, outH - 1)
-                            for (x in 0 until cropSize) {
-                                val sx = (x * outW / cropSize).coerceIn(0, outW - 1)
-                                val spatialIdx = sy * outW + sx
-                                var bestClass = 0
-                                var bestLogit = -Float.MAX_VALUE
-                                for (cls in 0 until numClasses) {
-                                    val logit = outFloats[cls * planeSize + spatialIdx]
-                                    if (logit > bestLogit) {
-                                        bestLogit = logit
-                                        bestClass = cls
-                                    }
-                                }
-                                // CelebAMask-HQ / ATR classes:
-                                // 0=bg, 1..13=face/ears/eyes/nose/lips, 14..15=neck, 16=cloth, 17=hair, 18=hat
-                                val isSkinOrNeck = bestClass in 1..15
-                                val isHairOrHat = bestClass == 17 || bestClass == 18
-                                val idx = y * cropSize + x
-                                headMaskCrop[idx] = if (isSkinOrNeck || isHairOrHat) 1.0f else 0.0f
-                                skinMaskCrop[idx] = if (isSkinOrNeck) 1.0f else 0.0f
+                val planeSize = outH * outW
+                for (y in 0 until cropSize) {
+                    val sy = (y * outH / cropSize).coerceIn(0, outH - 1)
+                    for (x in 0 until cropSize) {
+                        val sx = (x * outW / cropSize).coerceIn(0, outW - 1)
+                        val spatialIdx = sy * outW + sx
+                        var bestClass = 0
+                        var bestLogit = -Float.MAX_VALUE
+                        for (cls in 0 until numClasses) {
+                            val logit = outFloats[cls * planeSize + spatialIdx]
+                            if (logit > bestLogit) {
+                                bestLogit = logit
+                                bestClass = cls
                             }
                         }
+                        // CelebAMask-HQ / ATR classes:
+                        // 0=bg, 1..13=face/ears/eyes/nose/lips, 14..15=neck, 16=cloth, 17=hair, 18=hat
+                        val isSkinOrNeck = bestClass in 1..15
+                        val isHairOrHat = bestClass == 17 || bestClass == 18
+                        val idx = y * cropSize + x
+                        headMaskCrop[idx] = if (isSkinOrNeck || isHairOrHat) 1.0f else 0.0f
+                        skinMaskCrop[idx] = if (isSkinOrNeck) 1.0f else 0.0f
                     }
                 }
             }
@@ -276,8 +277,25 @@ object HeadSegmentationAndInpainting {
             fullHeadAlpha = smoothedAlpha,
             skinAndNeckWeight = skinMaskCrop,
             usedSegmentationOnnx = true,
-            segmentationSourceLabel = "segformer_B5_ce.onnx (ONNX Runtime)"
+            segmentationSourceLabel = if (isPreloaded) {
+                "segformer_B5_ce.onnx (In-Memory Session)"
+            } else {
+                "segformer_B5_ce.onnx (ONNX Runtime)"
+            }
         )
+    }
+
+    private fun runSegformerOnnx(
+        ortEnv: OrtEnvironment,
+        segModelFile: File,
+        alignedHeadCrop: Bitmap,
+        preferHardwareAccel: Boolean
+    ): HeadSegmentationMasks {
+        OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
+            ortEnv.createSession(segModelFile.absolutePath, opts).use { session ->
+                return runSegformerSession(ortEnv, session, alignedHeadCrop, isPreloaded = false)
+            }
+        }
     }
 
     private fun runModnetOnnx(

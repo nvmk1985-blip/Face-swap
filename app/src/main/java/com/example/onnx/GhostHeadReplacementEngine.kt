@@ -2,6 +2,7 @@ package com.example.onnx
 
 import ai.onnxruntime.OnnxTensor
 import ai.onnxruntime.OrtEnvironment
+import ai.onnxruntime.OrtSession
 import android.content.Context
 import android.graphics.Bitmap
 import kotlin.math.max
@@ -33,6 +34,11 @@ object GhostHeadReplacementEngine {
         allowTwoModelFallbackForTesting: Boolean,
         lowMemoryMode: Boolean = false,
         preferHardwareAccel: Boolean = false,
+        preloadedArcFaceSession: OrtSession? = null,
+        preloadedSwapSession: OrtSession? = null,
+        preloadedSegformerSession: OrtSession? = null,
+        preloadedGfpganSession: OrtSession? = null,
+        preloadedEmap512x512: FloatArray? = null,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val tStart = System.currentTimeMillis()
@@ -46,6 +52,7 @@ object GhostHeadReplacementEngine {
         val segFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.SEGMENTATION)
         val matFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.MATTING)
         val lamaFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.INPAINTING)
+        val gfpFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
 
         // STAGE 1: Detection & 3D-Aware Cranial Pose Analysis
         val tDet0 = System.currentTimeMillis()
@@ -88,19 +95,20 @@ object GhostHeadReplacementEngine {
             dstSize = headCropSize
         )
 
-        // If inswapper_128.onnx is installed, also extract the 512-D source identity vector for facial gaze/expression fusion
-        val hasInswapper = ortEnv != null && swapFile.exists() && swapFile.length() > 1024L
+        // If inswapper_128.onnx is installed/preloaded, also extract the 512-D source identity vector for facial gaze/expression fusion
+        val hasInswapper = ortEnv != null && (preloadedSwapSession != null || (swapFile.exists() && swapFile.length() > 1024L))
         val sourceEmbedding: SourceEmbeddingResult? = if (ortEnv != null && hasInswapper &&
-            ((recFile.exists() && recFile.length() > 1024L) || allowTwoModelFallbackForTesting)
+            (preloadedArcFaceSession != null || (recFile.exists() && recFile.length() > 1024L) || allowTwoModelFallbackForTesting)
         ) {
-            val emap = OnnxProtobufInspector.loadOrExtractInswapperEmap(context, swapFile)
+            val emap = preloadedEmap512x512 ?: OnnxProtobufInspector.loadOrExtractInswapperEmap(context, swapFile)
             ArcFaceRecognizer.extractSourceLatentEmbedding(
                 ortEnv = ortEnv,
                 sourceBitmap = sourceBitmap,
                 sourceLandmarks5 = sourceFace.landmarks5,
                 arcFaceModelFile = if (recFile.exists()) recFile else null,
                 emap512x512 = emap,
-                allowTwoModelFallbackForTesting = allowTwoModelFallbackForTesting
+                allowTwoModelFallbackForTesting = allowTwoModelFallbackForTesting,
+                preloadedArcFaceSession = preloadedArcFaceSession
             )
         } else {
             null
@@ -122,7 +130,8 @@ object GhostHeadReplacementEngine {
             alignedHeadCrop = alignedSourceHead,
             segModelFile = if (segFile.exists()) segFile else null,
             mattingModelFile = if (matFile.exists()) matFile else null,
-            preferHardwareAccel = preferHardwareAccel
+            preferHardwareAccel = preferHardwareAccel,
+            preloadedSegformerSession = preloadedSegformerSession
         )
 
         val targetW = targetBitmap.width
@@ -134,14 +143,10 @@ object GhostHeadReplacementEngine {
         var firstGeneratedHeadPreview: Bitmap? = null
         var totalGenMs = 0L
         var totalBlendMs = 0L
+        var usedGfpganPass = false
 
         // Process each target head sequentially, releasing intermediate Bitmaps & sessions to conserve RAM
         targetFacesToReplace.forEachIndexed { idx, targetFace ->
-            val tgtPose = HeadSegmentationAndInpainting.analyzeHeadPoseAndBounds(
-                targetFace,
-                targetW,
-                targetH
-            )
             val tgtHeadMatrix = HeadSegmentationAndInpainting.estimateHeadAlignmentMatrix(
                 srcLandmarks5 = targetFace.landmarks5,
                 cropSize = headCropSize,
@@ -172,6 +177,7 @@ object GhostHeadReplacementEngine {
                     fuseInswapperInnerExpressionIntoSourceHead(
                         ortEnv = ortEnv,
                         swapFile = swapFile,
+                        preloadedSwapSession = preloadedSwapSession,
                         sourceEmbedding = sourceEmbedding,
                         targetBitmap = targetBitmap,
                         targetFace = targetFace,
@@ -201,7 +207,8 @@ object GhostHeadReplacementEngine {
                 alignedHeadCrop = alignedTargetHead,
                 segModelFile = if (segFile.exists()) segFile else null,
                 mattingModelFile = if (matFile.exists()) matFile else null,
-                preferHardwareAccel = preferHardwareAccel
+                preferHardwareAccel = preferHardwareAccel,
+                preloadedSegformerSession = preloadedSegformerSession
             )
 
             // 5a. Inpaint disoccluded background where target's old hair/ears extended beyond the new source head
@@ -233,7 +240,7 @@ object GhostHeadReplacementEngine {
                 targetHeadAlpha = tgtMasks.fullHeadAlpha
             )
 
-            // STAGE 6: Enhancement (Tiled Detail & Micro-Contrast Restoration)
+            // STAGE 6: Enhancement (GFPGAN 1.4 512x512 ONNX Restoration + Tiled Detail & Micro-Contrast)
             onProgress(
                 SwapStageProgress(
                     stepIndex = 6,
@@ -243,7 +250,31 @@ object GhostHeadReplacementEngine {
                     progressFraction = 0.92f
                 )
             )
-            val enhancedHeadCrop = applyTiledDetailEnhancement(compositedHeadCrop)
+            val gfpRestoredHead = if (ortEnv != null && (preloadedGfpganSession != null || (gfpFile.exists() && gfpFile.length() > 1024L))) {
+                val restored512 = FaceBlender.runOptionalGfpganEnhancement512(
+                    ortEnv = ortEnv,
+                    gfpganFile = if (gfpFile.exists()) gfpFile else null,
+                    crop128Or512 = compositedHeadCrop,
+                    preferHardwareAccel = preferHardwareAccel,
+                    preloadedGfpganSession = preloadedGfpganSession
+                )
+                if (restored512 != null) {
+                    usedGfpganPass = true
+                    if (restored512.width == headCropSize) {
+                        restored512
+                    } else {
+                        val scaledBack = Bitmap.createScaledBitmap(restored512, headCropSize, headCropSize, true)
+                        restored512.recycle()
+                        scaledBack
+                    }
+                } else {
+                    null
+                }
+            } else {
+                null
+            }
+            val enhancedHeadCrop = applyTiledDetailEnhancement(gfpRestoredHead ?: compositedHeadCrop)
+            gfpRestoredHead?.recycle()
 
             // Paste the full head + inpainted disocclusion envelope back onto the full-resolution target photo
             val unionEnvelopeAlpha = FloatArray(headCropSize * headCropSize) { i ->
@@ -295,6 +326,9 @@ object GhostHeadReplacementEngine {
             if (hasInswapper && sourceEmbedding != null) {
                 append(" + inswapper_128 Expression Core")
             }
+            if (usedGfpganPass) {
+                append(" + gfpgan_1.4.onnx Restoration")
+            }
         }
 
         return FaceSwapExecutionResult(
@@ -321,6 +355,7 @@ object GhostHeadReplacementEngine {
     private fun fuseInswapperInnerExpressionIntoSourceHead(
         ortEnv: OrtEnvironment,
         swapFile: java.io.File,
+        preloadedSwapSession: OrtSession? = null,
         sourceEmbedding: SourceEmbeddingResult,
         targetBitmap: Bitmap,
         targetFace: DetectedFace,
@@ -345,30 +380,37 @@ object GhostHeadReplacementEngine {
         targetBuf.rewind()
 
         val rawSwappedPixels128 = IntArray(hw)
-        OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
-            ortEnv.createSession(swapFile.absolutePath, opts).use { session ->
-                var targetName = "target"
-                var sourceName = "source"
-                for ((name, nodeInfo) in session.inputInfo) {
-                    val tInfo = nodeInfo.info as? ai.onnxruntime.TensorInfo ?: continue
-                    if (tInfo.shape.size == 4) targetName = name
-                    if (tInfo.shape.size == 2) sourceName = name
-                }
-                val srcBuf = java.nio.FloatBuffer.wrap(sourceEmbedding.latentSourceVector512)
-                OnnxTensor.createTensor(ortEnv, targetBuf, longArrayOf(1L, 3L, 128L, 128L)).use { tTensor ->
-                    OnnxTensor.createTensor(ortEnv, srcBuf, longArrayOf(1L, 512L)).use { sTensor ->
-                        session.run(mapOf(targetName to tTensor, sourceName to sTensor)).use { res ->
-                            val outT = res[0] as OnnxTensor
-                            val outFloats = FloatArray(3 * hw)
-                            outT.floatBuffer.get(outFloats)
-                            for (i in 0 until hw) {
-                                val r = (outFloats[i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
-                                val g = (outFloats[hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
-                                val b = (outFloats[2 * hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
-                                rawSwappedPixels128[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
-                            }
+        val runWithSession: (OrtSession) -> Unit = { session ->
+            var targetName = "target"
+            var sourceName = "source"
+            for ((name, nodeInfo) in session.inputInfo) {
+                val tInfo = nodeInfo.info as? ai.onnxruntime.TensorInfo ?: continue
+                if (tInfo.shape.size == 4) targetName = name
+                if (tInfo.shape.size == 2) sourceName = name
+            }
+            val srcBuf = java.nio.FloatBuffer.wrap(sourceEmbedding.latentSourceVector512)
+            OnnxTensor.createTensor(ortEnv, targetBuf, longArrayOf(1L, 3L, 128L, 128L)).use { tTensor ->
+                OnnxTensor.createTensor(ortEnv, srcBuf, longArrayOf(1L, 512L)).use { sTensor ->
+                    session.run(mapOf(targetName to tTensor, sourceName to sTensor)).use { res ->
+                        val outT = res[0] as OnnxTensor
+                        val outFloats = FloatArray(3 * hw)
+                        outT.floatBuffer.get(outFloats)
+                        for (i in 0 until hw) {
+                            val r = (outFloats[i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                            val g = (outFloats[hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                            val b = (outFloats[2 * hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                            rawSwappedPixels128[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
                         }
                     }
+                }
+            }
+        }
+        if (preloadedSwapSession != null) {
+            runWithSession(preloadedSwapSession)
+        } else {
+            OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
+                ortEnv.createSession(swapFile.absolutePath, opts).use { session ->
+                    runWithSession(session)
                 }
             }
         }
@@ -380,7 +422,9 @@ object GhostHeadReplacementEngine {
             swapped128 = rawSwappedBmp,
             alignedTarget128 = targetCrop128,
             alignedSource112 = sourceEmbedding.aligned112Crop,
-            hasTrueArcFaceLatent = hasTrueArcFaceLatent
+            hasTrueArcFaceLatent = hasTrueArcFaceLatent,
+            forwardMatrix128 = m128,
+            targetLandmarks5 = targetFace.landmarks5
         )
         rawSwappedBmp.recycle()
         targetCrop128.recycle()

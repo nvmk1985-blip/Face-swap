@@ -13,14 +13,14 @@ import com.example.data.SwapAuditLog
 import com.example.data.SwapAuditRepository
 import com.example.onnx.DetectedFace
 import com.example.onnx.FaceAlignment
+import com.example.onnx.FaceSwapAndRestorationService
 import com.example.onnx.FaceSwapExecutionResult
-import com.example.onnx.GhostHeadReplacementEngine
 import com.example.onnx.HeadSegmentationAndInpainting
-import com.example.onnx.InSwapperEngine
 import com.example.onnx.ModelSlot
+import com.example.onnx.OnnxMemoryServiceState
 import com.example.onnx.OnnxModelInspection
 import com.example.onnx.OnnxProtobufInspector
-import com.example.onnx.ScrfdFaceDetector
+import com.example.onnx.OnnxRuntimeModelService
 import com.example.onnx.SwapStageProgress
 import com.example.util.ImageGalleryHelper
 import kotlinx.coroutines.Dispatchers
@@ -57,6 +57,7 @@ data class FaceSwapUiState(
     val currentTab: AppTab = AppTab.STUDIO,
     val studioMode: StudioMode = StudioMode.FACE_SWAP,
     val modelInspections: List<OnnxModelInspection> = emptyList(),
+    val memoryServiceState: OnnxMemoryServiceState = OnnxMemoryServiceState(),
     val isInspectingModels: Boolean = false,
     val sourceBitmap: Bitmap? = null,
     val sourceFaces: List<DetectedFace> = emptyList(),
@@ -113,6 +114,7 @@ data class FaceSwapUiState(
 class FaceSwapViewModel(application: Application) : AndroidViewModel(application) {
 
     private val ortEnv: OrtEnvironment = OrtEnvironment.getEnvironment()
+    val modelService: FaceSwapAndRestorationService = OnnxRuntimeModelService(application, ortEnv)
     private val auditRepository: SwapAuditRepository = SwapAuditRepository(
         SwapAuditDatabase.getInstance(application).swapAuditDao()
     )
@@ -217,13 +219,24 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     fun refreshModelInspections() {
         viewModelScope.launch {
-            _uiState.update { it.copy(isInspectingModels = true) }
-            val inspections = withContext(Dispatchers.IO) {
-                OnnxProtobufInspector.inspectAllModels(getApplication(), ortEnv)
+            _uiState.update {
+                it.copy(
+                    isInspectingModels = true,
+                    memoryServiceState = it.memoryServiceState.copy(isLoading = true)
+                )
+            }
+            val (inspections, memState) = withContext(Dispatchers.IO) {
+                val insp = OnnxProtobufInspector.inspectAllModels(getApplication(), ortEnv)
+                val mem = modelService.loadModelsIntoMemory(
+                    preferHardwareAccel = _uiState.value.preferHardwareAcceleration,
+                    lowMemoryMode = _uiState.value.lowMemoryMode
+                )
+                insp to mem
             }
             _uiState.update {
                 it.copy(
                     modelInspections = inspections,
+                    memoryServiceState = memState,
                     isInspectingModels = false
                 )
             }
@@ -231,6 +244,45 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
             if (detReady) {
                 _uiState.value.sourceBitmap?.let { bmp -> detectFacesForBitmap(bmp, isSource = true) }
                 _uiState.value.targetBitmap?.let { bmp -> detectFacesForBitmap(bmp, isSource = false) }
+            }
+        }
+    }
+
+    fun preloadModelsIntoMemory() {
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    memoryServiceState = it.memoryServiceState.copy(isLoading = true),
+                    statusBannerMessage = "Loading w600k_r50.onnx, gfpgan_1.4.onnx, and segformer_B5_ce.onnx into ONNX Runtime memory...",
+                    errorBannerMessage = null
+                )
+            }
+            val memState = withContext(Dispatchers.IO) {
+                modelService.loadModelsIntoMemory(
+                    preferHardwareAccel = _uiState.value.preferHardwareAcceleration,
+                    lowMemoryMode = _uiState.value.lowMemoryMode
+                )
+            }
+            _uiState.update {
+                it.copy(
+                    memoryServiceState = memState,
+                    statusBannerMessage = memState.summaryMessage
+                )
+            }
+        }
+    }
+
+    fun releaseModelsFromMemory() {
+        viewModelScope.launch {
+            val memState = withContext(Dispatchers.IO) {
+                modelService.releaseAllSessions()
+                modelService.getMemoryState()
+            }
+            _uiState.update {
+                it.copy(
+                    memoryServiceState = memState,
+                    statusBannerMessage = "Released in-memory ONNX Runtime sessions. Models will reload on-demand."
+                )
             }
         }
     }
@@ -249,17 +301,23 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
             }
             result.fold(
                 onSuccess = { file ->
-                    val inspections = withContext(Dispatchers.IO) {
-                        OnnxProtobufInspector.inspectAllModels(getApplication(), ortEnv)
+                    val (inspections, memState) = withContext(Dispatchers.IO) {
+                        val insp = OnnxProtobufInspector.inspectAllModels(getApplication(), ortEnv)
+                        modelService.loadModelSlotIntoMemory(
+                            slot = slot,
+                            preferHardwareAccel = _uiState.value.preferHardwareAcceleration
+                        )
+                        insp to modelService.getMemoryState()
                     }
                     val importedInspection = inspections.firstOrNull { it.slot == slot }
                     val valid = importedInspection?.isValidOnnx == true
                     _uiState.update {
                         it.copy(
                             modelInspections = inspections,
+                            memoryServiceState = memState,
                             isInspectingModels = false,
                             statusBannerMessage = if (valid) {
-                                "Installed ${slot.canonicalFileName} (${formatBytes(file.length())}) in ${slot.categoryTitle}"
+                                "Installed & loaded ${slot.canonicalFileName} (${formatBytes(file.length())}) into memory"
                             } else {
                                 null
                             },
@@ -294,7 +352,8 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
             _uiState.update {
                 it.copy(
                     isInspectingModels = true,
-                    statusBannerMessage = "Scanning folder & auto-importing all .onnx models...",
+                    memoryServiceState = it.memoryServiceState.copy(isLoading = true),
+                    statusBannerMessage = "Scanning folder & auto-importing all .onnx models into memory...",
                     errorBannerMessage = null
                 )
             }
@@ -307,17 +366,23 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
             }
             result.fold(
                 onSuccess = { importedSlots ->
-                    val inspections = withContext(Dispatchers.IO) {
-                        OnnxProtobufInspector.inspectAllModels(getApplication(), ortEnv)
+                    val (inspections, memState) = withContext(Dispatchers.IO) {
+                        val insp = OnnxProtobufInspector.inspectAllModels(getApplication(), ortEnv)
+                        val mem = modelService.loadModelsIntoMemory(
+                            preferHardwareAccel = _uiState.value.preferHardwareAcceleration,
+                            lowMemoryMode = _uiState.value.lowMemoryMode
+                        )
+                        insp to mem
                     }
                     _uiState.update {
                         it.copy(
                             modelInspections = inspections,
+                            memoryServiceState = memState,
                             isInspectingModels = false,
                             statusBannerMessage = if (importedSlots.isNotEmpty()) {
-                                "Auto-imported ${importedSlots.size} model(s): ${
+                                "Auto-imported & loaded ${importedSlots.size} model(s): ${
                                     importedSlots.joinToString { s -> s.canonicalFileName }
-                                }. Folder linked for automatic startup sync!"
+                                }."
                             } else {
                                 null
                             },
@@ -337,6 +402,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     _uiState.update {
                         it.copy(
                             isInspectingModels = false,
+                            memoryServiceState = it.memoryServiceState.copy(isLoading = false),
                             statusBannerMessage = null,
                             errorBannerMessage = "Folder scan failed: ${err.message}"
                         )
@@ -499,13 +565,8 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     val alignedSrc = FaceAlignment.warpAffineCrop(srcBmp, srcMat, previewSize)
                     val alignedTgt = FaceAlignment.warpAffineCrop(tgtBmp, tgtMat, previewSize)
 
-                    val segFile = OnnxProtobufInspector.resolveModelFile(getApplication(), ModelSlot.SEGMENTATION)
-                    val matFile = OnnxProtobufInspector.resolveModelFile(getApplication(), ModelSlot.MATTING)
-                    val masks = HeadSegmentationAndInpainting.segmentHeadHairNeck(
-                        ortEnv = ortEnv,
+                    val masks = modelService.segmentHeadAndHair(
                         alignedHeadCrop = alignedSrc,
-                        segModelFile = if (segFile.exists()) segFile else null,
-                        mattingModelFile = if (matFile.exists()) matFile else null,
                         preferHardwareAccel = state.preferHardwareAcceleration
                     )
                     val segPreviewBmp = HeadSegmentationAndInpainting.createHeadSegmentationPreviewBitmap(
@@ -528,6 +589,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                         it.copy(
                             isGeneratingHeadPreview = false,
                             headPreviewState = preview,
+                            memoryServiceState = modelService.getMemoryState(),
                             statusBannerMessage = "Head/Hair/Neck preview ready (${preview.segmentationLabel})."
                         )
                     }
@@ -554,15 +616,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
             val detResult = withContext(Dispatchers.Default) {
                 runCatching {
-                    val detFile = OnnxProtobufInspector.resolveModelFile(
-                        getApplication(),
-                        ModelSlot.DETECTOR
-                    )
-                    if (detFile.exists() && detFile.length() > 1024L) {
-                        ScrfdFaceDetector.detectFacesOnnx(ortEnv, detFile, bitmap)
-                    } else {
-                        ScrfdFaceDetector.detectFacesAndroidPreviewFallback(bitmap)
-                    }
+                    modelService.detectFaces(bitmap)
                 }
             }
 
@@ -580,6 +634,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                                 sourceFaces = faces,
                                 selectedSourceFaceIndex = 0,
                                 isDetectingSource = false,
+                                memoryServiceState = modelService.getMemoryState(),
                                 errorBannerMessage = warning
                             )
                         } else {
@@ -587,6 +642,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                                 targetFaces = faces,
                                 selectedTargetFaceIndex = 0,
                                 isDetectingTarget = false,
+                                memoryServiceState = modelService.getMemoryState(),
                                 errorBannerMessage = warning
                             )
                         }
@@ -693,7 +749,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                         stepIndex = 1,
                         totalSteps = if (state.studioMode == StudioMode.HEAD_REPLACEMENT) 6 else 5,
                         stageTitle = "Stage 1: Detection",
-                        detailMessage = "Preparing native memory arena...",
+                        detailMessage = "Preparing in-memory ONNX Runtime sessions...",
                         progressFraction = 0.05f
                     )
                 )
@@ -702,31 +758,28 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
             try {
                 val execResult = withContext(Dispatchers.Default) {
                     when (state.studioMode) {
-                        StudioMode.FACE_SWAP -> InSwapperEngine.executeFaceSwap(
-                            context = getApplication(),
-                            ortEnv = ortEnv,
+                        StudioMode.FACE_SWAP -> modelService.swapFaces(
                             sourceBitmap = srcBitmap,
                             sourceFace = selectedSourceFace,
                             targetBitmap = tgtBitmap,
                             targetFacesToReplace = targetsToSwap,
                             enableColorTransfer = state.enableColorTransfer,
                             enableProvenanceWatermark = state.enableProvenanceWatermark,
-                            allowTwoModelFallbackForTesting = state.allowTwoModelFallbackForTesting,
+                            allowTwoModelFallback = state.allowTwoModelFallbackForTesting,
+                            preferHardwareAccel = state.preferHardwareAcceleration,
                             onProgress = { progress ->
                                 _uiState.update { s -> s.copy(swapProgress = progress) }
                             }
                         )
 
-                        StudioMode.HEAD_REPLACEMENT -> GhostHeadReplacementEngine.executeFullHeadReplacement(
-                            context = getApplication(),
-                            ortEnv = ortEnv,
+                        StudioMode.HEAD_REPLACEMENT -> modelService.replaceFullHead(
                             sourceBitmap = srcBitmap,
                             sourceFace = selectedSourceFace,
                             targetBitmap = tgtBitmap,
                             targetFacesToReplace = targetsToSwap,
                             enableColorTransfer = state.enableColorTransfer,
                             enableProvenanceWatermark = state.enableProvenanceWatermark,
-                            allowTwoModelFallbackForTesting = state.allowTwoModelFallbackForTesting,
+                            allowTwoModelFallback = state.allowTwoModelFallbackForTesting,
                             lowMemoryMode = state.lowMemoryMode,
                             preferHardwareAccel = state.preferHardwareAcceleration,
                             onProgress = { progress ->
@@ -758,16 +811,19 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                         swapProgress = null,
                         swapResult = execResult,
                         lastAuditLogId = logId,
+                        memoryServiceState = modelService.getMemoryState(),
                         statusBannerMessage = "${state.studioMode.title} completed in ${execResult.totalMs} ms (${execResult.swappedFacesCount} target(s) replaced)."
                     )
                 }
             } catch (oom: OutOfMemoryError) {
+                modelService.releaseAllSessions()
                 System.gc()
                 _uiState.update {
                     it.copy(
                         isSwapping = false,
                         swapProgress = null,
                         lowMemoryMode = true,
+                        memoryServiceState = modelService.getMemoryState(),
                         errorBannerMessage = "Device ran low on memory. Enabled Low-Memory Tiled Mode automatically — please try again."
                     )
                 }
@@ -821,6 +877,11 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         viewModelScope.launch {
             auditRepository.clearAll()
         }
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        runCatching { modelService.close() }
     }
 
     private fun formatBytes(bytes: Long): String {

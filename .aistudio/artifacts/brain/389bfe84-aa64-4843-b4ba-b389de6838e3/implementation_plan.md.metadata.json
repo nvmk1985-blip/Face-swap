@@ -1,0 +1,6 @@
+{
+  "summary":  "Updated implementation plan in Tamil and English adding 512x512 Direct HD Super-Resolution Warping, Online Photo Style Skin-Texture & Catchlight Restoration, and the exact .onnx model lineup (w600k_r50.onnx + gfpgan_1.4.onnx + segformer_B5_ce.onnx) used by online AI studios.",
+  "updatedAt":  "2026-10-04T17:45:06.457979472Z",
+  "requestFeedback":  true,
+  "userFacing":  true
+}
