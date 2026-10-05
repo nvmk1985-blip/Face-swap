@@ -68,7 +68,9 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.onnx.DetectedFace
+import com.example.onnx.FaceReactionSourceMode
 import com.example.onnx.ModelSlot
+import com.example.onnx.SkinToneSourceMode
 import com.example.ui.FaceSwapUiState
 import com.example.ui.StudioMode
 import com.example.ui.components.FaceDetectionCanvas
@@ -100,6 +102,8 @@ fun StudioTab(
     onSaveToGallery: () -> Unit,
     onToggleCompareOriginal: (Boolean) -> Unit,
     onOpenModelsTab: () -> Unit,
+    onSkinToneModeChanged: (SkinToneSourceMode) -> Unit = {},
+    onFaceReactionModeChanged: (FaceReactionSourceMode) -> Unit = {},
     onBrowseSourceFile: () -> Unit = onPickSourcePhoto,
     onBrowseTargetFile: () -> Unit = onPickTargetPhoto,
     modifier: Modifier = Modifier
@@ -298,6 +302,14 @@ fun StudioTab(
                     }
                 }
             }
+
+            // 2b. Skin Tone (Source vs Target) & Face Reaction (Smile, Visible Teeth, Visible Tongue) Selector Card
+            SkinToneAndReactionSelectorCard(
+                skinToneMode = uiState.skinToneMode,
+                faceReactionMode = uiState.faceReactionMode,
+                onSkinToneModeChanged = onSkinToneModeChanged,
+                onFaceReactionModeChanged = onFaceReactionModeChanged
+            )
 
             // 3. Performance, Blending & Ethical Consent Card
             SafeguardsAndBlendingCard(
@@ -941,50 +953,105 @@ private fun PhotoSelectionCard(
                 }
 
                 if (faces.size > 1) {
-                    FlowRow(
-                        horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
-                    ) {
-                        faces.forEach { face ->
-                            FilterChip(
-                                selected = !replaceAllFaces && face.index == selectedFaceIndex,
-                                onClick = { onSelectFace(face.index) },
-                                label = {
-                                    Text(
-                                        "Head #${face.index + 1} (${(face.score * 100).toInt()}%)"
-                                    )
-                                }
-                            )
-                        }
-                    }
-                }
-
-                if (showMultiFaceToggle) {
-                    Row(
+                    Column(
                         modifier = Modifier
                             .fillMaxWidth()
-                            .clip(RoundedCornerShape(10.dp))
-                            .background(MaterialTheme.colorScheme.surfaceVariant)
-                            .padding(horizontal = 12.dp, vertical = 8.dp),
-                        verticalAlignment = Alignment.CenterVertically,
-                        horizontalArrangement = Arrangement.SpaceBetween
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(ObsidianBg)
+                            .border(1.dp, ElectricCyan.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                            .padding(12.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = if (showMultiFaceToggle) {
+                                "பல நபர்கள் கண்டறியப்பட்டனர் (${faces.size} பேர்) — யாரை மாற்ற வேண்டும்?"
+                            } else {
+                                "Source படத்தில் ${faces.size} முகங்கள் உள்ளன — எந்த முகத்தை எடுக்க வேண்டும்?"
+                            },
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = FontWeight.Bold,
+                            color = NeonEmerald
+                        )
+
+                        if (showMultiFaceToggle) {
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                val singleSelected = !replaceAllFaces
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(
+                                            if (singleSelected) NeonEmerald else MaterialTheme.colorScheme.surfaceVariant
+                                        )
+                                        .clickable { onToggleMultiFace(false) }
+                                        .padding(vertical = 10.dp, horizontal = 8.dp)
+                                        .testTag("single_person_target_mode_button"),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "✓ குறிப்பிட்ட 1 நபர் மட்டும் (#${selectedFaceIndex + 1})",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (singleSelected) ObsidianBg else MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+
+                                Box(
+                                    modifier = Modifier
+                                        .weight(1f)
+                                        .clip(RoundedCornerShape(10.dp))
+                                        .background(
+                                            if (replaceAllFaces) ElectricCyan else MaterialTheme.colorScheme.surfaceVariant
+                                        )
+                                        .clickable { onToggleMultiFace(true) }
+                                        .padding(vertical = 10.dp, horizontal = 8.dp)
+                                        .testTag("all_persons_target_mode_button"),
+                                    contentAlignment = Alignment.Center
+                                ) {
+                                    Text(
+                                        text = "அனைவர் முகமும் (${faces.size} பேர்)",
+                                        style = MaterialTheme.typography.labelMedium,
+                                        fontWeight = FontWeight.Bold,
+                                        color = if (replaceAllFaces) ObsidianBg else MaterialTheme.colorScheme.onSurface
+                                    )
+                                }
+                            }
+
                             Text(
-                                text = stringResource(R.string.multi_face_mode_label),
-                                style = MaterialTheme.typography.bodyLarge,
-                                fontWeight = FontWeight.SemiBold
-                            )
-                            Text(
-                                text = "Process all ${faces.size} detected heads/faces sequentially",
-                                style = MaterialTheme.typography.bodyMedium,
+                                text = if (!replaceAllFaces) {
+                                    "கீழே உள்ள படங்களில் எந்த நபரின் முகத்தை மாற்ற வேண்டுமோ அவரைத் தொட்டுத் தேர்ந்தெடுக்கவும் (தற்போது: நபர் #${selectedFaceIndex + 1} மட்டும் மாற்றப்படும்):"
+                                } else {
+                                    "தற்போது படத்தில் உள்ள ${faces.size} நபர்களின் முகங்களும் வரிசையாக மாற்றப்படும் (குறிப்பிட்ட ஒருவரை மட்டும் மாற்ற அவருடைய படத்தைத் தொடவும்):"
+                                },
+                                style = MaterialTheme.typography.bodySmall,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
                         }
-                        Switch(
-                            checked = replaceAllFaces,
-                            onCheckedChange = onToggleMultiFace
-                        )
+
+                        FlowRow(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            faces.forEach { face ->
+                                val isPersonActive = replaceAllFaces || (face.index == selectedFaceIndex)
+                                DetectedPersonThumbCard(
+                                    fullBitmap = bitmap,
+                                    face = face,
+                                    isSelected = isPersonActive,
+                                    isTargetCard = showMultiFaceToggle,
+                                    onClick = {
+                                        if (showMultiFaceToggle) {
+                                            onToggleMultiFace(false)
+                                        }
+                                        onSelectFace(face.index)
+                                    }
+                                )
+                            }
+                        }
                     }
                 }
             } else {
@@ -1484,4 +1551,209 @@ private fun RequirementRowItem(
         }
     }
 }
+
+@Composable
+private fun DetectedPersonThumbCard(
+    fullBitmap: android.graphics.Bitmap,
+    face: DetectedFace,
+    isSelected: Boolean,
+    isTargetCard: Boolean,
+    onClick: () -> Unit
+) {
+    val faceThumb = remember(fullBitmap, face.index, face.boundingBox) {
+        val padW = (face.boundingBox.width() * 0.25f).toInt()
+        val padH = (face.boundingBox.height() * 0.25f).toInt()
+        val x = (face.boundingBox.left.toInt() - padW).coerceIn(0, (fullBitmap.width - 1).coerceAtLeast(0))
+        val y = (face.boundingBox.top.toInt() - padH).coerceIn(0, (fullBitmap.height - 1).coerceAtLeast(0))
+        val w = (face.boundingBox.width().toInt() + padW * 2).coerceIn(1, (fullBitmap.width - x).coerceAtLeast(1))
+        val h = (face.boundingBox.height().toInt() + padH * 2).coerceIn(1, (fullBitmap.height - y).coerceAtLeast(1))
+        runCatching {
+            android.graphics.Bitmap.createBitmap(fullBitmap, x, y, w, h)
+        }.getOrElse { fullBitmap }
+    }
+
+    val borderColor = if (isSelected) NeonEmerald else RoyalViolet.copy(alpha = 0.55f)
+    val bgColor = if (isSelected) NeonEmerald.copy(alpha = 0.16f) else MaterialTheme.colorScheme.surface
+
+    Column(
+        modifier = Modifier
+            .width(96.dp)
+            .clip(RoundedCornerShape(12.dp))
+            .background(bgColor)
+            .border(if (isSelected) 2.dp else 1.dp, borderColor, RoundedCornerShape(12.dp))
+            .clickable(onClick = onClick)
+            .padding(8.dp)
+            .testTag("select_person_${face.index}_card"),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
+        Image(
+            bitmap = faceThumb.asImageBitmap(),
+            contentDescription = "Person #${face.index + 1}",
+            modifier = Modifier
+                .size(64.dp)
+                .clip(RoundedCornerShape(10.dp))
+                .border(1.dp, borderColor, RoundedCornerShape(10.dp)),
+            contentScale = ContentScale.Crop
+        )
+        Text(
+            text = "நபர் #${face.index + 1}",
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.Bold,
+            color = if (isSelected) NeonEmerald else MaterialTheme.colorScheme.onSurface
+        )
+        Text(
+            text = if (isTargetCard) {
+                if (isSelected) "✓ மாற்றப்படும்" else "மாற்றப்படாது"
+            } else {
+                if (isSelected) "✓ தேர்ந்தெடுக்கப்பட்டது" else "தேர்ந்தெடு"
+            },
+            style = MaterialTheme.typography.labelSmall,
+            color = if (isSelected) NeonEmerald else MaterialTheme.colorScheme.onSurfaceVariant,
+            fontWeight = if (isSelected) FontWeight.Bold else FontWeight.Normal
+        )
+    }
+}
+
+@Composable
+private fun SkinToneAndReactionSelectorCard(
+    skinToneMode: SkinToneSourceMode,
+    faceReactionMode: FaceReactionSourceMode,
+    onSkinToneModeChanged: (SkinToneSourceMode) -> Unit,
+    onFaceReactionModeChanged: (FaceReactionSourceMode) -> Unit
+) {
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // Section 1: Skin Tone Selection (Source vs Target vs 50/50)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "1. தோல் நிறம் தேர்வு (Skin Tone Source Selection)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = ElectricCyan
+                )
+                Text(
+                    text = "முகம் மாற்றும்போது யாருடைய தோல் நிறம் (Skin Tone) வர வேண்டும் என்பதைத் தேர்ந்தெடுக்கவும்:",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                SkinToneSourceMode.entries.forEach { mode ->
+                    val selected = skinToneMode == mode
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(
+                                if (selected) ElectricCyan.copy(alpha = 0.14f) else ObsidianBg
+                            )
+                            .border(
+                                width = if (selected) 1.8.dp else 1.dp,
+                                color = if (selected) ElectricCyan else MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                            .clickable { onSkinToneModeChanged(mode) }
+                            .padding(12.dp)
+                            .testTag("skin_tone_mode_${mode.name.lowercase()}"),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = mode.tamilTitle,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = if (selected) NeonEmerald else MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (selected) "✓ SELECTED" else "SELECT",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (selected) NeonEmerald else ElectricCyan
+                            )
+                        }
+                        Text(
+                            text = mode.tamilSubtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+
+            // Section 2: Face Reaction Selection (Smile, Visible Teeth, Visible Tongue)
+            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+                Text(
+                    text = "2. முகபாவனை தேர்வு (Face Reaction: Smile, பற்கள், நாக்கு)",
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    color = NeonEmerald
+                )
+                Text(
+                    text = "சிரிப்பு (Smile), தெரியும் பற்கள் (Teeth), நாக்கு (Tongue Visible) மற்றும் கண் பாவனை யாருடைய படத்திலிருந்து வர வேண்டும்?",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                FaceReactionSourceMode.entries.forEach { mode ->
+                    val selected = faceReactionMode == mode
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .background(
+                                if (selected) NeonEmerald.copy(alpha = 0.14f) else ObsidianBg
+                            )
+                            .border(
+                                width = if (selected) 1.8.dp else 1.dp,
+                                color = if (selected) NeonEmerald else MaterialTheme.colorScheme.surfaceVariant,
+                                shape = RoundedCornerShape(12.dp)
+                            )
+                            .clickable { onFaceReactionModeChanged(mode) }
+                            .padding(12.dp)
+                            .testTag("face_reaction_mode_${mode.name.lowercase()}"),
+                        verticalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceBetween,
+                            verticalAlignment = Alignment.CenterVertically
+                        ) {
+                            Text(
+                                text = mode.tamilTitle,
+                                style = MaterialTheme.typography.bodyLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = if (selected) NeonEmerald else MaterialTheme.colorScheme.onSurface,
+                                modifier = Modifier.weight(1f)
+                            )
+                            Text(
+                                text = if (selected) "✓ SELECTED" else "SELECT",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = if (selected) NeonEmerald else ElectricCyan
+                            )
+                        }
+                        Text(
+                            text = mode.tamilSubtitle,
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 

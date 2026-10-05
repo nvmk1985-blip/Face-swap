@@ -34,6 +34,8 @@ object GhostHeadReplacementEngine {
         allowTwoModelFallbackForTesting: Boolean,
         lowMemoryMode: Boolean = false,
         preferHardwareAccel: Boolean = false,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
         preloadedArcFaceSession: OrtSession? = null,
         preloadedSwapSession: OrtSession? = null,
         preloadedSegformerSession: OrtSession? = null,
@@ -171,8 +173,10 @@ object GhostHeadReplacementEngine {
             )
 
             val synthesizedHeadCrop = alignedSourceHead.copy(Bitmap.Config.ARGB_8888, true)
-            if (ortEnv != null && hasInswapper && sourceEmbedding != null) {
-                // Fuse InSwapper-128 reenacted inner facial expression into the source head structure
+            if (faceReactionMode == FaceReactionSourceMode.TARGET_REACTION &&
+                ortEnv != null && hasInswapper && sourceEmbedding != null
+            ) {
+                // Fuse InSwapper-128 reenacted Target facial expression (smile/teeth/tongue) into the source head
                 runCatching {
                     fuseInswapperInnerExpressionIntoSourceHead(
                         ortEnv = ortEnv,
@@ -197,7 +201,7 @@ object GhostHeadReplacementEngine {
                     stepIndex = 5,
                     totalSteps = 6,
                     stageTitle = "Stage 5/6: Blending",
-                    detailMessage = "Inpainting target hair disocclusion gaps and adapting skin/neck lighting...",
+                    detailMessage = "Inpainting target hair disocclusion gaps and applying ${skinToneMode.title}...",
                     progressFraction = 0.78f
                 )
             )
@@ -221,12 +225,13 @@ object GhostHeadReplacementEngine {
                 preferHardwareAccel = preferHardwareAccel
             )
 
-            // 5b. Adapt skin & neck lighting/warmth to match target scene without recoloring source hair
+            // 5b. Adapt skin & neck lighting/warmth according to SkinToneSourceMode without recoloring source hair
             val illuminationAdaptedHead = if (enableColorTransfer) {
                 adaptHeadSkinAndLightingSelective(
                     sourceHeadCrop = synthesizedHeadCrop,
                     targetHeadCrop = alignedTargetHead,
-                    skinAndNeckWeight = srcMasks.skinAndNeckWeight
+                    skinAndNeckWeight = srcMasks.skinAndNeckWeight,
+                    skinToneMode = skinToneMode
                 )
             } else {
                 synthesizedHeadCrop
@@ -470,7 +475,8 @@ object GhostHeadReplacementEngine {
     private fun adaptHeadSkinAndLightingSelective(
         sourceHeadCrop: Bitmap,
         targetHeadCrop: Bitmap,
-        skinAndNeckWeight: FloatArray
+        skinAndNeckWeight: FloatArray,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE
     ): Bitmap {
         val size = sourceHeadCrop.width
         val total = size * size
@@ -558,6 +564,12 @@ object GhostHeadReplacementEngine {
         val eyeRx = size * (26.0f / 256.0f)
         val eyeRy = size * (16.0f / 256.0f)
 
+        val skinStrength = when (skinToneMode) {
+            SkinToneSourceMode.TARGET_SCENE -> 0.76f
+            SkinToneSourceMode.SOURCE_IDENTITY -> 0.14f
+            SkinToneSourceMode.BALANCED_BLEND -> 0.45f
+        }
+
         val outPx = IntArray(total)
         for (y in 0 until size) {
             val row = y * size
@@ -582,7 +594,7 @@ object GhostHeadReplacementEngine {
                 val hairAdaptG = g * hairAmbientScale
                 val hairAdaptB = b * hairAmbientScale
 
-                val sw = (skinAndNeckWeight[i] * 0.72f * (1.0f - 0.90f * eyeProt)).coerceIn(0f, 0.78f)
+                val sw = (skinAndNeckWeight[i] * skinStrength * (1.0f - 0.90f * eyeProt)).coerceIn(0f, 0.80f)
                 val hw = (1f - skinAndNeckWeight[i]).coerceIn(0f, 1f) * 0.22f
                 val origW = (1f - sw - hw).coerceIn(0f, 1f)
 

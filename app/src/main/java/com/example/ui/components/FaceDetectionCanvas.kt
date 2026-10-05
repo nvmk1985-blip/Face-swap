@@ -1,6 +1,8 @@
 package com.example.ui.components
 
 import android.graphics.Bitmap
+import android.graphics.Paint
+import android.graphics.RectF
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.gestures.detectTapGestures
@@ -17,6 +19,7 @@ import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.PathEffect
 import androidx.compose.ui.graphics.asImageBitmap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.nativeCanvas
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.unit.IntOffset
 import androidx.compose.ui.unit.IntSize
@@ -28,12 +31,13 @@ import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.NeonEmerald
 import com.example.ui.theme.ObsidianBg
 import com.example.ui.theme.RoyalViolet
+import kotlin.math.hypot
 import kotlin.math.min
 
 /**
- * Renders a Bitmap with interactive face bounding boxes, 5-point SCRFD keypoints,
- * and (when `showCranialHeadBounds = true` in Mode 2 Head Replacement) the expanded
- * cranial/hair/skull/neck bounding volume.
+ * Renders a Bitmap with interactive face bounding boxes, numbered person badges (#1, #2, #3...),
+ * 5-point SCRFD keypoints, and (when `showCranialHeadBounds = true` in Mode 2 Head Replacement)
+ * the expanded cranial/hair/skull/neck bounding volume.
  */
 @Composable
 fun FaceDetectionCanvas(
@@ -68,17 +72,38 @@ fun FaceDetectionCanvas(
                         val imgX = (tapOffset.x - offsetX) / scale
                         val imgY = (tapOffset.y - offsetY) / scale
 
-                        val tappedFace = faces.firstOrNull { face ->
+                        val directFace = faces.firstOrNull { face ->
                             val pose = HeadSegmentationAndInpainting.analyzeHeadPoseAndBounds(
                                 face,
                                 bitmap.width,
                                 bitmap.height
                             )
-                            face.boundingBox.contains(imgX, imgY) ||
+                            val padX = face.boundingBox.width() * 0.18f
+                            val padY = face.boundingBox.height() * 0.18f
+                            val paddedBox = RectF(
+                                face.boundingBox.left - padX,
+                                face.boundingBox.top - padY,
+                                face.boundingBox.right + padX,
+                                face.boundingBox.bottom + padY
+                            )
+                            paddedBox.contains(imgX, imgY) ||
                                 (showCranialHeadBounds && pose.cranialBox.contains(imgX, imgY))
                         }
-                        if (tappedFace != null) {
-                            onFaceTapped(tappedFace.index)
+                        val chosenFace = directFace ?: faces.minByOrNull { face ->
+                            hypot(
+                                (face.boundingBox.centerX() - imgX).toDouble(),
+                                (face.boundingBox.centerY() - imgY).toDouble()
+                            )
+                        }?.takeIf { face ->
+                            val maxDist = maxOf(face.boundingBox.width(), face.boundingBox.height()) * 1.15f
+                            hypot(
+                                (face.boundingBox.centerX() - imgX).toDouble(),
+                                (face.boundingBox.centerY() - imgY).toDouble()
+                            ) <= maxDist
+                        }
+
+                        if (chosenFace != null) {
+                            onFaceTapped(chosenFace.index)
                         }
                     }
                 }
@@ -132,7 +157,7 @@ fun FaceDetectionCanvas(
 
                 if (isSelected) {
                     drawRoundRect(
-                        color = ElectricCyan.copy(alpha = 0.14f),
+                        color = ElectricCyan.copy(alpha = 0.16f),
                         topLeft = Offset(left, top),
                         size = Size(width, height),
                         cornerRadius = CornerRadius(8.dp.toPx(), 8.dp.toPx())
@@ -145,6 +170,33 @@ fun FaceDetectionCanvas(
                     size = Size(width, height),
                     cornerRadius = CornerRadius(8.dp.toPx(), 8.dp.toPx()),
                     style = Stroke(width = strokePx)
+                )
+
+                // Draw numbered person badge (#1, #2, #3...) so user can easily identify each person in multi-person photos
+                val badgeLabel = if (isSelected) "✓ #${face.index + 1}" else "#${face.index + 1}"
+                val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
+                    color = if (isSelected) android.graphics.Color.rgb(11, 16, 33) else android.graphics.Color.WHITE
+                    textSize = 11.dp.toPx()
+                    isFakeBoldText = true
+                }
+                val textW = textPaint.measureText(badgeLabel)
+                val badgePadH = 6.dp.toPx()
+                val badgeH = 18.dp.toPx()
+                val badgeW = textW + badgePadH * 2f
+                val badgeTop = (top - badgeH - 2.dp.toPx()).coerceAtLeast(offsetY + 2.dp.toPx())
+                val badgeLeft = left.coerceIn(offsetX + 2.dp.toPx(), (offsetX + drawnW - badgeW - 2.dp.toPx()).coerceAtLeast(offsetX + 2.dp.toPx()))
+
+                drawRoundRect(
+                    color = if (isSelected) NeonEmerald else RoyalViolet.copy(alpha = 0.92f),
+                    topLeft = Offset(badgeLeft, badgeTop),
+                    size = Size(badgeW, badgeH),
+                    cornerRadius = CornerRadius(6.dp.toPx(), 6.dp.toPx())
+                )
+                drawContext.canvas.nativeCanvas.drawText(
+                    badgeLabel,
+                    badgeLeft + badgePadH,
+                    badgeTop + badgeH * 0.74f,
+                    textPaint
                 )
 
                 face.landmarks5.forEachIndexed { ptIdx, pt ->

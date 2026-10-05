@@ -111,6 +111,8 @@ interface FaceSwapAndRestorationService : AutoCloseable {
         enableProvenanceWatermark: Boolean = true,
         allowTwoModelFallback: Boolean = false,
         preferHardwareAccel: Boolean = true,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
         onProgress: (SwapStageProgress) -> Unit = {}
     ): FaceSwapExecutionResult
 
@@ -128,6 +130,8 @@ interface FaceSwapAndRestorationService : AutoCloseable {
         allowTwoModelFallback: Boolean = false,
         lowMemoryMode: Boolean = false,
         preferHardwareAccel: Boolean = true,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
         onProgress: (SwapStageProgress) -> Unit = {}
     ): FaceSwapExecutionResult
 
@@ -475,6 +479,8 @@ class OnnxRuntimeModelService(
         enableProvenanceWatermark: Boolean,
         allowTwoModelFallback: Boolean,
         preferHardwareAccel: Boolean,
+        skinToneMode: SkinToneSourceMode,
+        faceReactionMode: FaceReactionSourceMode,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val arcFaceSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel)
@@ -492,6 +498,8 @@ class OnnxRuntimeModelService(
             enableColorTransfer = enableColorTransfer,
             enableProvenanceWatermark = enableProvenanceWatermark,
             allowTwoModelFallbackForTesting = allowTwoModelFallback,
+            skinToneMode = skinToneMode,
+            faceReactionMode = faceReactionMode,
             preloadedArcFaceSession = arcFaceSession,
             preloadedSwapSession = swapSession,
             preloadedGfpganSession = gfpganSession,
@@ -510,6 +518,8 @@ class OnnxRuntimeModelService(
         allowTwoModelFallback: Boolean,
         lowMemoryMode: Boolean,
         preferHardwareAccel: Boolean,
+        skinToneMode: SkinToneSourceMode,
+        faceReactionMode: FaceReactionSourceMode,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val arcFaceSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel)
@@ -530,6 +540,8 @@ class OnnxRuntimeModelService(
             allowTwoModelFallbackForTesting = allowTwoModelFallback,
             lowMemoryMode = lowMemoryMode,
             preferHardwareAccel = preferHardwareAccel,
+            skinToneMode = skinToneMode,
+            faceReactionMode = faceReactionMode,
             preloadedArcFaceSession = arcFaceSession,
             preloadedSwapSession = swapSession,
             preloadedSegformerSession = segformerSession,

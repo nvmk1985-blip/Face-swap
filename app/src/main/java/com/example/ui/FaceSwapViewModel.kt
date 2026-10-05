@@ -13,6 +13,7 @@ import com.example.data.SwapAuditLog
 import com.example.data.SwapAuditRepository
 import com.example.onnx.DetectedFace
 import com.example.onnx.FaceAlignment
+import com.example.onnx.FaceReactionSourceMode
 import com.example.onnx.FaceSwapAndRestorationService
 import com.example.onnx.FaceSwapExecutionResult
 import com.example.onnx.HeadSegmentationAndInpainting
@@ -21,6 +22,7 @@ import com.example.onnx.OnnxMemoryServiceState
 import com.example.onnx.OnnxModelInspection
 import com.example.onnx.OnnxProtobufInspector
 import com.example.onnx.OnnxRuntimeModelService
+import com.example.onnx.SkinToneSourceMode
 import com.example.onnx.SwapStageProgress
 import com.example.util.ImageGalleryHelper
 import kotlinx.coroutines.Dispatchers
@@ -72,6 +74,8 @@ data class FaceSwapUiState(
     val isGeneratingHeadPreview: Boolean = false,
     val consentConfirmed: Boolean = false,
     val enableColorTransfer: Boolean = true,
+    val skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+    val faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
     val enableProvenanceWatermark: Boolean = true,
     val allowTwoModelFallbackForTesting: Boolean = false,
     val preferHardwareAcceleration: Boolean = true,
@@ -167,6 +171,14 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     fun setEnableColorTransfer(enabled: Boolean) {
         _uiState.update { it.copy(enableColorTransfer = enabled) }
+    }
+
+    fun setSkinToneMode(mode: SkinToneSourceMode) {
+        _uiState.update { it.copy(skinToneMode = mode, enableColorTransfer = true) }
+    }
+
+    fun setFaceReactionMode(mode: FaceReactionSourceMode) {
+        _uiState.update { it.copy(faceReactionMode = mode) }
     }
 
     fun setEnableProvenanceWatermark(enabled: Boolean) {
@@ -641,6 +653,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                             state.copy(
                                 targetFaces = faces,
                                 selectedTargetFaceIndex = 0,
+                                replaceAllTargetFaces = false,
                                 isDetectingTarget = false,
                                 memoryServiceState = modelService.getMemoryState(),
                                 errorBannerMessage = warning
@@ -767,6 +780,8 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                             enableProvenanceWatermark = state.enableProvenanceWatermark,
                             allowTwoModelFallback = state.allowTwoModelFallbackForTesting,
                             preferHardwareAccel = state.preferHardwareAcceleration,
+                            skinToneMode = state.skinToneMode,
+                            faceReactionMode = state.faceReactionMode,
                             onProgress = { progress ->
                                 _uiState.update { s -> s.copy(swapProgress = progress) }
                             }
@@ -782,6 +797,8 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                             allowTwoModelFallback = state.allowTwoModelFallbackForTesting,
                             lowMemoryMode = state.lowMemoryMode,
                             preferHardwareAccel = state.preferHardwareAcceleration,
+                            skinToneMode = state.skinToneMode,
+                            faceReactionMode = state.faceReactionMode,
                             onProgress = { progress ->
                                 _uiState.update { s -> s.copy(swapProgress = progress) }
                             }

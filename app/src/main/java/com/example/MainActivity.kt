@@ -325,6 +325,8 @@ fun FaceSwapStudioApp(
                     onSelectSourceFace = viewModel::selectSourceFace,
                     onSelectTargetFace = viewModel::selectTargetFace,
                     onToggleReplaceAllFaces = viewModel::setReplaceAllTargetFaces,
+                    onSkinToneModeChanged = viewModel::setSkinToneMode,
+                    onFaceReactionModeChanged = viewModel::setFaceReactionMode,
                     onConsentChanged = viewModel::setConsentConfirmed,
                     onColorTransferChanged = viewModel::setEnableColorTransfer,
                     onWatermarkChanged = viewModel::setEnableProvenanceWatermark,

@@ -52,6 +52,8 @@ object InSwapperEngine {
         enableColorTransfer: Boolean,
         enableProvenanceWatermark: Boolean,
         allowTwoModelFallbackForTesting: Boolean,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
         preloadedArcFaceSession: OrtSession? = null,
         preloadedSwapSession: OrtSession? = null,
         preloadedGfpganSession: OrtSession? = null,
@@ -179,7 +181,7 @@ object InSwapperEngine {
                         SwapStageProgress(
                             stepIndex = 5,
                             stageTitle = "Stage 5/5: 512x512 Online-Style HD Restoration & Glitch-Free Blending",
-                            detailMessage = "Restoring dynamic eye/brow landmarks, 512x512 skin pores & blending face #${targetFace.index + 1}...",
+                            detailMessage = "Applying ${skinToneMode.title}, ${faceReactionMode.title} & blending face #${targetFace.index + 1}...",
                             progressFraction = 0.90f
                         )
                     )
@@ -195,11 +197,13 @@ object InSwapperEngine {
                         targetLandmarks5 = targetFace.landmarks5
                     )
 
-                    // 2. Harmonize skin tone strictly on skin while protecting dynamic eye & eyebrow zones
+                    // 2. Harmonize skin tone according to user's chosen SkinToneSourceMode (Target vs Source vs 50/50)
                     val colorCorrected128 = if (enableColorTransfer) {
                         FaceBlender.transferSkinToneStatistics128(
                             swapped128 = eyeRestored128,
                             targetCrop128 = alignedTarget128,
+                            sourceCrop128 = alignedSource128,
+                            skinToneMode = skinToneMode,
                             forwardMatrix128 = m128,
                             targetLandmarks5 = targetFace.landmarks5
                         )
@@ -207,7 +211,7 @@ object InSwapperEngine {
                         eyeRestored128
                     }
 
-                    // 3. Direct 512x512 Online Photo Style HD Super-Resolution, Pore Transfer & Biometric Feather Blending
+                    // 3. Direct 512x512 Online Photo Style HD Super-Resolution, Reaction Synthesis & Biometric Feather Blending
                     val gfpganFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
                     FaceBlender.enhanceAndBlendOnlineHdFace512(
                         ortEnv = ortEnv,
@@ -219,6 +223,11 @@ object InSwapperEngine {
                         colorCorrected128 = colorCorrected128,
                         forwardMatrix128 = m128,
                         targetLandmarks5 = targetFace.landmarks5,
+                        sourceBitmap = sourceBitmap,
+                        sourceLandmarks5 = sourceFace.landmarks5,
+                        skinToneMode = skinToneMode,
+                        faceReactionMode = faceReactionMode,
+                        enableColorTransfer = enableColorTransfer,
                         preloadedGfpganSession = preloadedGfpganSession
                     )
 
