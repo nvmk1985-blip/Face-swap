@@ -113,6 +113,13 @@ interface FaceSwapAndRestorationService : AutoCloseable {
         preferHardwareAccel: Boolean = true,
         skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
         faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
+        enableOcclusionProtection: Boolean = true,
+        portraitBlurStrength: Float = 0f,
+        blendStrength: Float = 1.0f,
+        enhancementStrength: Float = 0.85f,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        scaleAdjust: Float = 1.0f,
         onProgress: (SwapStageProgress) -> Unit = {}
     ): FaceSwapExecutionResult
 
@@ -132,6 +139,12 @@ interface FaceSwapAndRestorationService : AutoCloseable {
         preferHardwareAccel: Boolean = true,
         skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
         faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
+        portraitBlurStrength: Float = 0f,
+        blendStrength: Float = 1.0f,
+        enhancementStrength: Float = 0.85f,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        scaleAdjust: Float = 1.0f,
         onProgress: (SwapStageProgress) -> Unit = {}
     ): FaceSwapExecutionResult
 
@@ -481,11 +494,21 @@ class OnnxRuntimeModelService(
         preferHardwareAccel: Boolean,
         skinToneMode: SkinToneSourceMode,
         faceReactionMode: FaceReactionSourceMode,
+        enableOcclusionProtection: Boolean,
+        portraitBlurStrength: Float,
+        blendStrength: Float,
+        enhancementStrength: Float,
+        offsetX: Float,
+        offsetY: Float,
+        scaleAdjust: Float,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val arcFaceSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel)
         val swapSession = getOrLoadSession(ModelSlot.SWAPPER, preferHardwareAccel)
         val gfpganSession = getOrLoadSession(ModelSlot.ENHANCEMENT, preferHardwareAccel)
+        val segformerSession = if (enableOcclusionProtection) {
+            getOrLoadSession(ModelSlot.SEGMENTATION, preferHardwareAccel)
+        } else null
         val emap = getOrLoadInswapperEmap()
 
         return InSwapperEngine.executeFaceSwap(
@@ -500,9 +523,18 @@ class OnnxRuntimeModelService(
             allowTwoModelFallbackForTesting = allowTwoModelFallback,
             skinToneMode = skinToneMode,
             faceReactionMode = faceReactionMode,
+            enableOcclusionProtection = enableOcclusionProtection,
+            portraitBlurStrength = portraitBlurStrength,
+            blendStrength = blendStrength,
+            enhancementStrength = enhancementStrength,
+            offsetX = offsetX,
+            offsetY = offsetY,
+            scaleAdjust = scaleAdjust,
+            preferHardwareAccel = preferHardwareAccel,
             preloadedArcFaceSession = arcFaceSession,
             preloadedSwapSession = swapSession,
             preloadedGfpganSession = gfpganSession,
+            preloadedSegformerSession = segformerSession,
             preloadedEmap512x512 = emap,
             onProgress = onProgress
         )
@@ -520,6 +552,12 @@ class OnnxRuntimeModelService(
         preferHardwareAccel: Boolean,
         skinToneMode: SkinToneSourceMode,
         faceReactionMode: FaceReactionSourceMode,
+        portraitBlurStrength: Float,
+        blendStrength: Float,
+        enhancementStrength: Float,
+        offsetX: Float,
+        offsetY: Float,
+        scaleAdjust: Float,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val arcFaceSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel)
@@ -542,6 +580,12 @@ class OnnxRuntimeModelService(
             preferHardwareAccel = preferHardwareAccel,
             skinToneMode = skinToneMode,
             faceReactionMode = faceReactionMode,
+            portraitBlurStrength = portraitBlurStrength,
+            blendStrength = blendStrength,
+            enhancementStrength = enhancementStrength,
+            offsetX = offsetX,
+            offsetY = offsetY,
+            scaleAdjust = scaleAdjust,
             preloadedArcFaceSession = arcFaceSession,
             preloadedSwapSession = swapSession,
             preloadedSegformerSession = segformerSession,

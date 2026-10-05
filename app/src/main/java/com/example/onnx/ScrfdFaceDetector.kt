@@ -311,7 +311,30 @@ object ScrfdFaceDetector {
     fun detectFacesAndroidPreviewFallback(bitmap: Bitmap, maxFaces: Int = 10): List<DetectedFace> {
         val origW = bitmap.width
         val origH = bitmap.height
-        if (origW <= 16 || origH <= 16) return listOf(createFullPortraitFaceEstimate(bitmap))
+        if (origW <= 16 || origH <= 16) return emptyList()
+
+        // Check if image is blank / uniform solid color (no facial structure present)
+        val sampleStepX = (origW / 16).coerceAtLeast(1)
+        val sampleStepY = (origH / 16).coerceAtLeast(1)
+        var minLum = 255f
+        var maxLum = 0f
+        var y = 0
+        while (y < origH) {
+            var x = 0
+            while (x < origW) {
+                val c = bitmap.getPixel(x, y)
+                val lum = 0.299f * ((c ushr 16) and 0xFF) +
+                    0.587f * ((c ushr 8) and 0xFF) +
+                    0.114f * (c and 0xFF)
+                if (lum < minLum) minLum = lum
+                if (lum > maxLum) maxLum = lum
+                x += sampleStepX
+            }
+            y += sampleStepY
+        }
+        if ((maxLum - minLum) < 8.0f) {
+            return emptyList()
+        }
 
         // Android FaceDetector works best on scaled images (max ~640px)
         val maxDim = maxOf(origW, origH)
@@ -331,7 +354,7 @@ object ScrfdFaceDetector {
         rgb565.recycle()
 
         if (found <= 0) {
-            // Guaranteed portrait fallback so valid user photos are never rejected
+            // Guaranteed portrait fallback for real non-blank photos when det_10g.onnx is not yet loaded
             return listOf(createFullPortraitFaceEstimate(bitmap))
         }
 

@@ -36,6 +36,12 @@ object GhostHeadReplacementEngine {
         preferHardwareAccel: Boolean = false,
         skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
         faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
+        portraitBlurStrength: Float = 0f,
+        blendStrength: Float = 1.0f,
+        enhancementStrength: Float = 0.85f,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        scaleAdjust: Float = 1.0f,
         preloadedArcFaceSession: OrtSession? = null,
         preloadedSwapSession: OrtSession? = null,
         preloadedSegformerSession: OrtSession? = null,
@@ -255,7 +261,8 @@ object GhostHeadReplacementEngine {
                     progressFraction = 0.92f
                 )
             )
-            val gfpRestoredHead = if (ortEnv != null && (preloadedGfpganSession != null || (gfpFile.exists() && gfpFile.length() > 1024L))) {
+            val clampedEnhance = enhancementStrength.coerceIn(0f, 1f)
+            val gfpRestoredHead512 = if (clampedEnhance > 0.05f && ortEnv != null && (preloadedGfpganSession != null || (gfpFile.exists() && gfpFile.length() > 1024L))) {
                 val restored512 = FaceBlender.runOptionalGfpganEnhancement512(
                     ortEnv = ortEnv,
                     gfpganFile = if (gfpFile.exists()) gfpFile else null,
@@ -265,33 +272,51 @@ object GhostHeadReplacementEngine {
                 )
                 if (restored512 != null) {
                     usedGfpganPass = true
-                    if (restored512.width == headCropSize) {
-                        restored512
-                    } else {
-                        val scaledBack = Bitmap.createScaledBitmap(restored512, headCropSize, headCropSize, true)
-                        restored512.recycle()
-                        scaledBack
-                    }
+                    restored512
                 } else {
                     null
                 }
             } else {
                 null
             }
-            val enhancedHeadCrop = applyTiledDetailEnhancement(gfpRestoredHead ?: compositedHeadCrop)
-            gfpRestoredHead?.recycle()
+            // Keep full 512x512 HD resolution if GFPGAN restored at 512x512 (NEVER downscale back to 128x128 or headCropSize!)
+            val enhancedHeadCrop = applyTiledDetailEnhancement(gfpRestoredHead512 ?: compositedHeadCrop)
+            gfpRestoredHead512?.recycle()
 
             // Paste the full head + inpainted disocclusion envelope back onto the full-resolution target photo
-            val unionEnvelopeAlpha = FloatArray(headCropSize * headCropSize) { i ->
+            val baseEnvelopeAlpha = FloatArray(headCropSize * headCropSize) { i ->
                 max(srcMasks.fullHeadAlpha[i], tgtMasks.fullHeadAlpha[i] * 0.90f).coerceIn(0f, 1f)
             }
+            val warpSize = enhancedHeadCrop.width
+            val warpScale = warpSize.toFloat() / headCropSize.toFloat()
+            val warpMatrix2x3 = if (warpSize == headCropSize) {
+                tgtHeadMatrix
+            } else {
+                FloatArray(6) { i -> tgtHeadMatrix[i] * warpScale }
+            }
+            val warpEnvelopeAlpha = if (warpSize == headCropSize) {
+                baseEnvelopeAlpha
+            } else {
+                FloatArray(warpSize * warpSize) { idx512 ->
+                    val y512 = idx512 / warpSize
+                    val x512 = idx512 % warpSize
+                    val sy = (y512 * headCropSize / warpSize).coerceIn(0, headCropSize - 1)
+                    val sx = (x512 * headCropSize / warpSize).coerceIn(0, headCropSize - 1)
+                    baseEnvelopeAlpha[sy * headCropSize + sx]
+                }
+            }
+
             warpHeadCropBackToTarget(
                 targetPixels = compositePixels,
                 targetWidth = targetW,
                 targetHeight = targetH,
                 headCrop = enhancedHeadCrop,
-                forwardHeadMatrix2x3 = tgtHeadMatrix,
-                envelopeAlpha = unionEnvelopeAlpha
+                forwardHeadMatrix2x3 = warpMatrix2x3,
+                envelopeAlpha = warpEnvelopeAlpha,
+                blendStrength = blendStrength,
+                offsetX = offsetX * warpScale,
+                offsetY = offsetY * warpScale,
+                scaleAdjust = scaleAdjust
             )
 
             if (illuminationAdaptedHead !== synthesizedHeadCrop) illuminationAdaptedHead.recycle()
@@ -299,8 +324,8 @@ object GhostHeadReplacementEngine {
             compositedHeadCrop.recycle()
 
             if (firstTargetHeadPreview == null) {
-                firstTargetHeadPreview = Bitmap.createScaledBitmap(alignedTargetHead, 128, 128, true)
-                firstGeneratedHeadPreview = Bitmap.createScaledBitmap(enhancedHeadCrop, 128, 128, true)
+                firstTargetHeadPreview = alignedTargetHead.copy(Bitmap.Config.ARGB_8888, false)
+                firstGeneratedHeadPreview = enhancedHeadCrop.copy(Bitmap.Config.ARGB_8888, false)
             }
             alignedTargetHead.recycle()
             synthesizedHeadCrop.recycle()
@@ -320,6 +345,14 @@ object GhostHeadReplacementEngine {
         val finalBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
         finalBitmap.setPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)
 
+        if (portraitBlurStrength > 0.03f) {
+            HeadSegmentationAndInpainting.applyPortraitModeBackgroundBokeh(
+                bitmap = finalBitmap,
+                faces = targetFacesToReplace,
+                blurStrength = portraitBlurStrength
+            )
+        }
+
         if (enableProvenanceWatermark) {
             FaceBlender.applyEthicalProvenanceWatermark(finalBitmap)
         }
@@ -332,7 +365,10 @@ object GhostHeadReplacementEngine {
                 append(" + inswapper_128 Expression Core")
             }
             if (usedGfpganPass) {
-                append(" + gfpgan_1.4.onnx Restoration")
+                append(" + gfpgan_1.4.onnx (512x512 HD)")
+            }
+            if (portraitBlurStrength > 0.03f) {
+                append(" + DSLR Bokeh ${(portraitBlurStrength * 100).toInt()}%")
             }
         }
 
@@ -701,7 +737,11 @@ object GhostHeadReplacementEngine {
         targetHeight: Int,
         headCrop: Bitmap,
         forwardHeadMatrix2x3: FloatArray,
-        envelopeAlpha: FloatArray
+        envelopeAlpha: FloatArray,
+        blendStrength: Float = 1.0f,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        scaleAdjust: Float = 1.0f
     ) {
         val cropSize = headCrop.width
         val cropPixels = IntArray(cropSize * cropSize)
@@ -726,10 +766,10 @@ object GhostHeadReplacementEngine {
             minY = min(minY, ty)
             maxY = max(maxY, ty)
         }
-        minX = (minX - 2).coerceIn(0, targetWidth - 1)
-        maxX = (maxX + 2).coerceIn(0, targetWidth - 1)
-        minY = (minY - 2).coerceIn(0, targetHeight - 1)
-        maxY = (maxY + 2).coerceIn(0, targetHeight - 1)
+        minX = (minX - 16).coerceIn(0, targetWidth - 1)
+        maxX = (maxX + 16).coerceIn(0, targetWidth - 1)
+        minY = (minY - 16).coerceIn(0, targetHeight - 1)
+        maxY = (maxY + 16).coerceIn(0, targetHeight - 1)
 
         val m00 = forwardHeadMatrix2x3[0]
         val m01 = forwardHeadMatrix2x3[1]
@@ -738,22 +778,32 @@ object GhostHeadReplacementEngine {
         val m11 = forwardHeadMatrix2x3[4]
         val m12 = forwardHeadMatrix2x3[5]
 
+        val center = cropSize * 0.5f
+        val clampedBlend = blendStrength.coerceIn(0.20f, 1.0f)
+        val safeScale = scaleAdjust.coerceIn(0.85f, 1.15f)
+        val shiftU = offsetX.coerceIn(-36f, 36f) * (cropSize / 320f)
+        val shiftV = offsetY.coerceIn(-36f, 36f) * (cropSize / 320f)
+
         for (y in minY..maxY) {
             val rowOffset = y * targetWidth
             val baseU = m01 * y + m02
             val baseV = m11 * y + m12
             for (x in minX..maxX) {
-                val u = m00 * x + baseU
-                val v = m10 * x + baseV
+                val rawU = m00 * x + baseU
+                val rawV = m10 * x + baseV
+                val u = (rawU - center - shiftU) / safeScale + center
+                val v = (rawV - center - shiftV) / safeScale + center
                 if (u >= 1f && u < cropSize - 2f && v >= 1f && v < cropSize - 2f) {
                     val x0 = u.toInt().coerceIn(0, cropSize - 2)
                     val y0 = v.toInt().coerceIn(0, cropSize - 2)
                     val fx = u - x0
                     val fy = v - y0
-                    val alpha = envelopeAlpha[y0 * cropSize + x0] * (1f - fx) * (1f - fy) +
-                        envelopeAlpha[y0 * cropSize + x0 + 1] * fx * (1f - fy) +
-                        envelopeAlpha[(y0 + 1) * cropSize + x0] * (1f - fx) * fy +
-                        envelopeAlpha[(y0 + 1) * cropSize + x0 + 1] * fx * fy
+                    val alpha = (
+                        envelopeAlpha[y0 * cropSize + x0] * (1f - fx) * (1f - fy) +
+                            envelopeAlpha[y0 * cropSize + x0 + 1] * fx * (1f - fy) +
+                            envelopeAlpha[(y0 + 1) * cropSize + x0] * (1f - fx) * fy +
+                            envelopeAlpha[(y0 + 1) * cropSize + x0 + 1] * fx * fy
+                        ) * clampedBlend
 
                     if (alpha > 0.003f) {
                         val headColor = FaceAlignment.sampleBilinearClamped(cropPixels, cropSize, cropSize, u, v)

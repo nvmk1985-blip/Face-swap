@@ -448,11 +448,13 @@ class ExampleRobolectricTest {
             requestedPerms.contains(android.Manifest.permission.INTERNET)
         )
 
-        // 2. Verify all 6 structured model subdirectories are created locally
+        // 2. Verify all 8 structured model subdirectories are created locally
         val root = OnnxProtobufInspector.getModelsRootDir(context)
         val expectedSubdirs = listOf(
             "face_swap",
-            "head_swap",
+            "head_replacement",
+            "detection",
+            "recognition",
             "segmentation",
             "matting",
             "inpainting",
@@ -465,5 +467,66 @@ class ExampleRobolectricTest {
 
         // 3. Verify GHOST 2.0 Feasibility Matrix has all 7 reference components documented
         assertEquals(7, OnnxProtobufInspector.GHOST_2_FEASIBILITY_MATRIX.size)
+
+        // 4. Verify Rotate 90° and Crop 1:1 / 4:5 helpers work offline
+        val testBmp = Bitmap.createBitmap(200, 120, Bitmap.Config.ARGB_8888)
+        val rotated = com.example.util.ImageGalleryHelper.rotateBitmap90(testBmp)
+        assertEquals(120, rotated.width)
+        assertEquals(200, rotated.height)
+        val croppedSq = com.example.util.ImageGalleryHelper.cropBitmapToRatio(rotated, 1, 1)
+        assertEquals(120, croppedSq.width)
+        assertEquals(120, croppedSq.height)
+    }
+
+    @Test
+    fun `test11 online hd 512x512 direct warp pipeline never downscales to 128x128 and supports portrait bokeh`() {
+        val (tgtBmp, tgtFace) = createSyntheticPortrait(
+            width = 480,
+            height = 640,
+            bgColor = Color.rgb(35, 55, 85),
+            skinColor = Color.rgb(215, 175, 150),
+            hairColor = Color.rgb(45, 30, 20),
+            rollDegrees = 14f
+        )
+        // Simulate raw 128x128 output from inswapper_128.onnx
+        val aligned128 = FaceAlignment.alignCrop128(tgtBmp, tgtFace.landmarks5)
+        val targetPixels = IntArray(tgtBmp.width * tgtBmp.height)
+        tgtBmp.getPixels(targetPixels, 0, tgtBmp.width, 0, 0, tgtBmp.width, tgtBmp.height)
+
+        val hdRestored512 = com.example.onnx.FaceBlender.enhanceAndBlendOnlineHdFace512(
+            ortEnv = ortEnv ?: OrtEnvironment.getEnvironment(),
+            gfpganFile = null,
+            targetBitmap = tgtBmp,
+            targetPixels = targetPixels,
+            targetWidth = tgtBmp.width,
+            targetHeight = tgtBmp.height,
+            swappedCrop128 = aligned128.croppedBitmap,
+            targetLandmarks5 = tgtFace.landmarks5,
+            enableColorTransfer = true,
+            blendStrength = 0.88f,
+            enhancementStrength = 0.75f,
+            skinToneMode = com.example.onnx.SkinToneSourceMode.TARGET_SCENE,
+            faceReactionMode = com.example.onnx.FaceReactionSourceMode.TARGET_REACTION,
+            enableOcclusionProtection = true
+        )
+
+        // Verify the restored crop returned is 512x512 HD (NOT downscaled back to 128x128)
+        assertEquals(512, hdRestored512.width)
+        assertEquals(512, hdRestored512.height)
+        hdRestored512.recycle()
+        aligned128.croppedBitmap.recycle()
+
+        // Verify DSLR Portrait Mode Background Bokeh preserves full target resolution
+        val outBmp = Bitmap.createBitmap(tgtBmp.width, tgtBmp.height, Bitmap.Config.ARGB_8888)
+        outBmp.setPixels(targetPixels, 0, tgtBmp.width, 0, 0, tgtBmp.width, tgtBmp.height)
+        val bokehBmp = HeadSegmentationAndInpainting.applyPortraitModeBackgroundBokeh(
+            ortEnv = ortEnv,
+            bitmap = outBmp,
+            detectedFaces = listOf(tgtFace),
+            blurStrength = 0.65f,
+            segModelFile = null
+        )
+        assertEquals(480, bokehBmp.width)
+        assertEquals(640, bokehBmp.height)
     }
 }

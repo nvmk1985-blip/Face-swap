@@ -54,9 +54,18 @@ object InSwapperEngine {
         allowTwoModelFallbackForTesting: Boolean,
         skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
         faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
+        enableOcclusionProtection: Boolean = true,
+        portraitBlurStrength: Float = 0f,
+        blendStrength: Float = 1.0f,
+        enhancementStrength: Float = 0.85f,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        scaleAdjust: Float = 1.0f,
+        preferHardwareAccel: Boolean = false,
         preloadedArcFaceSession: OrtSession? = null,
         preloadedSwapSession: OrtSession? = null,
         preloadedGfpganSession: OrtSession? = null,
+        preloadedSegformerSession: OrtSession? = null,
         preloadedEmap512x512: FloatArray? = null,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
@@ -64,6 +73,7 @@ object InSwapperEngine {
         val detFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.DETECTOR)
         val recFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.RECOGNIZER)
         val swapFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.SWAPPER)
+        val segFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.SEGMENTATION)
 
         require(preloadedSwapSession != null || (swapFile.exists() && swapFile.length() > 1024L)) {
             "inswapper_128.onnx is not loaded. Please import inswapper_128.onnx in the ONNX Models tab or place it in app/src/main/assets/models/."
@@ -180,8 +190,8 @@ object InSwapperEngine {
                     onProgress(
                         SwapStageProgress(
                             stepIndex = 5,
-                            stageTitle = "Stage 5/5: 512x512 Online-Style HD Restoration & Glitch-Free Blending",
-                            detailMessage = "Applying ${skinToneMode.title}, ${faceReactionMode.title} & blending face #${targetFace.index + 1}...",
+                            stageTitle = "Stage 5/6: Segmentation,Blending & Enhancement",
+                            detailMessage = "Applying ${skinToneMode.title}, ${faceReactionMode.title}, Blend ${(blendStrength * 100).toInt()}%, Enhance ${(enhancementStrength * 100).toInt()}% on face #${targetFace.index + 1}...",
                             progressFraction = 0.90f
                         )
                     )
@@ -211,9 +221,9 @@ object InSwapperEngine {
                         eyeRestored128
                     }
 
-                    // 3. Direct 512x512 Online Photo Style HD Super-Resolution, Reaction Synthesis & Biometric Feather Blending
+                    // 3. Direct 512x512 Online Photo Style HD Super-Resolution, Reaction Synthesis, Occlusion Guard & Multi-Band Blend
                     val gfpganFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
-                    FaceBlender.enhanceAndBlendOnlineHdFace512(
+                    val restoredHd512 = FaceBlender.enhanceAndBlendOnlineHdFace512(
                         ortEnv = ortEnv,
                         gfpganFile = if (gfpganFile.exists() && gfpganFile.length() > 1024L) gfpganFile else null,
                         targetBitmap = targetBitmap,
@@ -228,21 +238,30 @@ object InSwapperEngine {
                         skinToneMode = skinToneMode,
                         faceReactionMode = faceReactionMode,
                         enableColorTransfer = enableColorTransfer,
-                        preloadedGfpganSession = preloadedGfpganSession
+                        enableOcclusionProtection = enableOcclusionProtection,
+                        blendStrength = blendStrength,
+                        enhancementStrength = enhancementStrength,
+                        offsetX = offsetX,
+                        offsetY = offsetY,
+                        scaleAdjust = scaleAdjust,
+                        preferHardwareAccel = preferHardwareAccel,
+                        segformerFile = if (segFile.exists() && segFile.length() > 1024L) segFile else null,
+                        preloadedGfpganSession = preloadedGfpganSession,
+                        preloadedSegformerSession = preloadedSegformerSession
                     )
 
                     if (colorCorrected128 !== eyeRestored128) {
                         colorCorrected128.recycle()
                     }
+                    eyeRestored128.recycle()
+                    rawSwapped128.recycle()
 
                     if (firstTargetCrop128 == null) {
                         firstTargetCrop128 = alignedTarget128
-                        firstRawSwapped128 = eyeRestored128
-                        rawSwapped128.recycle()
+                        firstRawSwapped128 = restoredHd512
                     } else {
                         alignedTarget128.recycle()
-                        eyeRestored128.recycle()
-                        rawSwapped128.recycle()
+                        restoredHd512.recycle()
                     }
                     totalBlendMs += (System.currentTimeMillis() - tBlend0).coerceAtLeast(1L)
                 }
@@ -267,6 +286,14 @@ object InSwapperEngine {
         val finalBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
         finalBitmap.setPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)
 
+        if (portraitBlurStrength > 0.03f) {
+            HeadSegmentationAndInpainting.applyPortraitModeBackgroundBokeh(
+                bitmap = finalBitmap,
+                faces = targetFacesToReplace,
+                blurStrength = portraitBlurStrength
+            )
+        }
+
         if (enableProvenanceWatermark) {
             FaceBlender.applyEthicalProvenanceWatermark(finalBitmap)
         }
@@ -279,6 +306,12 @@ object InSwapperEngine {
         } else {
             " -> 512x512 Online HD Blend"
         }
+        val segTag = if (enableOcclusionProtection && (preloadedSegformerSession != null || (segFile.exists() && segFile.length() > 1024L))) {
+            " + segformer_B5_ce.onnx"
+        } else ""
+        val bokehTag = if (portraitBlurStrength > 0.03f) {
+            " + DSLR Bokeh ${(portraitBlurStrength * 100).toInt()}%"
+        } else ""
 
         return FaceSwapExecutionResult(
             outputBitmap = finalBitmap,
@@ -293,7 +326,7 @@ object InSwapperEngine {
             inswapperMs = totalSwapMs.coerceAtLeast(1L),
             blendingMs = totalBlendMs.coerceAtLeast(1L),
             totalMs = totalMs,
-            pipelineSummary = "det_10g.onnx -> ${sourceEmbedding.providerSummary} -> inswapper_128.onnx$gfpTag"
+            pipelineSummary = "det_10g.onnx -> ${sourceEmbedding.providerSummary} -> inswapper_128.onnx$gfpTag$segTag$bokehTag"
         )
     }
 

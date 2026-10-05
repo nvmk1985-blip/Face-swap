@@ -34,7 +34,12 @@ object ImageGalleryHelper {
      * Supports OEM Gallery providers (Vivo, Xiaomi, Samsung, Oppo), Android Photo Picker
      * virtual/typed media URIs, DocumentsProvider URIs, and direct file descriptors.
      */
-    fun decodeUriToBitmap(context: Context, uri: Uri): Result<Bitmap> {
+    fun decodeUriToBitmap(
+        context: Context,
+        uri: Uri,
+        maxDimensionPx: Int = MAX_IMAGE_DIMENSION
+    ): Result<Bitmap> {
+        val safeMaxDim = maxDimensionPx.coerceIn(512, 4096)
         return runCatching {
             // Preserve read permission across coroutine dispatches if the provider supports it
             runCatching {
@@ -51,7 +56,7 @@ object ImageGalleryHelper {
                 // Strategy 1: Native ImageDecoder on Android 9+ (handles Photo Picker, HEIC, WebP, EXIF)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
                     val imageDecoderResult = runCatching {
-                        decodeWithImageDecoder(context, candidateUri)
+                        decodeWithImageDecoder(context, candidateUri, safeMaxDim)
                     }
                     if (imageDecoderResult.isSuccess) {
                         return@runCatching imageDecoderResult.getOrThrow()
@@ -62,7 +67,7 @@ object ImageGalleryHelper {
 
                 // Strategy 2: Copy stream once to a temporary cache file using multi-descriptor fallback
                 val tempFileResult = runCatching {
-                    decodeViaSinglePassTempFile(context, candidateUri)
+                    decodeViaSinglePassTempFile(context, candidateUri, safeMaxDim)
                 }
                 if (tempFileResult.isSuccess) {
                     return@runCatching tempFileResult.getOrThrow()
@@ -72,7 +77,7 @@ object ImageGalleryHelper {
 
                 // Strategy 3: Direct ParcelFileDescriptor decoding
                 val pfdResult = runCatching {
-                    decodeViaParcelFileDescriptor(context, candidateUri)
+                    decodeViaParcelFileDescriptor(context, candidateUri, safeMaxDim)
                 }
                 if (pfdResult.isSuccess) {
                     return@runCatching pfdResult.getOrThrow()
@@ -87,7 +92,11 @@ object ImageGalleryHelper {
         }
     }
 
-    private fun decodeWithImageDecoder(context: Context, uri: Uri): Bitmap {
+    private fun decodeWithImageDecoder(
+        context: Context,
+        uri: Uri,
+        maxDimensionPx: Int = MAX_IMAGE_DIMENSION
+    ): Bitmap {
         if (Build.VERSION.SDK_INT < Build.VERSION_CODES.P) {
             error("ImageDecoder requires API 28+")
         }
@@ -98,8 +107,8 @@ object ImageGalleryHelper {
             val w = info.size.width
             val h = info.size.height
             val longest = max(w, h)
-            if (longest > MAX_IMAGE_DIMENSION) {
-                val scale = MAX_IMAGE_DIMENSION.toFloat() / longest.toFloat()
+            if (longest > maxDimensionPx) {
+                val scale = maxDimensionPx.toFloat() / longest.toFloat()
                 decoder.setTargetSize(
                     (w * scale).toInt().coerceAtLeast(1),
                     (h * scale).toInt().coerceAtLeast(1)
@@ -112,7 +121,11 @@ object ImageGalleryHelper {
         return ensureArgb8888(bitmap)
     }
 
-    private fun decodeViaSinglePassTempFile(context: Context, uri: Uri): Bitmap {
+    private fun decodeViaSinglePassTempFile(
+        context: Context,
+        uri: Uri,
+        maxDimensionPx: Int = MAX_IMAGE_DIMENSION
+    ): Bitmap {
         val tempFile = File(context.cacheDir, "picked_photo_${System.nanoTime()}.tmp")
         try {
             val stream = openBestEffortInputStream(context, uri)
@@ -141,7 +154,7 @@ object ImageGalleryHelper {
 
             var sampleSize = 1
             val longestSide = max(boundsOpts.outWidth, boundsOpts.outHeight)
-            while (longestSide / sampleSize > MAX_IMAGE_DIMENSION) {
+            while (longestSide / sampleSize > maxDimensionPx) {
                 sampleSize *= 2
             }
 
@@ -162,7 +175,11 @@ object ImageGalleryHelper {
         }
     }
 
-    private fun decodeViaParcelFileDescriptor(context: Context, uri: Uri): Bitmap {
+    private fun decodeViaParcelFileDescriptor(
+        context: Context,
+        uri: Uri,
+        maxDimensionPx: Int = MAX_IMAGE_DIMENSION
+    ): Bitmap {
         val pfd = openBestEffortParcelFileDescriptor(context, uri)
             ?: error("Unable to open ParcelFileDescriptor for Gallery URI.")
 
@@ -178,7 +195,7 @@ object ImageGalleryHelper {
 
             var sampleSize = 1
             val longestSide = max(boundsOpts.outWidth, boundsOpts.outHeight)
-            while (longestSide / sampleSize > MAX_IMAGE_DIMENSION) {
+            while (longestSide / sampleSize > maxDimensionPx) {
                 sampleSize *= 2
             }
 
@@ -411,16 +428,74 @@ object ImageGalleryHelper {
     }
 
     /**
+     * Rotates a Bitmap clockwise by 90 degrees.
+     */
+    fun rotateBitmap90(bitmap: Bitmap): Bitmap {
+        val matrix = Matrix().apply { postRotate(90f) }
+        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
+    }
+
+    /**
+     * Center-crops a Bitmap to the requested aspect ratio (`aspectW : aspectH`).
+     */
+    fun cropBitmapToRatio(bitmap: Bitmap, aspectW: Int, aspectH: Int): Bitmap {
+        if (aspectW <= 0 || aspectH <= 0) return bitmap
+        val srcW = bitmap.width
+        val srcH = bitmap.height
+        val targetRatio = aspectW.toFloat() / aspectH.toFloat()
+        val srcRatio = srcW.toFloat() / srcH.toFloat()
+
+        val cropW: Int
+        val cropH: Int
+        if (srcRatio > targetRatio) {
+            cropH = srcH
+            cropW = (srcH * targetRatio).toInt().coerceIn(1, srcW)
+        } else {
+            cropW = srcW
+            cropH = (srcW / targetRatio).toInt().coerceIn(1, srcH)
+        }
+
+        val x = ((srcW - cropW) / 2).coerceAtLeast(0)
+        val y = ((srcH - cropH) / 2).coerceAtLeast(0)
+        return Bitmap.createBitmap(bitmap, x, y, cropW, cropH)
+    }
+
+    /**
      * Saves the swapped Bitmap to the Android device's Gallery (`Pictures/FaceSwapStudio`)
      * using MediaStore without requiring internet or legacy storage permissions on Android 10+.
+     *
+     * @param isHd When true, saves uncompressed 100% PNG at the requested `targetMaxDimension`.
+     *             When false, saves standard 95% JPEG.
      */
-    fun saveBitmapToGallery(context: Context, bitmap: Bitmap): Result<String> {
+    fun saveBitmapToGallery(
+        context: Context,
+        bitmap: Bitmap,
+        isHd: Boolean = true,
+        targetMaxDimension: Int = 0
+    ): Result<String> {
         return runCatching {
-            val fileName = "FaceSwap_${System.currentTimeMillis()}.png"
+            val exportBitmap = if (targetMaxDimension > 0) {
+                val longest = max(bitmap.width, bitmap.height)
+                if (longest != targetMaxDimension && longest > 0) {
+                    val scale = targetMaxDimension.toFloat() / longest.toFloat()
+                    val newW = (bitmap.width * scale).toInt().coerceIn(64, 4096)
+                    val newH = (bitmap.height * scale).toInt().coerceIn(64, 4096)
+                    Bitmap.createScaledBitmap(bitmap, newW, newH, true)
+                } else {
+                    bitmap
+                }
+            } else {
+                bitmap
+            }
+
+            val ext = if (isHd) "png" else "jpg"
+            val mime = if (isHd) "image/png" else "image/jpeg"
+            val prefix = if (isHd) "FaceSwap_HD" else "FaceSwap"
+            val fileName = "${prefix}_${System.currentTimeMillis()}.$ext"
             val resolver = context.contentResolver
             val contentValues = ContentValues().apply {
                 put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
-                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                put(MediaStore.Images.Media.MIME_TYPE, mime)
                 if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                     put(
                         MediaStore.Images.Media.RELATIVE_PATH,
@@ -439,9 +514,15 @@ object ImageGalleryHelper {
                 ?: error("Could not open MediaStore output stream.")
 
             outputStream.use { out ->
-                if (!bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)) {
-                    error("Failed to compress PNG bitmap.")
+                val format = if (isHd) Bitmap.CompressFormat.PNG else Bitmap.CompressFormat.JPEG
+                val quality = if (isHd) 100 else 95
+                if (!exportBitmap.compress(format, quality, out)) {
+                    error("Failed to compress output bitmap.")
                 }
+            }
+
+            if (exportBitmap !== bitmap) {
+                exportBitmap.recycle()
             }
 
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
@@ -450,7 +531,55 @@ object ImageGalleryHelper {
                 resolver.update(imageUri, contentValues, null, null)
             }
 
-            "Pictures/FaceSwapStudio/$fileName"
+            "Pictures/FaceSwapStudio/$fileName (${exportBitmap.width}×${exportBitmap.height})"
+        }
+    }
+
+    /**
+     * Shares the result Bitmap via Android's native system Share sheet (`Intent.ACTION_SEND`)
+     * using a MediaStore URI so no external internet or cloud upload is needed.
+     */
+    fun shareBitmap(context: Context, bitmap: Bitmap): Result<String> {
+        return runCatching {
+            val fileName = "FaceSwap_Share_${System.currentTimeMillis()}.png"
+            val resolver = context.contentResolver
+            val contentValues = ContentValues().apply {
+                put(MediaStore.Images.Media.DISPLAY_NAME, fileName)
+                put(MediaStore.Images.Media.MIME_TYPE, "image/png")
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    put(
+                        MediaStore.Images.Media.RELATIVE_PATH,
+                        "${Environment.DIRECTORY_PICTURES}/FaceSwapStudio"
+                    )
+                    put(MediaStore.Images.Media.IS_PENDING, 1)
+                }
+            }
+
+            val imageUri = resolver.insert(
+                MediaStore.Images.Media.EXTERNAL_CONTENT_URI,
+                contentValues
+            ) ?: error("Could not prepare shareable MediaStore URI.")
+
+            resolver.openOutputStream(imageUri)?.use { out ->
+                bitmap.compress(Bitmap.CompressFormat.PNG, 100, out)
+            } ?: error("Could not write shareable image stream.")
+
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                contentValues.clear()
+                contentValues.put(MediaStore.Images.Media.IS_PENDING, 0)
+                resolver.update(imageUri, contentValues, null, null)
+            }
+
+            val sendIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "image/png"
+                putExtra(Intent.EXTRA_STREAM, imageUri)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            val chooser = Intent.createChooser(sendIntent, "Share Offline Face Swap / Head Result").apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+            context.startActivity(chooser)
+            "Opened Android Share Sheet ($fileName)"
         }
     }
 }

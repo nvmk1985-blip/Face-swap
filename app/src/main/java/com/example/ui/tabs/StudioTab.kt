@@ -72,6 +72,18 @@ import com.example.onnx.FaceReactionSourceMode
 import com.example.onnx.ModelSlot
 import com.example.onnx.SkinToneSourceMode
 import com.example.ui.FaceSwapUiState
+import androidx.compose.foundation.gestures.detectTransformGestures
+import androidx.compose.material.icons.filled.Crop
+import androidx.compose.material.icons.filled.RotateRight
+import androidx.compose.material.icons.filled.Share
+import androidx.compose.material.icons.filled.ZoomIn
+import androidx.compose.material3.Slider
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.input.pointer.pointerInput
+import com.example.ui.OutputResolutionOption
+import com.example.ui.ProcessingQualityLevel
 import com.example.ui.StudioMode
 import com.example.ui.components.FaceDetectionCanvas
 import com.example.ui.theme.AmberWarning
@@ -100,6 +112,20 @@ fun StudioTab(
     onLowMemoryChanged: (Boolean) -> Unit,
     onRunSwap: () -> Unit,
     onSaveToGallery: () -> Unit,
+    onSaveHdToGallery: () -> Unit = onSaveToGallery,
+    onShareResult: () -> Unit = {},
+    onRotateResult90: () -> Unit = {},
+    onCropResultAspect: (Int, Int) -> Unit = { _, _ -> },
+    onQualityLevelChanged: (ProcessingQualityLevel) -> Unit = {},
+    onOutputResolutionChanged: (OutputResolutionOption) -> Unit = {},
+    onBlendStrengthChanged: (Float) -> Unit = {},
+    onEnhancementStrengthChanged: (Float) -> Unit = {},
+    onOcclusionProtectionChanged: (Boolean) -> Unit = {},
+    onPortraitBlurStrengthChanged: (Float) -> Unit = {},
+    onFaceOffsetXChanged: (Float) -> Unit = {},
+    onFaceOffsetYChanged: (Float) -> Unit = {},
+    onFaceScaleChanged: (Float) -> Unit = {},
+    onResetAdjustments: () -> Unit = {},
     onToggleCompareOriginal: (Boolean) -> Unit,
     onOpenModelsTab: () -> Unit,
     onSkinToneModeChanged: (SkinToneSourceMode) -> Unit = {},
@@ -184,119 +210,117 @@ fun StudioTab(
                 onToggleMultiFace = onToggleReplaceAllFaces
             )
 
-            // Mode 2 Specific Controls: [ Detect Head ] and [ Preview ]
-            if (isHeadMode) {
-                Row(
-                    modifier = Modifier.fillMaxWidth(),
-                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+            // [ Detect ] and [ Preview ] Controls (Available in BOTH Mode 1 & Mode 2)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(12.dp)
+            ) {
+                OutlinedButton(
+                    onClick = onDetectHead,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("detect_head_button"),
+                    shape = RoundedCornerShape(12.dp)
                 ) {
-                    OutlinedButton(
-                        onClick = onDetectHead,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("detect_head_button"),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Radar,
-                            contentDescription = stringResource(R.string.btn_detect_head),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(stringResource(R.string.btn_detect_head))
-                    }
-
-                    OutlinedButton(
-                        onClick = onPreviewHead,
-                        enabled = !uiState.isGeneratingHeadPreview,
-                        modifier = Modifier
-                            .weight(1f)
-                            .height(48.dp)
-                            .testTag("preview_head_button"),
-                        shape = RoundedCornerShape(12.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Preview,
-                            contentDescription = stringResource(R.string.btn_preview_head),
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            if (uiState.isGeneratingHeadPreview) {
-                                "Segmenting..."
-                            } else {
-                                stringResource(R.string.btn_preview_head)
-                            }
-                        )
-                    }
+                    Icon(
+                        imageVector = Icons.Default.Radar,
+                        contentDescription = stringResource(R.string.btn_detect_head),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(if (isHeadMode) stringResource(R.string.btn_detect_head) else "Detect Faces")
                 }
 
-                // Live Head / Hair / Neck Segmentation & Cranial Alignment Preview
-                uiState.headPreviewState?.let { preview ->
-                    Card(
-                        modifier = Modifier.fillMaxWidth(),
-                        shape = RoundedCornerShape(16.dp),
-                        colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surface
-                        )
+                OutlinedButton(
+                    onClick = onPreviewHead,
+                    enabled = !uiState.isGeneratingHeadPreview,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(48.dp)
+                        .testTag("preview_head_button"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Preview,
+                        contentDescription = stringResource(R.string.btn_preview_head),
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        if (uiState.isGeneratingHeadPreview) {
+                            "Segmenting..."
+                        } else {
+                            "Preview Alignment"
+                        }
+                    )
+                }
+            }
+
+            // Live Head / Hair / Neck Segmentation & Cranial Alignment Preview
+            uiState.headPreviewState?.let { preview ->
+                Card(
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(16.dp),
+                    colors = CardDefaults.cardColors(
+                        containerColor = MaterialTheme.colorScheme.surface
+                    )
+                ) {
+                    Column(
+                        modifier = Modifier.padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
-                        Column(
-                            modifier = Modifier.padding(14.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        Text(
+                            text = "Head / Hair / Neck Segmentation & Pose Preview",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = ElectricCyan
+                        )
+                        Text(
+                            text = "Parser: ${preview.segmentationLabel}",
+                            style = MaterialTheme.typography.labelMedium,
+                            color = NeonEmerald
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.SpaceEvenly
                         ) {
-                            Text(
-                                text = "Head / Hair / Neck Segmentation & Pose Preview",
-                                style = MaterialTheme.typography.titleMedium,
-                                color = ElectricCyan
-                            )
-                            Text(
-                                text = "Parser: ${preview.segmentationLabel}",
-                                style = MaterialTheme.typography.labelMedium,
-                                color = NeonEmerald
-                            )
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceEvenly
-                            ) {
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Image(
-                                        bitmap = preview.segmentedSourceHeadBitmap.asImageBitmap(),
-                                        contentDescription = "Segmented Source Head & Hair Mask",
-                                        modifier = Modifier
-                                            .size(128.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .border(
-                                                1.5.dp,
-                                                ElectricCyan,
-                                                RoundedCornerShape(12.dp)
-                                            )
-                                    )
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        text = "Source Matte (${"%.1f".format(preview.sourceRollDeg)}°)",
-                                        style = MaterialTheme.typography.labelMedium
-                                    )
-                                }
-                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                    Image(
-                                        bitmap = preview.alignedTargetHeadBitmap.asImageBitmap(),
-                                        contentDescription = "Aligned Target Head Region",
-                                        modifier = Modifier
-                                            .size(128.dp)
-                                            .clip(RoundedCornerShape(12.dp))
-                                            .border(
-                                                1.5.dp,
-                                                RoyalViolet,
-                                                RoundedCornerShape(12.dp)
-                                            )
-                                    )
-                                    Spacer(modifier = Modifier.height(4.dp))
-                                    Text(
-                                        text = "Target Pose (${"%.1f".format(preview.targetRollDeg)}°)",
-                                        style = MaterialTheme.typography.labelMedium
-                                    )
-                                }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Image(
+                                    bitmap = preview.segmentedSourceHeadBitmap.asImageBitmap(),
+                                    contentDescription = "Segmented Source Head & Hair Mask",
+                                    modifier = Modifier
+                                        .size(128.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .border(
+                                            1.5.dp,
+                                            ElectricCyan,
+                                            RoundedCornerShape(12.dp)
+                                        )
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Source Matte (${"%.1f".format(preview.sourceRollDeg)}°)",
+                                    style = MaterialTheme.typography.labelMedium
+                                )
+                            }
+                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                Image(
+                                    bitmap = preview.alignedTargetHeadBitmap.asImageBitmap(),
+                                    contentDescription = "Aligned Target Head Region",
+                                    modifier = Modifier
+                                        .size(128.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .border(
+                                            1.5.dp,
+                                            RoyalViolet,
+                                            RoundedCornerShape(12.dp)
+                                        )
+                                )
+                                Spacer(modifier = Modifier.height(4.dp))
+                                Text(
+                                    text = "Target Pose (${"%.1f".format(preview.targetRollDeg)}°)",
+                                    style = MaterialTheme.typography.labelMedium
+                                )
                             }
                         }
                     }
@@ -309,6 +333,21 @@ fun StudioTab(
                 faceReactionMode = uiState.faceReactionMode,
                 onSkinToneModeChanged = onSkinToneModeChanged,
                 onFaceReactionModeChanged = onFaceReactionModeChanged
+            )
+
+            // 2c. Quality Levels (FAST / BALANCED / HIGH QUALITY) + Fine-Tune Studio Controls
+            QualityAndFineTuneControlsCard(
+                uiState = uiState,
+                onQualityLevelChanged = onQualityLevelChanged,
+                onOutputResolutionChanged = onOutputResolutionChanged,
+                onBlendStrengthChanged = onBlendStrengthChanged,
+                onEnhancementStrengthChanged = onEnhancementStrengthChanged,
+                onOcclusionProtectionChanged = onOcclusionProtectionChanged,
+                onPortraitBlurStrengthChanged = onPortraitBlurStrengthChanged,
+                onFaceOffsetXChanged = onFaceOffsetXChanged,
+                onFaceOffsetYChanged = onFaceOffsetYChanged,
+                onFaceScaleChanged = onFaceScaleChanged,
+                onResetAdjustments = onResetAdjustments
             )
 
             // 3. Performance, Blending & Ethical Consent Card
@@ -439,24 +478,26 @@ fun StudioTab(
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant
                             )
-                            if (isHeadMode) {
-                                Text(
-                                    text = "Stages: Detection -> Alignment -> Head generation -> Segmentation -> Blending -> Enhancement",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = NeonEmerald
-                                )
-                            }
+                            Text(
+                                text = "Stages: Detection -> Alignment -> Segmentation -> AI Processing -> Blending -> Enhancement",
+                                style = MaterialTheme.typography.labelMedium,
+                                color = NeonEmerald
+                            )
                         }
                     }
                 }
             }
 
-            // 5. Result Preview + [ Before / After ] + [ Save Image ]
+            // 5. Result Preview + [ Before / After ] + [ Save HD ] / [ Save ] / [ Share ]
             uiState.swapResult?.let {
                 SwapResultCard(
                     uiState = uiState,
                     onToggleCompareOriginal = onToggleCompareOriginal,
-                    onSaveToGallery = onSaveToGallery
+                    onSaveToGallery = onSaveToGallery,
+                    onSaveHdToGallery = onSaveHdToGallery,
+                    onShareResult = onShareResult,
+                    onRotateResult90 = onRotateResult90,
+                    onCropResultAspect = onCropResultAspect
                 )
             }
 
@@ -1246,11 +1287,16 @@ private fun SafeguardsAndBlendingCard(
     }
 }
 
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun SwapResultCard(
     uiState: FaceSwapUiState,
     onToggleCompareOriginal: (Boolean) -> Unit,
-    onSaveToGallery: () -> Unit
+    onSaveToGallery: () -> Unit,
+    onSaveHdToGallery: () -> Unit = onSaveToGallery,
+    onShareResult: () -> Unit = {},
+    onRotateResult90: () -> Unit = {},
+    onCropResultAspect: (Int, Int) -> Unit = { _, _ -> }
 ) {
     val result = uiState.swapResult ?: return
     val displayBitmap = if (uiState.showOriginalInComparison && uiState.targetBitmap != null) {
@@ -1258,6 +1304,9 @@ private fun SwapResultCard(
     } else {
         result.outputBitmap
     }
+
+    var zoomScale by remember { mutableFloatStateOf(1.0f) }
+    var panOffset by remember { mutableStateOf(Offset.Zero) }
 
     Card(
         modifier = Modifier.fillMaxWidth(),
@@ -1276,15 +1325,15 @@ private fun SwapResultCard(
                 Column(modifier = Modifier.weight(1f)) {
                     Text(
                         text = if (uiState.showOriginalInComparison) {
-                            "Before (Original Target)"
+                            "BEFORE (Original Target)"
                         } else {
-                            "After (${uiState.studioMode.title} Result)"
+                            "AFTER (${uiState.studioMode.title} Result)"
                         },
                         style = MaterialTheme.typography.titleLarge,
                         color = ElectricCyan
                     )
                     Text(
-                        text = "Total Latency: ${result.totalMs} ms • ${result.swappedFacesCount} Replaced",
+                        text = "Latency: ${result.totalMs} ms • ${result.swappedFacesCount} Replaced • ${displayBitmap.width}×${displayBitmap.height}",
                         style = MaterialTheme.typography.labelMedium,
                         color = NeonEmerald
                     )
@@ -1300,20 +1349,185 @@ private fun SwapResultCard(
                         modifier = Modifier.size(18.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
-                    Text(stringResource(R.string.btn_before_after))
+                    Text("BEFORE | AFTER")
                 }
             }
 
-            Image(
-                bitmap = displayBitmap.asImageBitmap(),
-                contentDescription = "Output Preview",
+            // Interactive Before | After Split-Screen Comparison Slider
+            var splitPosition by remember { mutableFloatStateOf(1.0f) }
+            val splitComparisonPreview = remember(result.outputBitmap, uiState.targetBitmap, splitPosition, uiState.showOriginalInComparison) {
+                if (uiState.showOriginalInComparison && uiState.targetBitmap != null) {
+                    uiState.targetBitmap
+                } else if (splitPosition in 0.02f..0.98f && uiState.targetBitmap != null &&
+                    uiState.targetBitmap.width == result.outputBitmap.width &&
+                    uiState.targetBitmap.height == result.outputBitmap.height
+                ) {
+                    val w = result.outputBitmap.width
+                    val h = result.outputBitmap.height
+                    val splitX = (w * splitPosition).toInt().coerceIn(1, w - 1)
+                    val combined = result.outputBitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
+                    val origSlice = IntArray((w - splitX) * h)
+                    uiState.targetBitmap.getPixels(origSlice, 0, w - splitX, splitX, 0, w - splitX, h)
+                    combined.setPixels(origSlice, 0, w - splitX, splitX, 0, w - splitX, h)
+                    val canvas = android.graphics.Canvas(combined)
+                    val linePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                        color = android.graphics.Color.rgb(0, 229, 255)
+                        strokeWidth = (w / 240f).coerceAtLeast(3f)
+                    }
+                    canvas.drawLine(splitX.toFloat(), 0f, splitX.toFloat(), h.toFloat(), linePaint)
+                    combined
+                } else {
+                    result.outputBitmap
+                }
+            }
+
+            // Zoomable & Pannable Result Canvas
+            Box(
                 modifier = Modifier
                     .fillMaxWidth()
-                    .height(320.dp)
+                    .height(340.dp)
                     .clip(RoundedCornerShape(14.dp))
-                    .background(ObsidianBg),
-                contentScale = ContentScale.Fit
-            )
+                    .background(ObsidianBg)
+                    .pointerInput(Unit) {
+                        detectTransformGestures { _, pan, zoom, _ ->
+                            val newScale = (zoomScale * zoom).coerceIn(1.0f, 4.0f)
+                            zoomScale = newScale
+                            panOffset = if (newScale > 1.02f) {
+                                Offset(
+                                    x = (panOffset.x + pan.x).coerceIn(-320f, 320f),
+                                    y = (panOffset.y + pan.y).coerceIn(-320f, 320f)
+                                )
+                            } else {
+                                Offset.Zero
+                            }
+                        }
+                    },
+                contentAlignment = Alignment.Center
+            ) {
+                Image(
+                    bitmap = splitComparisonPreview.asImageBitmap(),
+                    contentDescription = "Zoomable Output Preview",
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .graphicsLayer(
+                            scaleX = zoomScale,
+                            scaleY = zoomScale,
+                            translationX = panOffset.x,
+                            translationY = panOffset.y
+                        ),
+                    contentScale = ContentScale.Fit
+                )
+
+                Surface(
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(8.dp),
+                    shape = RoundedCornerShape(8.dp),
+                    color = ObsidianBg.copy(alpha = 0.78f)
+                ) {
+                    Text(
+                        text = "Zoom: ${"%.1f".format(zoomScale)}x (Pinch or tap below)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ElectricCyan,
+                        modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
+                    )
+                }
+            }
+
+            // Interactive Before | After Split-Screen Wipe Slider
+            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "AFTER | BEFORE Split Slider (இடது: After • வலது: Before)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = NeonEmerald,
+                        fontWeight = FontWeight.Bold
+                    )
+                    Text(
+                        text = "${(splitPosition * 100).toInt()}% After",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ElectricCyan
+                    )
+                }
+                Slider(
+                    value = splitPosition,
+                    onValueChange = { splitPosition = it },
+                    valueRange = 0.0f..1.0f,
+                    modifier = Modifier.testTag("before_after_split_slider")
+                )
+            }
+
+            // Zoom, Rotate & Crop Interactive Toolbar
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                FilterChip(
+                    selected = zoomScale > 1.05f,
+                    onClick = {
+                        if (zoomScale < 1.9f) {
+                            zoomScale = 2.0f
+                        } else if (zoomScale < 2.9f) {
+                            zoomScale = 3.0f
+                        } else {
+                            zoomScale = 1.0f
+                            panOffset = Offset.Zero
+                        }
+                    },
+                    label = { Text("Zoom (${"%.0f".format(zoomScale)}x)") },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Default.ZoomIn,
+                            contentDescription = "Zoom Result",
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    modifier = Modifier.testTag("result_zoom_button")
+                )
+
+                FilterChip(
+                    selected = false,
+                    onClick = {
+                        zoomScale = 1.0f
+                        panOffset = Offset.Zero
+                        onRotateResult90()
+                    },
+                    label = { Text("Rotate 90°") },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Default.RotateRight,
+                            contentDescription = "Rotate 90 degrees",
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    modifier = Modifier.testTag("result_rotate_button")
+                )
+
+                FilterChip(
+                    selected = false,
+                    onClick = { onCropResultAspect(1, 1) },
+                    label = { Text("Crop 1:1") },
+                    leadingIcon = {
+                        Icon(
+                            imageVector = Icons.Default.Crop,
+                            contentDescription = "Crop 1:1 Square",
+                            modifier = Modifier.size(16.dp)
+                        )
+                    },
+                    modifier = Modifier.testTag("result_crop_1_1_button")
+                )
+
+                FilterChip(
+                    selected = false,
+                    onClick = { onCropResultAspect(4, 5) },
+                    label = { Text("Crop 4:5") },
+                    modifier = Modifier.testTag("result_crop_4_5_button")
+                )
+            }
 
             Row(
                 modifier = Modifier.fillMaxWidth(),
@@ -1349,28 +1563,74 @@ private fun SwapResultCard(
                 )
             }
 
-            Button(
-                onClick = onSaveToGallery,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(52.dp)
-                    .testTag("save_to_gallery_button"),
-                shape = RoundedCornerShape(12.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = NeonEmerald,
-                    contentColor = ObsidianBg
-                )
+            // [ Save HD ] | [ Save ] | [ Share ] Action Buttons
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
             ) {
-                Icon(
-                    imageVector = Icons.Default.SaveAlt,
-                    contentDescription = stringResource(R.string.btn_save_gallery)
-                )
-                Spacer(modifier = Modifier.width(8.dp))
-                Text(
-                    text = stringResource(R.string.btn_save_gallery),
-                    style = MaterialTheme.typography.titleMedium,
-                    fontWeight = FontWeight.Bold
-                )
+                Button(
+                    onClick = onSaveHdToGallery,
+                    modifier = Modifier
+                        .weight(1.15f)
+                        .height(50.dp)
+                        .testTag("save_hd_button"),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = NeonEmerald,
+                        contentColor = ObsidianBg
+                    )
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.SaveAlt,
+                        contentDescription = "Save HD",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(6.dp))
+                    Text(
+                        text = "Save HD",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onSaveToGallery,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(50.dp)
+                        .testTag("save_to_gallery_button"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Text(
+                        text = "Save",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                }
+
+                OutlinedButton(
+                    onClick = onShareResult,
+                    modifier = Modifier
+                        .weight(1f)
+                        .height(50.dp)
+                        .testTag("share_result_button"),
+                    shape = RoundedCornerShape(12.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Default.Share,
+                        contentDescription = "Share Result",
+                        modifier = Modifier.size(16.dp),
+                        tint = ElectricCyan
+                    )
+                    Spacer(modifier = Modifier.width(4.dp))
+                    Text(
+                        text = "Share",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                }
             }
         }
     }
@@ -1750,6 +2010,290 @@ private fun SkinToneAndReactionSelectorCard(
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                }
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun QualityAndFineTuneControlsCard(
+    uiState: FaceSwapUiState,
+    onQualityLevelChanged: (ProcessingQualityLevel) -> Unit,
+    onOutputResolutionChanged: (OutputResolutionOption) -> Unit,
+    onBlendStrengthChanged: (Float) -> Unit,
+    onEnhancementStrengthChanged: (Float) -> Unit,
+    onOcclusionProtectionChanged: (Boolean) -> Unit,
+    onPortraitBlurStrengthChanged: (Float) -> Unit,
+    onFaceOffsetXChanged: (Float) -> Unit,
+    onFaceOffsetYChanged: (Float) -> Unit,
+    onFaceScaleChanged: (Float) -> Unit,
+    onResetAdjustments: () -> Unit
+) {
+    var expandPositionControls by remember { mutableStateOf(false) }
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(16.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(14.dp)
+        ) {
+            // 1. Quality Level Selector (FAST / BALANCED / HIGH QUALITY) + RAM Telemetry
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "Quality Level & Auto-RAM Resolution",
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = ElectricCyan
+                    )
+                    Text(
+                        text = "RAM: ${"%.1f".format(uiState.deviceTotalRamGb)}GB (${uiState.deviceAvailRamMb}MB Free)",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = NeonEmerald,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    ProcessingQualityLevel.entries.forEach { level ->
+                        val selected = uiState.qualityLevel == level
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(42.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (selected) ElectricCyan else MaterialTheme.colorScheme.surfaceVariant
+                                )
+                                .clickable { onQualityLevelChanged(level) }
+                                .testTag("quality_level_${level.name.lowercase()}"),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = level.title,
+                                style = MaterialTheme.typography.labelMedium,
+                                fontWeight = FontWeight.Bold,
+                                color = if (selected) ObsidianBg else MaterialTheme.colorScheme.onSurface
+                            )
+                        }
+                    }
+                }
+
+                Text(
+                    text = uiState.qualityLevel.subtitle,
+                    style = MaterialTheme.typography.labelSmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+
+            // 2. Blend Strength, GFPGAN Enhancement & DSLR Portrait Bokeh Blur Sliders
+            Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "Blend Strength (Multi-Band Boundary Fusion)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "${(uiState.blendStrength * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ElectricCyan,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Slider(
+                    value = uiState.blendStrength,
+                    onValueChange = onBlendStrengthChanged,
+                    valueRange = 0.20f..1.0f,
+                    modifier = Modifier.testTag("blend_strength_slider")
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "512×512 HD Enhancement (GFPGAN / Pore Detail)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = "${(uiState.enhancementStrength * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = NeonEmerald,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Slider(
+                    value = uiState.enhancementStrength,
+                    onValueChange = onEnhancementStrengthChanged,
+                    valueRange = 0.0f..1.0f,
+                    modifier = Modifier.testTag("enhancement_strength_slider")
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text(
+                        text = "DSLR Portrait Background Blur (பின்னணி Blur)",
+                        style = MaterialTheme.typography.bodyMedium,
+                        fontWeight = FontWeight.SemiBold
+                    )
+                    Text(
+                        text = if (uiState.portraitBlurStrength <= 0.03f) "OFF (0%)" else "${(uiState.portraitBlurStrength * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = RoyalViolet,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+                Slider(
+                    value = uiState.portraitBlurStrength,
+                    onValueChange = onPortraitBlurStrengthChanged,
+                    valueRange = 0.0f..1.0f,
+                    modifier = Modifier.testTag("portrait_blur_slider")
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    verticalAlignment = Alignment.CenterVertically,
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Column(modifier = Modifier.weight(1f)) {
+                        Text(
+                            text = "Occlusion Protection (கண்ணாடி, முடி & ஆபரணப் பாதுகாப்பு)",
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = FontWeight.SemiBold
+                        )
+                        Text(
+                            text = "Uses segformer_B5_ce.onnx + luminance guard to protect glasses, hair bangs & earrings",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    Switch(
+                        checked = uiState.enableOcclusionProtection,
+                        onCheckedChange = onOcclusionProtectionChanged,
+                        modifier = Modifier.testTag("occlusion_protection_switch")
+                    )
+                }
+            }
+
+            // 3. Output Resolution Selector
+            Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                Text(
+                    text = "Output Export Resolution",
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    color = ElectricCyan
+                )
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    OutputResolutionOption.entries.forEach { resOpt ->
+                        FilterChip(
+                            selected = uiState.outputResolution == resOpt,
+                            onClick = { onOutputResolutionChanged(resOpt) },
+                            label = { Text(resOpt.title) },
+                            modifier = Modifier.testTag("output_res_${resOpt.name.lowercase()}")
+                        )
+                    }
+                }
+            }
+
+            // 4. Collapsible Face/Head Position & Scale Adjustment
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(10.dp))
+                    .background(ObsidianBg)
+                    .clickable { expandPositionControls = !expandPositionControls }
+                    .padding(horizontal = 12.dp, vertical = 10.dp)
+                    .testTag("toggle_position_adjustments_button"),
+                horizontalArrangement = Arrangement.SpaceBetween,
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Text(
+                    text = "Face / Head Position & Scale Adjustment (X: ${uiState.faceOffsetX.toInt()}px, Y: ${uiState.faceOffsetY.toInt()}px, ${"%.2f".format(uiState.faceScaleAdjust)}x)",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = ElectricCyan,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                Text(
+                    text = if (expandPositionControls) "▲" else "▼",
+                    style = MaterialTheme.typography.labelMedium,
+                    color = NeonEmerald
+                )
+            }
+
+            AnimatedVisibility(visible = expandPositionControls) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(ObsidianBg)
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Text(
+                            text = "Horizontal Shift (X): ${uiState.faceOffsetX.toInt()} px",
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                        OutlinedButton(
+                            onClick = onResetAdjustments,
+                            modifier = Modifier.height(32.dp)
+                        ) {
+                            Text("Reset All", style = MaterialTheme.typography.labelSmall)
+                        }
+                    }
+                    Slider(
+                        value = uiState.faceOffsetX,
+                        onValueChange = onFaceOffsetXChanged,
+                        valueRange = -24f..24f
+                    )
+
+                    Text(
+                        text = "Vertical Shift (Y): ${uiState.faceOffsetY.toInt()} px",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    Slider(
+                        value = uiState.faceOffsetY,
+                        onValueChange = onFaceOffsetYChanged,
+                        valueRange = -24f..24f
+                    )
+
+                    Text(
+                        text = "Face / Head Scale: ${"%.2f".format(uiState.faceScaleAdjust)}x",
+                        style = MaterialTheme.typography.labelMedium
+                    )
+                    Slider(
+                        value = uiState.faceScaleAdjust,
+                        onValueChange = onFaceScaleChanged,
+                        valueRange = 0.88f..1.12f
+                    )
                 }
             }
         }

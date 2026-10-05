@@ -829,4 +829,306 @@ object HeadSegmentationAndInpainting {
         bmp.setPixels(out, 0, size, 0, 0, size, size)
         return bmp
     }
+
+    /**
+     * Computes a 512x512 neural face-parsing occlusion gate using `segformer_B5_ce.onnx`
+     * (CelebAMask-HQ 19-class parser) on the aligned 512x512 target face crop.
+     *
+     * Protects target foreground occlusions so they are never overwritten by the swapped face:
+     *  - Class 3 (`eye_g` / eyeglasses / sunglasses) -> 0.0f (protected)
+     *  - Class 9 (`ear_r` / earrings / jewelry)      -> 0.0f (protected)
+     *  - Class 17 (`hair` bangs / locks over face)   -> 0.0f (protected)
+     *  - Class 18 (`hat` / headwear / cap)           -> 0.0f (protected)
+     *  - Class 0 (`background`) & Class 16 (`cloth`) -> 0.0f (protected)
+     *  - Classes 1, 2, 4..8, 10..13 (facial skin, nose, eyes, brows, lips, mouth) -> 1.0f (swappable)
+     *
+     * Returns `null` safely if `segformer_B5_ce.onnx` is not installed or incompatible, allowing
+     * `FaceBlender` to fall back seamlessly to its chromatic/luminance occlusion guard.
+     */
+    fun computeFaceOcclusionGate512(
+        ortEnv: OrtEnvironment?,
+        alignedTarget512: Bitmap,
+        segModelFile: File? = null,
+        preferHardwareAccel: Boolean = false,
+        preloadedSegformerSession: OrtSession? = null
+    ): FloatArray? {
+        if (ortEnv == null) return null
+        val targetSize = 512
+
+        fun parseWithSession(session: OrtSession): FloatArray? {
+            val modelSize = 512
+            val scaled512 = if (alignedTarget512.width == modelSize && alignedTarget512.height == modelSize) {
+                alignedTarget512
+            } else {
+                Bitmap.createScaledBitmap(alignedTarget512, modelSize, modelSize, true)
+            }
+            val hw = modelSize * modelSize
+            val pixels = IntArray(hw)
+            scaled512.getPixels(pixels, 0, modelSize, 0, 0, modelSize, modelSize)
+            if (scaled512 !== alignedTarget512) scaled512.recycle()
+
+            val floatBuf = FloatBuffer.allocate(3 * hw)
+            val meanR = 0.485f
+            val meanG = 0.456f
+            val meanB = 0.406f
+            val stdR = 0.229f
+            val stdG = 0.224f
+            val stdB = 0.225f
+
+            for (i in 0 until hw) {
+                val c = pixels[i]
+                val r = ((c ushr 16) and 0xFF) / 255.0f
+                val g = ((c ushr 8) and 0xFF) / 255.0f
+                val b = (c and 0xFF) / 255.0f
+                floatBuf.put(i, (r - meanR) / stdR)
+                floatBuf.put(hw + i, (g - meanG) / stdG)
+                floatBuf.put(2 * hw + i, (b - meanB) / stdB)
+            }
+            floatBuf.rewind()
+
+            val rawGate = FloatArray(targetSize * targetSize)
+            val inputName = session.inputNames.first()
+            val shape = longArrayOf(1L, 3L, modelSize.toLong(), modelSize.toLong())
+            OnnxTensor.createTensor(ortEnv, floatBuf, shape).use { inTensor ->
+                session.run(mapOf(inputName to inTensor)).use { results ->
+                    val outTensor = results[0] as OnnxTensor
+                    val outShape = outTensor.info.shape
+                    val outBuf = outTensor.floatBuffer
+                    if (outShape.size == 4 && outShape[1] >= 14L) {
+                        val numClasses = outShape[1].toInt()
+                        val outH = outShape[2].toInt()
+                        val outW = outShape[3].toInt()
+                        val planeSize = outH * outW
+                        val outFloats = FloatArray(numClasses * planeSize)
+                        outBuf.get(outFloats)
+
+                        for (y in 0 until targetSize) {
+                            val sy = (y * outH / targetSize).coerceIn(0, outH - 1)
+                            val row = y * targetSize
+                            for (x in 0 until targetSize) {
+                                val sx = (x * outW / targetSize).coerceIn(0, outW - 1)
+                                val spatialIdx = sy * outW + sx
+                                var bestClass = 0
+                                var bestLogit = -Float.MAX_VALUE
+                                for (cls in 0 until numClasses) {
+                                    val logit = outFloats[cls * planeSize + spatialIdx]
+                                    if (logit > bestLogit) {
+                                        bestLogit = logit
+                                        bestClass = cls
+                                    }
+                                }
+                                // CelebAMask-HQ classes:
+                                // 1=skin, 2=nose, 3=eye_g(glasses), 4=l_eye, 5=r_eye, 6=l_brow, 7=r_brow,
+                                // 8=l_ear, 9=ear_r(earring), 10=mouth, 11=u_lip, 12=l_lip, 13=hair(or neck in some mappings),
+                                // 14=neck, 15=neck_l, 16=cloth, 17=hair, 18=hat
+                                val isInnerFaceFeature = bestClass in listOf(1, 2, 4, 5, 6, 7, 10, 11, 12, 13)
+                                val isProtectedOcclusion = bestClass in listOf(0, 3, 9, 16, 17, 18)
+                                rawGate[row + x] = when {
+                                    isProtectedOcclusion -> 0.0f
+                                    isInnerFaceFeature -> 1.0f
+                                    else -> 0.65f
+                                }
+                            }
+                        }
+                    } else {
+                        return null
+                    }
+                }
+            }
+
+            // Smooth the 512x512 occlusion gate with a fast 5x5 box feather so glasses/hair edges blend organically
+            val smoothed = FloatArray(targetSize * targetSize)
+            for (y in 0 until targetSize) {
+                val y0 = (y - 2).coerceAtLeast(0)
+                val y1 = (y + 2).coerceAtMost(targetSize - 1)
+                val row = y * targetSize
+                for (x in 0 until targetSize) {
+                    val x0 = (x - 2).coerceAtLeast(0)
+                    val x1 = (x + 2).coerceAtMost(targetSize - 1)
+                    var sum = 0f
+                    var count = 0
+                    for (ny in y0..y1) {
+                        val nRow = ny * targetSize
+                        for (nx in x0..x1) {
+                            sum += rawGate[nRow + nx]
+                            count++
+                        }
+                    }
+                    smoothed[row + x] = (sum / count.coerceAtLeast(1)).coerceIn(0f, 1f)
+                }
+            }
+            return smoothed
+        }
+
+        if (preloadedSegformerSession != null) {
+            runCatching {
+                return parseWithSession(preloadedSegformerSession)
+            }
+        }
+        if (segModelFile != null && segModelFile.exists() && segModelFile.length() > 1024L) {
+            return runCatching {
+                OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
+                    ortEnv.createSession(segModelFile.absolutePath, opts).use { session ->
+                        parseWithSession(session)
+                    }
+                }
+            }.getOrNull()
+        }
+        return null
+    }
+
+    /**
+     * Applies DSLR Portrait Mode Background Bokeh Blur to [bitmap] in-place while keeping all
+     * detected subjects (faces, hair crowns, necks, and shoulders/torsos) razor-sharp.
+     */
+    fun applyPortraitModeBackgroundBokeh(
+        bitmap: Bitmap,
+        faces: List<DetectedFace>,
+        blurStrength: Float
+    ) {
+        val clampedStrength = blurStrength.coerceIn(0f, 1f)
+        if (clampedStrength <= 0.03f || faces.isEmpty()) return
+
+        val w = bitmap.width
+        val h = bitmap.height
+        val total = w * h
+        val origPixels = IntArray(total)
+        bitmap.getPixels(origPixels, 0, w, 0, 0, w, h)
+
+        // Compute blurred background via downscaled multi-pass separable box blur (approximating Gaussian bokeh)
+        val downScale = 4
+        val bw = (w / downScale).coerceAtLeast(16)
+        val bh = (h / downScale).coerceAtLeast(16)
+        val smallBmp = Bitmap.createScaledBitmap(bitmap, bw, bh, true)
+        val smallPx = IntArray(bw * bh)
+        smallBmp.getPixels(smallPx, 0, bw, 0, 0, bw, bh)
+        smallBmp.recycle()
+
+        val radius = (2 + (clampedStrength * 6f).toInt()).coerceIn(2, 8)
+        var passPx = smallPx
+        repeat(2) {
+            val horiz = IntArray(bw * bh)
+            for (y in 0 until bh) {
+                val row = y * bw
+                for (x in 0 until bw) {
+                    var rS = 0
+                    var gS = 0
+                    var bS = 0
+                    var cnt = 0
+                    val x0 = (x - radius).coerceAtLeast(0)
+                    val x1 = (x + radius).coerceAtMost(bw - 1)
+                    for (nx in x0..x1) {
+                        val c = passPx[row + nx]
+                        rS += (c ushr 16) and 0xFF
+                        gS += (c ushr 8) and 0xFF
+                        bS += c and 0xFF
+                        cnt++
+                    }
+                    horiz[row + x] = (0xFF shl 24) or ((rS / cnt) shl 16) or ((gS / cnt) shl 8) or (bS / cnt)
+                }
+            }
+            val vert = IntArray(bw * bh)
+            for (y in 0 until bh) {
+                val y0 = (y - radius).coerceAtLeast(0)
+                val y1 = (y + radius).coerceAtMost(bh - 1)
+                for (x in 0 until bw) {
+                    var rS = 0
+                    var gS = 0
+                    var bS = 0
+                    var cnt = 0
+                    for (ny in y0..y1) {
+                        val c = horiz[ny * bw + x]
+                        rS += (c ushr 16) and 0xFF
+                        gS += (c ushr 8) and 0xFF
+                        bS += c and 0xFF
+                        cnt++
+                    }
+                    vert[y * bw + x] = (0xFF shl 24) or ((rS / cnt) shl 16) or ((gS / cnt) shl 8) or (bS / cnt)
+                }
+            }
+            passPx = vert
+        }
+
+        val blurredSmall = Bitmap.createBitmap(bw, bh, Bitmap.Config.ARGB_8888)
+        blurredSmall.setPixels(passPx, 0, bw, 0, 0, bw, bh)
+        val blurredFull = Bitmap.createScaledBitmap(blurredSmall, w, h, true)
+        blurredSmall.recycle()
+        val blurPixels = IntArray(total)
+        blurredFull.getPixels(blurPixels, 0, w, 0, 0, w, h)
+        blurredFull.recycle()
+
+        // Build foreground subject protection silhouette (head + hair + neck + shoulders/torso) for each person
+        data class SubjectEllipses(
+            val headCx: Float,
+            val headCy: Float,
+            val headRx: Float,
+            val headRy: Float,
+            val bodyCx: Float,
+            val bodyCy: Float,
+            val bodyRx: Float,
+            val bodyRy: Float
+        )
+        val subjects = faces.map { face ->
+            val box = face.boundingBox
+            val fw = box.width().coerceAtLeast(24f)
+            val fh = box.height().coerceAtLeast(24f)
+            val cx = box.centerX()
+            val cy = box.centerY()
+            SubjectEllipses(
+                headCx = cx,
+                headCy = cy - fh * 0.08f,
+                headRx = fw * 0.95f,
+                headRy = fh * 1.10f,
+                bodyCx = cx,
+                bodyCy = box.bottom + fh * 1.15f,
+                bodyRx = fw * 1.85f,
+                bodyRy = fh * 1.65f
+            )
+        }
+
+        for (y in 0 until h) {
+            val row = y * w
+            val yf = y.toFloat()
+            for (x in 0 until w) {
+                val xf = x.toFloat()
+                var maxSubjectKeep = 0f
+                for (sub in subjects) {
+                    val hDx = (xf - sub.headCx) / sub.headRx
+                    val hDy = (yf - sub.headCy) / sub.headRy
+                    val hDist = sqrt(hDx * hDx + hDy * hDy)
+                    val headKeep = when {
+                        hDist <= 0.78f -> 1.0f
+                        hDist >= 1.25f -> 0f
+                        else -> (0.5f * (1.0 + cos(Math.PI * ((hDist - 0.78f) / 0.47f)))).toFloat()
+                    }
+
+                    val bDx = (xf - sub.bodyCx) / sub.bodyRx
+                    val bDy = (yf - sub.bodyCy) / sub.bodyRy
+                    val bDist = sqrt(bDx * bDx + bDy * bDy)
+                    val bodyKeep = when {
+                        bDist <= 0.75f -> 1.0f
+                        bDist >= 1.25f -> 0f
+                        else -> (0.5f * (1.0 + cos(Math.PI * ((bDist - 0.75f) / 0.50f)))).toFloat()
+                    }
+                    val keep = max(headKeep, bodyKeep)
+                    if (keep > maxSubjectKeep) maxSubjectKeep = keep
+                }
+
+                val bgBlurWeight = ((1.0f - maxSubjectKeep) * clampedStrength).coerceIn(0f, 1f)
+                if (bgBlurWeight > 0.01f) {
+                    val idx = row + x
+                    val oc = origPixels[idx]
+                    val bc = blurPixels[idx]
+                    val invW = 1.0f - bgBlurWeight
+                    val r = (((oc ushr 16) and 0xFF) * invW + ((bc ushr 16) and 0xFF) * bgBlurWeight).toInt().coerceIn(0, 255)
+                    val g = (((oc ushr 8) and 0xFF) * invW + ((bc ushr 8) and 0xFF) * bgBlurWeight).toInt().coerceIn(0, 255)
+                    val b = ((oc and 0xFF) * invW + (bc and 0xFF) * bgBlurWeight).toInt().coerceIn(0, 255)
+                    origPixels[idx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                }
+            }
+        }
+
+        bitmap.setPixels(origPixels, 0, w, 0, 0, w, h)
+    }
 }
+

@@ -43,8 +43,28 @@ enum class AppTab {
 }
 
 enum class StudioMode(val title: String, val badge: String) {
-    FACE_SWAP("Face Swap", "MODE 1 — InsightFace / InSwapper-128"),
-    HEAD_REPLACEMENT("Head Replacement", "MODE 2 — GHOST 2.0 Android Full Head/Hair/Neck")
+    FACE_SWAP("FACE SWAP", "MODE 1 — InsightFace / InSwapper-128"),
+    HEAD_REPLACEMENT("FULL HEAD REPLACEMENT", "MODE 2 — GHOST 2.0 Android Full Head/Hair/Neck")
+}
+
+enum class ProcessingQualityLevel(
+    val title: String,
+    val maxDecodeDimensionPx: Int,
+    val subtitle: String
+) {
+    FAST("FAST", 1280, "1280px Max • Fast Blend • Safe for <4GB RAM"),
+    BALANCED("BALANCED", 2048, "2048px Max • 512×512 HD Restore • 4–7.5GB RAM"),
+    HIGH_QUALITY("HIGH QUALITY", 3072, "3072px Max • Full Tiled HD & Hair Matting • 8GB+ RAM")
+}
+
+enum class OutputResolutionOption(
+    val title: String,
+    val maxExportDimensionPx: Int
+) {
+    ORIGINAL("Original Size", 0),
+    RES_1080P("Full HD (1920px)", 1920),
+    RES_2K_QHD("2K QHD (2560px)", 2560),
+    RES_4K_UHD("4K UHD (3840px)", 3840)
 }
 
 data class HeadAlignmentPreviewState(
@@ -58,6 +78,10 @@ data class HeadAlignmentPreviewState(
 data class FaceSwapUiState(
     val currentTab: AppTab = AppTab.STUDIO,
     val studioMode: StudioMode = StudioMode.FACE_SWAP,
+    val qualityLevel: ProcessingQualityLevel = ProcessingQualityLevel.BALANCED,
+    val outputResolution: OutputResolutionOption = OutputResolutionOption.ORIGINAL,
+    val deviceTotalRamGb: Float = 6.0f,
+    val deviceAvailRamMb: Long = 2048L,
     val modelInspections: List<OnnxModelInspection> = emptyList(),
     val memoryServiceState: OnnxMemoryServiceState = OnnxMemoryServiceState(),
     val isInspectingModels: Boolean = false,
@@ -76,6 +100,13 @@ data class FaceSwapUiState(
     val enableColorTransfer: Boolean = true,
     val skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
     val faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
+    val enableOcclusionProtection: Boolean = true,
+    val portraitBlurStrength: Float = 0.0f,
+    val blendStrength: Float = 1.0f,
+    val enhancementStrength: Float = 0.85f,
+    val faceOffsetX: Float = 0f,
+    val faceOffsetY: Float = 0f,
+    val faceScaleAdjust: Float = 1.0f,
     val enableProvenanceWatermark: Boolean = true,
     val allowTwoModelFallbackForTesting: Boolean = false,
     val preferHardwareAcceleration: Boolean = true,
@@ -123,8 +154,15 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         SwapAuditDatabase.getInstance(application).swapAuditDao()
     )
 
+    private val initialRamConfig = detectDeviceRamProfile(application)
+
     private val _uiState = MutableStateFlow(
-        FaceSwapUiState(lowMemoryMode = detectIsLowRamDevice(application))
+        FaceSwapUiState(
+            lowMemoryMode = initialRamConfig.first,
+            qualityLevel = initialRamConfig.second,
+            deviceTotalRamGb = initialRamConfig.third.first,
+            deviceAvailRamMb = initialRamConfig.third.second
+        )
     )
     val uiState: StateFlow<FaceSwapUiState> = _uiState.asStateFlow()
 
@@ -138,11 +176,31 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         refreshModelInspections()
     }
 
-    private fun detectIsLowRamDevice(context: Context): Boolean {
+    private fun detectDeviceRamProfile(
+        context: Context
+    ): Triple<Boolean, ProcessingQualityLevel, Pair<Float, Long>> {
         return runCatching {
             val am = context.getSystemService(Context.ACTIVITY_SERVICE) as? ActivityManager
-            am?.isLowRamDevice == true
-        }.getOrDefault(false)
+            val memInfo = ActivityManager.MemoryInfo()
+            am?.getMemoryInfo(memInfo)
+            val totalGb = if (memInfo.totalMem > 0L) {
+                memInfo.totalMem.toFloat() / (1024f * 1024f * 1024f)
+            } else {
+                6.0f
+            }
+            val availMb = if (memInfo.availMem > 0L) {
+                memInfo.availMem / (1024L * 1024L)
+            } else {
+                2048L
+            }
+            val isLow = (am?.isLowRamDevice == true) || totalGb < 4.0f || availMb < 750L
+            val autoQuality = when {
+                isLow -> ProcessingQualityLevel.FAST
+                totalGb >= 7.5f && availMb >= 1800L -> ProcessingQualityLevel.HIGH_QUALITY
+                else -> ProcessingQualityLevel.BALANCED
+            }
+            Triple(isLow, autoQuality, totalGb to availMb)
+        }.getOrDefault(Triple(false, ProcessingQualityLevel.BALANCED, 6.0f to 2048L))
     }
 
     fun selectTab(tab: AppTab) {
@@ -181,6 +239,61 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
         _uiState.update { it.copy(faceReactionMode = mode) }
     }
 
+    fun setQualityLevel(level: ProcessingQualityLevel) {
+        _uiState.update {
+            it.copy(
+                qualityLevel = level,
+                lowMemoryMode = (level == ProcessingQualityLevel.FAST),
+                statusBannerMessage = "Quality set to ${level.title} (Max ${level.maxDecodeDimensionPx}px)"
+            )
+        }
+    }
+
+    fun setOutputResolution(option: OutputResolutionOption) {
+        _uiState.update { it.copy(outputResolution = option) }
+    }
+
+    fun setBlendStrength(strength: Float) {
+        _uiState.update { it.copy(blendStrength = strength.coerceIn(0.20f, 1.0f)) }
+    }
+
+    fun setEnhancementStrength(strength: Float) {
+        _uiState.update { it.copy(enhancementStrength = strength.coerceIn(0f, 1.0f)) }
+    }
+
+    fun setEnableOcclusionProtection(enabled: Boolean) {
+        _uiState.update { it.copy(enableOcclusionProtection = enabled) }
+    }
+
+    fun setPortraitBlurStrength(strength: Float) {
+        _uiState.update { it.copy(portraitBlurStrength = strength.coerceIn(0f, 1.0f)) }
+    }
+
+    fun setFaceOffsetX(offsetX: Float) {
+        _uiState.update { it.copy(faceOffsetX = offsetX.coerceIn(-32f, 32f)) }
+    }
+
+    fun setFaceOffsetY(offsetY: Float) {
+        _uiState.update { it.copy(faceOffsetY = offsetY.coerceIn(-32f, 32f)) }
+    }
+
+    fun setFaceScaleAdjust(scale: Float) {
+        _uiState.update { it.copy(faceScaleAdjust = scale.coerceIn(0.85f, 1.15f)) }
+    }
+
+    fun resetPositionAdjustments() {
+        _uiState.update {
+            it.copy(
+                faceOffsetX = 0f,
+                faceOffsetY = 0f,
+                faceScaleAdjust = 1.0f,
+                blendStrength = 1.0f,
+                enhancementStrength = 0.85f,
+                portraitBlurStrength = 0.0f
+            )
+        }
+    }
+
     fun setEnableProvenanceWatermark(enabled: Boolean) {
         _uiState.update { it.copy(enableProvenanceWatermark = enabled) }
     }
@@ -194,7 +307,12 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun setLowMemoryMode(enabled: Boolean) {
-        _uiState.update { it.copy(lowMemoryMode = enabled) }
+        _uiState.update {
+            it.copy(
+                lowMemoryMode = enabled,
+                qualityLevel = if (enabled) ProcessingQualityLevel.FAST else it.qualityLevel
+            )
+        }
     }
 
     fun setReplaceAllTargetFaces(replaceAll: Boolean) {
@@ -426,6 +544,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     fun onSourceImageSelected(uri: Uri) {
         viewModelScope.launch {
+            val maxDim = _uiState.value.qualityLevel.maxDecodeDimensionPx
             _uiState.update {
                 it.copy(
                     isDetectingSource = true,
@@ -435,7 +554,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                 )
             }
             val decoded = withContext(Dispatchers.IO) {
-                ImageGalleryHelper.decodeUriToBitmap(getApplication(), uri)
+                ImageGalleryHelper.decodeUriToBitmap(getApplication(), uri, maxDim)
             }
             decoded.fold(
                 onSuccess = { bitmap ->
@@ -452,7 +571,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     _uiState.update {
                         it.copy(
                             isDetectingSource = false,
-                            errorBannerMessage = "Could not load source photo: ${err.message}"
+                            errorBannerMessage = "Unsupported or unreadable Source image: ${err.message}"
                         )
                     }
                 }
@@ -462,6 +581,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     fun onTargetImageSelected(uri: Uri) {
         viewModelScope.launch {
+            val maxDim = _uiState.value.qualityLevel.maxDecodeDimensionPx
             _uiState.update {
                 it.copy(
                     isDetectingTarget = true,
@@ -471,7 +591,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                 )
             }
             val decoded = withContext(Dispatchers.IO) {
-                ImageGalleryHelper.decodeUriToBitmap(getApplication(), uri)
+                ImageGalleryHelper.decodeUriToBitmap(getApplication(), uri, maxDim)
             }
             decoded.fold(
                 onSuccess = { bitmap ->
@@ -488,7 +608,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     _uiState.update {
                         it.copy(
                             isDetectingTarget = false,
-                            errorBannerMessage = "Could not load target photo: ${err.message}"
+                            errorBannerMessage = "Unsupported or unreadable Target image: ${err.message}"
                         )
                     }
                 }
@@ -634,12 +754,38 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
             detResult.fold(
                 onSuccess = { faces ->
-                    val roleLabel = if (isSource) "source" else "target"
+                    val roleLabel = if (isSource) "Source" else "Target"
+                    val minSide = kotlin.math.min(bitmap.width, bitmap.height)
+                    val lowResMsg = if (isSource && minSide < 180) {
+                        "Low-resolution Source photo (${bitmap.width}×${bitmap.height}). Higher resolution portrait recommended for sharper identity."
+                    } else if (!isSource && minSide < 240) {
+                        "Low-resolution Target photo (${bitmap.width}×${bitmap.height}). Output sharpness may be limited."
+                    } else null
+
+                    val poseOrOcclusionWarning = if (faces.isNotEmpty()) {
+                        val primary = faces.first()
+                        val pose = HeadSegmentationAndInpainting.analyzeHeadPoseAndBounds(
+                            primary,
+                            bitmap.width,
+                            bitmap.height
+                        )
+                        when {
+                            kotlin.math.abs(pose.rollDegrees) > 38f || kotlin.math.abs(pose.yawRatio) > 0.62f ->
+                                "Extreme head angle detected in $roleLabel photo (roll ${"%.0f".format(pose.rollDegrees)}°). Alignment adjusted automatically."
+                            primary.score < 0.58f ->
+                                "Face in $roleLabel photo appears partially hidden or low-contrast (confidence ${"%.0f".format(primary.score * 100)}%)."
+                            faces.size > 1 ->
+                                "Detected ${faces.size} faces in $roleLabel photo (Face 1..Face ${faces.size}). Tap a face card below to choose who to swap."
+                            else -> null
+                        }
+                    } else null
+
                     val warning = if (faces.isEmpty()) {
-                        "No clear face/head detected in the $roleLabel photo. Please select a well-lit portrait."
-                    } else {
-                        null
-                    }
+                        "No face detected in the $roleLabel photo. Please select a clearer, well-lit portrait."
+                    } else null
+
+                    val infoMsg = lowResMsg ?: poseOrOcclusionWarning
+
                     _uiState.update { state ->
                         if (isSource) {
                             state.copy(
@@ -647,7 +793,8 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                                 selectedSourceFaceIndex = 0,
                                 isDetectingSource = false,
                                 memoryServiceState = modelService.getMemoryState(),
-                                errorBannerMessage = warning
+                                errorBannerMessage = warning,
+                                statusBannerMessage = infoMsg ?: state.statusBannerMessage
                             )
                         } else {
                             state.copy(
@@ -656,7 +803,8 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                                 replaceAllTargetFaces = false,
                                 isDetectingTarget = false,
                                 memoryServiceState = modelService.getMemoryState(),
-                                errorBannerMessage = warning
+                                errorBannerMessage = warning,
+                                statusBannerMessage = infoMsg ?: state.statusBannerMessage
                             )
                         }
                     }
@@ -782,6 +930,13 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                             preferHardwareAccel = state.preferHardwareAcceleration,
                             skinToneMode = state.skinToneMode,
                             faceReactionMode = state.faceReactionMode,
+                            enableOcclusionProtection = state.enableOcclusionProtection,
+                            portraitBlurStrength = state.portraitBlurStrength,
+                            blendStrength = state.blendStrength,
+                            enhancementStrength = state.enhancementStrength,
+                            offsetX = state.faceOffsetX,
+                            offsetY = state.faceOffsetY,
+                            scaleAdjust = state.faceScaleAdjust,
                             onProgress = { progress ->
                                 _uiState.update { s -> s.copy(swapProgress = progress) }
                             }
@@ -795,10 +950,16 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                             enableColorTransfer = state.enableColorTransfer,
                             enableProvenanceWatermark = state.enableProvenanceWatermark,
                             allowTwoModelFallback = state.allowTwoModelFallbackForTesting,
-                            lowMemoryMode = state.lowMemoryMode,
+                            lowMemoryMode = state.lowMemoryMode || (state.qualityLevel == ProcessingQualityLevel.FAST),
                             preferHardwareAccel = state.preferHardwareAcceleration,
                             skinToneMode = state.skinToneMode,
                             faceReactionMode = state.faceReactionMode,
+                            portraitBlurStrength = state.portraitBlurStrength,
+                            blendStrength = state.blendStrength,
+                            enhancementStrength = state.enhancementStrength,
+                            offsetX = state.faceOffsetX,
+                            offsetY = state.faceOffsetY,
+                            scaleAdjust = state.faceScaleAdjust,
                             onProgress = { progress ->
                                 _uiState.update { s -> s.copy(swapProgress = progress) }
                             }
@@ -811,7 +972,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                         sourceResolution = "${srcBitmap.width}x${srcBitmap.height}",
                         targetResolution = "${tgtBitmap.width}x${tgtBitmap.height}",
                         swappedFacesCount = execResult.swappedFacesCount,
-                        pipelineSummary = "[${state.studioMode.title}] ${execResult.pipelineSummary}",
+                        pipelineSummary = "[${state.studioMode.title} • ${state.qualityLevel.title}] ${execResult.pipelineSummary}",
                         detectionMs = execResult.detectionMs,
                         embeddingMs = execResult.embeddingMs,
                         inswapperMs = execResult.inswapperMs,
@@ -840,8 +1001,9 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                         isSwapping = false,
                         swapProgress = null,
                         lowMemoryMode = true,
+                        qualityLevel = ProcessingQualityLevel.FAST,
                         memoryServiceState = modelService.getMemoryState(),
-                        errorBannerMessage = "Device ran low on memory. Enabled Low-Memory Tiled Mode automatically — please try again."
+                        errorBannerMessage = "Insufficient RAM detected. Switched automatically to FAST / Low-Memory Tiled Mode — please tap Process again."
                     )
                 }
             } catch (t: Throwable) {
@@ -849,19 +1011,26 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     it.copy(
                         isSwapping = false,
                         swapProgress = null,
-                        errorBannerMessage = t.message ?: "Execution failed: ${t.javaClass.simpleName}"
+                        errorBannerMessage = t.message ?: "Processing failure: ${t.javaClass.simpleName}"
                     )
                 }
             }
         }
     }
 
-    fun saveResultToGallery() {
-        val result = _uiState.value.swapResult ?: return
-        val logId = _uiState.value.lastAuditLogId
+    fun saveResultToGallery(isHd: Boolean = true) {
+        val state = _uiState.value
+        val result = state.swapResult ?: return
+        val logId = state.lastAuditLogId
+        val targetDim = if (isHd) state.outputResolution.maxExportDimensionPx else 0
         viewModelScope.launch {
             val saved = withContext(Dispatchers.IO) {
-                ImageGalleryHelper.saveBitmapToGallery(getApplication(), result.outputBitmap)
+                ImageGalleryHelper.saveBitmapToGallery(
+                    context = getApplication(),
+                    bitmap = result.outputBitmap,
+                    isHd = isHd,
+                    targetMaxDimension = targetDim
+                )
             }
             saved.fold(
                 onSuccess = { path ->
@@ -870,7 +1039,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     }
                     _uiState.update {
                         it.copy(
-                            statusBannerMessage = "Saved to Android Gallery: $path",
+                            statusBannerMessage = "Saved ${if (isHd) "HD PNG" else "Standard JPG"} to Gallery: $path",
                             errorBannerMessage = null
                         )
                     }
@@ -880,6 +1049,49 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                         it.copy(errorBannerMessage = "Could not save to Gallery: ${err.message}")
                     }
                 }
+            )
+        }
+    }
+
+    fun shareResultImage() {
+        val result = _uiState.value.swapResult ?: return
+        viewModelScope.launch {
+            val shared = withContext(Dispatchers.IO) {
+                ImageGalleryHelper.shareBitmap(getApplication(), result.outputBitmap)
+            }
+            shared.fold(
+                onSuccess = { msg ->
+                    _uiState.update {
+                        it.copy(statusBannerMessage = msg, errorBannerMessage = null)
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(errorBannerMessage = "Share failed: ${err.message}")
+                    }
+                }
+            )
+        }
+    }
+
+    fun rotateResultBitmap90() {
+        val currentResult = _uiState.value.swapResult ?: return
+        val rotated = ImageGalleryHelper.rotateBitmap90(currentResult.outputBitmap)
+        _uiState.update {
+            it.copy(
+                swapResult = currentResult.copy(outputBitmap = rotated),
+                statusBannerMessage = "Rotated output image 90° (${rotated.width}×${rotated.height})."
+            )
+        }
+    }
+
+    fun cropResultBitmapAspect(aspectW: Int, aspectH: Int) {
+        val currentResult = _uiState.value.swapResult ?: return
+        val cropped = ImageGalleryHelper.cropBitmapToRatio(currentResult.outputBitmap, aspectW, aspectH)
+        _uiState.update {
+            it.copy(
+                swapResult = currentResult.copy(outputBitmap = cropped),
+                statusBannerMessage = "Cropped output image to $aspectW:$aspectH (${cropped.width}×${cropped.height})."
             )
         }
     }

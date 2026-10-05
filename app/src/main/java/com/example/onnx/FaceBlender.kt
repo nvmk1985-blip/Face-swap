@@ -997,11 +997,31 @@ object FaceBlender {
         skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
         faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
         enableColorTransfer: Boolean = true,
-        preloadedGfpganSession: OrtSession? = null
-    ) {
+        enableOcclusionProtection: Boolean = true,
+        blendStrength: Float = 1.0f,
+        enhancementStrength: Float = 0.85f,
+        offsetX: Float = 0f,
+        offsetY: Float = 0f,
+        scaleAdjust: Float = 1.0f,
+        preferHardwareAccel: Boolean = false,
+        segformerFile: File? = null,
+        preloadedGfpganSession: OrtSession? = null,
+        preloadedSegformerSession: OrtSession? = null
+    ): Bitmap {
         val m512 = FloatArray(6) { i -> forwardMatrix128[i] * 4.0f }
         val alignedTarget512 = FaceAlignment.warpAffineCrop(targetBitmap, m512, HD_SIZE)
         val geom512 = computeWarpedGeometry(forwardMatrix128, targetLandmarks5, scale = 4.0f)
+
+        // Optional Neural Occlusion Gate via segformer_B5_ce.onnx (protects eyeglasses, hair bangs, hats & earrings)
+        val neuralOcclusionGate512 = if (enableOcclusionProtection) {
+            HeadSegmentationAndInpainting.computeFaceOcclusionGate512(
+                ortEnv = ortEnv,
+                alignedTarget512 = alignedTarget512,
+                segModelFile = segformerFile,
+                preferHardwareAccel = preferHardwareAccel,
+                preloadedSegformerSession = preloadedSegformerSession
+            )
+        } else null
 
         // Prepare 512x512 aligned Source crop if needed for Source Skin Tone or Source Reaction (Smile/Teeth/Tongue)
         val mSrc128 = if (sourceBitmap != null && sourceLandmarks5 != null && sourceLandmarks5.size >= 5) {
@@ -1015,22 +1035,43 @@ object FaceBlender {
             computeWarpedGeometry(mSrc128, sourceLandmarks5, scale = 4.0f)
         } else null
 
-        val gfp512 = runOptionalGfpganEnhancement512(
-            ortEnv = ortEnv,
-            gfpganFile = gfpganFile,
-            crop128Or512 = colorCorrected128,
-            preloadedGfpganSession = preloadedGfpganSession
-        )
-        val upscaled512 = gfp512 ?: Bitmap.createScaledBitmap(colorCorrected128, HD_SIZE, HD_SIZE, true)
+        val clampedEnhance = enhancementStrength.coerceIn(0f, 1f)
+        val gfp512 = if (clampedEnhance > 0.05f) {
+            runOptionalGfpganEnhancement512(
+                ortEnv = ortEnv,
+                gfpganFile = gfpganFile,
+                crop128Or512 = colorCorrected128,
+                preferHardwareAccel = preferHardwareAccel,
+                preloadedGfpganSession = preloadedGfpganSession
+            )
+        } else null
+        val baseUpscaled512 = Bitmap.createScaledBitmap(colorCorrected128, HD_SIZE, HD_SIZE, true)
 
         val total512 = HD_SIZE * HD_SIZE
         val swapPx512 = IntArray(total512)
         val tgtPx512 = IntArray(total512)
         val srcPx512 = if (alignedSource512 != null) IntArray(total512) else null
-        upscaled512.getPixels(swapPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
+
+        baseUpscaled512.getPixels(swapPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
+        baseUpscaled512.recycle()
+
+        if (gfp512 != null) {
+            val gfpPx = IntArray(total512)
+            gfp512.getPixels(gfpPx, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
+            gfp512.recycle()
+            val invEnh = 1.0f - clampedEnhance
+            for (i in 0 until total512) {
+                val bc = swapPx512[i]
+                val gc = gfpPx[i]
+                val r = (((gc ushr 16) and 0xFF) * clampedEnhance + ((bc ushr 16) and 0xFF) * invEnh).toInt().coerceIn(0, 255)
+                val g = (((gc ushr 8) and 0xFF) * clampedEnhance + ((bc ushr 8) and 0xFF) * invEnh).toInt().coerceIn(0, 255)
+                val b = ((gc and 0xFF) * clampedEnhance + (bc and 0xFF) * invEnh).toInt().coerceIn(0, 255)
+                swapPx512[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+            }
+        }
+
         alignedTarget512.getPixels(tgtPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
         alignedSource512?.getPixels(srcPx512!!, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
-        upscaled512.recycle()
         alignedTarget512.recycle()
         alignedSource512?.recycle()
 
@@ -1070,7 +1111,8 @@ object FaceBlender {
 
         // 1. Transfer natural 512x512 DSLR skin pore micro-texture & studio lighting sheen
         //    (strictly gated so hair strands or dark lines on target are never transferred as texture)
-        val poreScale = if (skinToneMode == SkinToneSourceMode.SOURCE_IDENTITY) 0.35f else 0.55f
+        val poreScale = (if (skinToneMode == SkinToneSourceMode.SOURCE_IDENTITY) 0.35f else 0.55f) *
+            (0.4f + 0.6f * clampedEnhance)
         for (y in 16 until HD_SIZE - 16) {
             val row = y * HD_SIZE
             for (x in 16 until HD_SIZE - 16) {
@@ -1123,7 +1165,21 @@ object FaceBlender {
         )
 
         // 3. Build tight 512x512 Biometric Landmark-Fitted Cosine Feather Mask with Foreground Occlusion Guard
-        val mask512 = createBiometricFaceMask512(geom512, tgtPx512, swapPx512, skinToneMode)
+        val mask512 = createBiometricFaceMask512(
+            geom512 = geom512,
+            tgtPx512 = tgtPx512,
+            swapPx512 = swapPx512,
+            skinToneMode = skinToneMode,
+            enableOcclusionProtection = enableOcclusionProtection,
+            neuralOcclusionGate512 = neuralOcclusionGate512
+        )
+
+        // 3b. Multi-Band (Low-Frequency Illumination + High-Frequency Facial Detail) Boundary & Jawline Shadow Fusion
+        applyMultiBandBoundaryAndJawlineFusion512(
+            swapPx512 = swapPx512,
+            tgtPx512 = tgtPx512,
+            mask512 = mask512
+        )
 
         // 4. Inverse Affine Warp of 512x512 HD Face directly onto full-resolution targetPixels
         val inv = FaceAlignment.invertAffine2x3(m512)
@@ -1146,10 +1202,10 @@ object FaceBlender {
             maxY = max(maxY, ty)
         }
 
-        minX = (minX - 2).coerceIn(0, targetWidth - 1)
-        maxX = (maxX + 2).coerceIn(0, targetWidth - 1)
-        minY = (minY - 2).coerceIn(0, targetHeight - 1)
-        maxY = (maxY + 2).coerceIn(0, targetHeight - 1)
+        minX = (minX - 16).coerceIn(0, targetWidth - 1)
+        maxX = (maxX + 16).coerceIn(0, targetWidth - 1)
+        minY = (minY - 16).coerceIn(0, targetHeight - 1)
+        maxY = (maxY + 16).coerceIn(0, targetHeight - 1)
 
         val m00 = m512[0]
         val m01 = m512[1]
@@ -1158,15 +1214,22 @@ object FaceBlender {
         val m11 = m512[4]
         val m12 = m512[5]
 
+        val clampedBlend = blendStrength.coerceIn(0.20f, 1.0f)
+        val safeScale = scaleAdjust.coerceIn(0.85f, 1.15f)
+        val shiftU = offsetX.coerceIn(-36f, 36f)
+        val shiftV = offsetY.coerceIn(-36f, 36f)
+
         for (y in minY..maxY) {
             val rowOffset = y * targetWidth
             val baseU = m01 * y + m02
             val baseV = m11 * y + m12
             for (x in minX..maxX) {
-                val u = m00 * x + baseU
-                val v = m10 * x + baseV
+                val rawU = m00 * x + baseU
+                val rawV = m10 * x + baseV
+                val u = (rawU - 256f - shiftU) / safeScale + 256f
+                val v = (rawV - 256f - shiftV) / safeScale + 256f
                 if (u >= 2f && u < HD_SIZE - 3f && v >= 2f && v < HD_SIZE - 3f) {
-                    val alpha = sampleMaskBilinearGeneric(mask512, HD_SIZE, u, v)
+                    val alpha = sampleMaskBilinearGeneric(mask512, HD_SIZE, u, v) * clampedBlend
                     if (alpha > 0.003f) {
                         val swapColor = FaceAlignment.sampleBilinearClamped(
                             swapPx512,
@@ -1196,6 +1259,63 @@ object FaceBlender {
                 }
             }
         }
+
+        val restoredHd512 = Bitmap.createBitmap(HD_SIZE, HD_SIZE, Bitmap.Config.ARGB_8888)
+        restoredHd512.setPixels(swapPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
+        return restoredHd512
+    }
+
+    /**
+     * 2-Band (Low-Frequency Illumination + High-Frequency Detail) Multi-Band & Jawline Shadow Fusion
+     * in 512x512 HD space: smoothly aligns the outer cheek, forehead, and chin/neck jawline shadow
+     * envelope of `swapPx512` to `tgtPx512` across the transition ring (`0.05 < mask512 < 0.92`)
+     * while preserving 100% of the swapped face's crisp high-frequency detail.
+     */
+    private fun applyMultiBandBoundaryAndJawlineFusion512(
+        swapPx512: IntArray,
+        tgtPx512: IntArray,
+        mask512: FloatArray
+    ) {
+        val step = 12
+        for (y in step until HD_SIZE - step) {
+            val row = y * HD_SIZE
+            // Stronger low-frequency shadow alignment along the lower chin/neck jawline (y > 340)
+            val jawlineBoost = if (y > 340) 0.35f else 0.22f
+            for (x in step until HD_SIZE - step) {
+                val idx = row + x
+                val m = mask512[idx]
+                if (m <= 0.04f || m >= 0.94f) continue
+
+                // Transition weight peaks around the boundary feather zone (m ~ 0.45..0.85)
+                val boundaryWeight = ((1.0f - m) * jawlineBoost).coerceIn(0f, 0.42f)
+                val sLow = compute5PointLowPassRGB512(swapPx512, x, y, step)
+                val tLow = compute5PointLowPassRGB512(tgtPx512, x, y, step)
+
+                val sc = swapPx512[idx]
+                val sr = (sc ushr 16) and 0xFF
+                val sg = (sc ushr 8) and 0xFF
+                val sb = sc and 0xFF
+
+                val nr = (sr + (tLow[0] - sLow[0]) * boundaryWeight).toInt().coerceIn(0, 255)
+                val ng = (sg + (tLow[1] - sLow[1]) * boundaryWeight).toInt().coerceIn(0, 255)
+                val nb = (sb + (tLow[2] - sLow[2]) * boundaryWeight).toInt().coerceIn(0, 255)
+                swapPx512[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
+            }
+        }
+    }
+
+    private fun compute5PointLowPassRGB512(px: IntArray, x: Int, y: Int, d: Int): FloatArray {
+        val c0 = px[y * HD_SIZE + x]
+        val cN = px[(y - d) * HD_SIZE + x]
+        val cS = px[(y + d) * HD_SIZE + x]
+        val cW = px[y * HD_SIZE + (x - d)]
+        val cE = px[y * HD_SIZE + (x + d)]
+        val r = (((c0 ushr 16) and 0xFF) + ((cN ushr 16) and 0xFF) + ((cS ushr 16) and 0xFF) +
+            ((cW ushr 16) and 0xFF) + ((cE ushr 16) and 0xFF)) * 0.2f
+        val g = (((c0 ushr 8) and 0xFF) + ((cN ushr 8) and 0xFF) + ((cS ushr 8) and 0xFF) +
+            ((cW ushr 8) and 0xFF) + ((cE ushr 8) and 0xFF)) * 0.2f
+        val b = ((c0 and 0xFF) + (cN and 0xFF) + (cS and 0xFF) + (cW and 0xFF) + (cE and 0xFF)) * 0.2f
+        return floatArrayOf(r, g, b)
     }
 
     /**
@@ -1528,7 +1648,9 @@ object FaceBlender {
         geom512: WarpedFaceGeometry,
         tgtPx512: IntArray,
         swapPx512: IntArray,
-        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        enableOcclusionProtection: Boolean = true,
+        neuralOcclusionGate512: FloatArray? = null
     ): FloatArray {
         val mask = FloatArray(HD_SIZE * HD_SIZE)
         val eyeMidX = (geom512.leftEye.x + geom512.rightEye.x) * 0.5f
@@ -1573,18 +1695,24 @@ object FaceBlender {
                     }
                 }
 
-                // Foreground Hair & Earring Occlusion Guard on outer cheek/forehead periphery (r > 0.52):
-                // If target has dark hair strands/locks (tLum < 55) while swapped pixel is bright skin,
-                // smoothly attenuate mask alpha so target's natural hair stays cleanly on top of the cheek!
-                if (r > 0.52f && alpha > 0.01f) {
-                    val idx = row + x
-                    val tc = tgtPx512[idx]
-                    val sc = swapPx512[idx]
-                    val tLum = 0.299f * (tc ushr 16 and 0xFF) + 0.587f * (tc ushr 8 and 0xFF) + 0.114f * (tc and 0xFF)
-                    val sLum = 0.299f * (sc ushr 16 and 0xFF) + 0.587f * (sc ushr 8 and 0xFF) + 0.114f * (sc and 0xFF)
-                    if (tLum < 58f && sLum > tLum + 24f) {
-                        val hairKeep = ((58f - tLum) / 45f).coerceIn(0f, 0.88f)
-                        alpha *= (1.0f - hairKeep)
+                val idx = row + x
+                if (enableOcclusionProtection && alpha > 0.01f) {
+                    // 1. Neural segformer_B5_ce.onnx Face-Parsing Gate (protects eyeglasses, hair bangs, hats & earrings)
+                    if (neuralOcclusionGate512 != null) {
+                        val segGate = neuralOcclusionGate512[idx].coerceIn(0f, 1f)
+                        alpha *= (0.18f + 0.82f * segGate)
+                    }
+
+                    // 2. Chromatic/Luminance Foreground Hair & Glasses Frame Occlusion Guard on outer periphery (r > 0.48)
+                    if (r > 0.48f) {
+                        val tc = tgtPx512[idx]
+                        val sc = swapPx512[idx]
+                        val tLum = 0.299f * (tc ushr 16 and 0xFF) + 0.587f * (tc ushr 8 and 0xFF) + 0.114f * (tc and 0xFF)
+                        val sLum = 0.299f * (sc ushr 16 and 0xFF) + 0.587f * (sc ushr 8 and 0xFF) + 0.114f * (sc and 0xFF)
+                        if (tLum < 58f && sLum > tLum + 24f) {
+                            val hairKeep = ((58f - tLum) / 45f).coerceIn(0f, 0.88f)
+                            alpha *= (1.0f - hairKeep)
+                        }
                     }
                 }
 

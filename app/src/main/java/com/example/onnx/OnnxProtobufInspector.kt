@@ -39,10 +39,10 @@ enum class ModelSlot(
 ) {
     DETECTOR(
         id = "det_10g",
-        subdirectory = "face_swap",
+        subdirectory = "detection",
         canonicalFileName = "det_10g.onnx",
         displayName = "det_10g.onnx (SCRFD-10G_KPS)",
-        categoryTitle = "models/face_swap/",
+        categoryTitle = "models/detection/ (or models/face_swap/)",
         approximateSizeLabel = "~16.9 MB",
         requirementLevel = ModelRequirementLevel.REQUIRED_CORE,
         tamilTitle = "1. முகம் & 5-புள்ளி கண்டறியும் மாடல் (Face Detector)",
@@ -55,10 +55,10 @@ enum class ModelSlot(
     ),
     RECOGNIZER(
         id = "w600k_r50",
-        subdirectory = "face_swap",
+        subdirectory = "recognition",
         canonicalFileName = "w600k_r50.onnx",
         displayName = "w600k_r50.onnx (ArcFace IResNet50)",
-        categoryTitle = "models/face_swap/",
+        categoryTitle = "models/recognition/ (or models/face_swap/)",
         approximateSizeLabel = "~166 MB",
         requirementLevel = ModelRequirementLevel.REQUIRED_IDENTITY,
         tamilTitle = "2. முக அடையாளப் பிரித்தெடுப்பு மாடல் (Identity Recognizer)",
@@ -90,7 +90,7 @@ enum class ModelSlot(
         subdirectory = "segmentation",
         canonicalFileName = "segformer_B5_ce.onnx",
         displayName = "segformer_B5_ce.onnx (GHOST 2.0 Head/Hair Parser)",
-        categoryTitle = "models/segmentation/",
+        categoryTitle = "models/segmentation/ (or models/head_replacement/)",
         approximateSizeLabel = "~325 MB (or ~50 MB BiSeNet)",
         requirementLevel = ModelRequirementLevel.OPTIONAL_HEAD_SWAP,
         tamilTitle = "4. தலை, முடி & கழுத்து பிரிக்கும் மாடல் (Head/Hair Parser)",
@@ -197,13 +197,16 @@ object OnnxProtobufInspector {
     private const val EMAP_FLOATS = 512 * 512
     private const val EMAP_BYTES = EMAP_FLOATS * 4
 
-    private val SUBDIRECTORIES = listOf(
+    val SUBDIRECTORIES = listOf(
         "face_swap",
-        "head_swap",
+        "head_replacement",
+        "detection",
+        "recognition",
         "segmentation",
         "matting",
         "inpainting",
-        "enhancement"
+        "enhancement",
+        "head_swap"
     )
 
     /**
@@ -313,21 +316,28 @@ object OnnxProtobufInspector {
     fun getModelsDir(context: Context): File = getModelsRootDir(context)
 
     /**
-     * Resolves the file location for a given `ModelSlot`. Checks the structured subdirectory first
-     * (`filesDir/models/<subdirectory>/<canonicalFileName>`), and falls back to `filesDir/models/<canonicalFileName>`
-     * so models imported previously remain immediately recognized.
+     * Resolves the file location for a given `ModelSlot`. Checks the primary structured subdirectory first
+     * (`filesDir/models/<subdirectory>/<canonicalFileName>`), then checks all other canonical subdirectories
+     * (`face_swap/`, `head_replacement/`, `detection/`, `recognition/`, `segmentation/`, `matting/`, `inpainting/`, `enhancement/`)
+     * and the root `filesDir/models/<canonicalFileName>` so models placed in any folder are immediately recognized.
      */
     fun resolveModelFile(context: Context, slot: ModelSlot): File {
         val root = getModelsRootDir(context)
-        val subDirFile = File(File(root, slot.subdirectory), slot.canonicalFileName)
-        if (subDirFile.exists() && subDirFile.length() > 1024L) {
-            return subDirFile
+        val primaryFile = File(File(root, slot.subdirectory), slot.canonicalFileName)
+        if (primaryFile.exists() && primaryFile.length() > 1024L) {
+            return primaryFile
+        }
+        for (sub in SUBDIRECTORIES) {
+            val candidate = File(File(root, sub), slot.canonicalFileName)
+            if (candidate.exists() && candidate.length() > 1024L) {
+                return candidate
+            }
         }
         val legacyRootFile = File(root, slot.canonicalFileName)
         if (legacyRootFile.exists() && legacyRootFile.length() > 1024L) {
             return legacyRootFile
         }
-        return subDirFile
+        return primaryFile
     }
 
     /**
