@@ -77,7 +77,7 @@ fun ModelsInspectorTab(
                 .widthIn(max = 640.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // 0. ONNX Runtime In-Memory Model Service Card (w600k_r50.onnx, gfpgan_1.4.onnx, segformer_B5_ce.onnx)
+            // 0. ONNX Runtime In-Memory Model Service Card + Tamil Model Usage Guide
             Card(
                 modifier = Modifier.fillMaxWidth(),
                 shape = RoundedCornerShape(16.dp),
@@ -88,13 +88,18 @@ fun ModelsInspectorTab(
                     verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
                     Text(
-                        text = "ONNX Runtime In-Memory Service (OnnxRuntimeModelService)",
+                        text = "தற்போது மெமரியில் (RAM) உள்ள மாடல்கள் & அவற்றின் பயன்கள்",
                         style = MaterialTheme.typography.titleMedium,
                         fontWeight = FontWeight.Bold,
                         color = NeonEmerald
                     )
                     Text(
-                        text = "Keeps w600k_r50.onnx (Identity), gfpgan_1.4.onnx (512x512 Restoration), and segformer_B5_ce.onnx (Head/Hair Parser) + det_10g / inswapper_128 warm in native memory for instant Face Detection, Swapping, and Restoration.",
+                        text = "ONNX Runtime In-Memory Service • Active in RAM: ${memoryServiceState.activeSessionCount} மாடல்கள்",
+                        style = MaterialTheme.typography.labelMedium,
+                        color = ElectricCyan
+                    )
+                    Text(
+                        text = "கீழே உள்ள பட்டியலில் எந்தெந்த .onnx மாடல்கள் தற்போது நேரடியாக RAM மெமரியில் ஏற்றப்பட்டுள்ளன என்பதையும், ஒவ்வொரு மாடலும் எதற்காகப் பயன்படுகிறது என்பதையும் தமிழில் காணலாம்:",
                         style = MaterialTheme.typography.bodySmall,
                         color = MaterialTheme.colorScheme.onSurfaceVariant
                     )
@@ -105,27 +110,41 @@ fun ModelsInspectorTab(
                             .clip(RoundedCornerShape(10.dp))
                             .background(ObsidianBg)
                             .padding(12.dp),
-                        verticalArrangement = Arrangement.spacedBy(6.dp)
+                        verticalArrangement = Arrangement.spacedBy(10.dp)
                     ) {
                         MemorySlotRow(
-                            label = "w600k_r50.onnx (ArcFace 512-D Identity)",
+                            label = "1. w600k_r50.onnx (ArcFace 512-D)",
+                            tamilPurpose = ModelSlot.RECOGNIZER.tamilTitle + " — " + ModelSlot.RECOGNIZER.tamilRoleSummary,
                             isLoaded = memoryServiceState.w600kLoaded,
                             note = memoryServiceState.loadedSessions[ModelSlot.RECOGNIZER]?.statusNote
                         )
                         MemorySlotRow(
-                            label = "gfpgan_1.4.onnx (512x512 Face Restoration)",
+                            label = "2. gfpgan_1.4.onnx (512×512 HD Enhancer)",
+                            tamilPurpose = ModelSlot.ENHANCEMENT.tamilTitle + " — " + ModelSlot.ENHANCEMENT.tamilRoleSummary,
                             isLoaded = memoryServiceState.gfpganLoaded,
                             note = memoryServiceState.loadedSessions[ModelSlot.ENHANCEMENT]?.statusNote
                         )
                         MemorySlotRow(
-                            label = "segformer_B5_ce.onnx (Head/Hair/Neck Parser)",
+                            label = "3. segformer_B5_ce.onnx (Head/Hair Parser)",
+                            tamilPurpose = ModelSlot.SEGMENTATION.tamilTitle + " — " + ModelSlot.SEGMENTATION.tamilRoleSummary,
                             isLoaded = memoryServiceState.segformerLoaded,
                             note = memoryServiceState.loadedSessions[ModelSlot.SEGMENTATION]?.statusNote
                         )
                         MemorySlotRow(
-                            label = "det_10g.onnx + inswapper_128.onnx + emap",
-                            isLoaded = memoryServiceState.detectorLoaded && memoryServiceState.inswapperLoaded,
-                            note = if (memoryServiceState.emapLoaded) "emap[512x512] cached in RAM" else null
+                            label = "4. det_10g.onnx (SCRFD Face Detector)",
+                            tamilPurpose = ModelSlot.DETECTOR.tamilTitle + " — " + ModelSlot.DETECTOR.tamilRoleSummary,
+                            isLoaded = memoryServiceState.detectorLoaded,
+                            note = memoryServiceState.loadedSessions[ModelSlot.DETECTOR]?.statusNote
+                        )
+                        MemorySlotRow(
+                            label = "5. inswapper_128.onnx + emap[512×512]",
+                            tamilPurpose = ModelSlot.SWAPPER.tamilTitle + " — " + ModelSlot.SWAPPER.tamilRoleSummary,
+                            isLoaded = memoryServiceState.inswapperLoaded,
+                            note = if (memoryServiceState.emapLoaded) {
+                                "emap[512×512] மெமரியில் உள்ளது • ${memoryServiceState.loadedSessions[ModelSlot.SWAPPER]?.statusNote ?: ""}"
+                            } else {
+                                memoryServiceState.loadedSessions[ModelSlot.SWAPPER]?.statusNote
+                            }
                         )
                     }
 
@@ -142,7 +161,7 @@ fun ModelsInspectorTab(
                             shape = RoundedCornerShape(10.dp)
                         ) {
                             Text(
-                                text = if (memoryServiceState.isLoading) "Loading..." else "Load Into Memory",
+                                text = if (memoryServiceState.isLoading) "ஏற்றப்படுகிறது..." else "RAM-ல் ஏற்று (Load to RAM)",
                                 fontWeight = FontWeight.Bold
                             )
                         }
@@ -283,16 +302,18 @@ fun ModelsInspectorTab(
 
             // 2. Installed vs Missing Model Slots
             Text(
-                text = "On-Device ONNX Model Slots (No Automatic Background Downloads)",
+                text = "On-Device ONNX Model Slots • ஒவ்வொரு மாடலின் பணி (தமிழில்)",
                 style = MaterialTheme.typography.titleMedium,
                 color = ElectricCyan
             )
 
             ModelSlot.entries.forEach { slot ->
                 val inspection = inspections.firstOrNull { it.slot == slot }
+                val isLoadedInRam = memoryServiceState.loadedSessions[slot]?.isLoadedInMemory == true
                 ModelInspectionCard(
                     slot = slot,
                     inspection = inspection,
+                    isLoadedInRam = isLoadedInRam,
                     onImportModel = { onImportModelForSlot(slot) }
                 )
             }
@@ -317,6 +338,7 @@ fun ModelsInspectorTab(
 private fun ModelInspectionCard(
     slot: ModelSlot,
     inspection: OnnxModelInspection?,
+    isLoadedInRam: Boolean,
     onImportModel: () -> Unit
 ) {
     val isReady = inspection?.isValidOnnx == true
@@ -342,19 +364,38 @@ private fun ModelInspectionCard(
                 Row(
                     modifier = Modifier.fillMaxWidth(),
                     verticalAlignment = Alignment.CenterVertically,
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    horizontalArrangement = Arrangement.SpaceBetween
                 ) {
-                    Icon(
-                        imageVector = if (isReady) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
-                        contentDescription = slot.displayName,
-                        tint = statusColor,
-                        modifier = Modifier.size(20.dp)
-                    )
-                    Text(
-                        text = if (isReady) "✓ Installed: ${slot.canonicalFileName}" else "✗ Missing: ${slot.canonicalFileName}",
-                        style = MaterialTheme.typography.titleMedium,
-                        color = statusColor
-                    )
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(
+                            imageVector = if (isReady) Icons.Default.CheckCircle else Icons.Default.WarningAmber,
+                            contentDescription = slot.displayName,
+                            tint = statusColor,
+                            modifier = Modifier.size(20.dp)
+                        )
+                        Text(
+                            text = if (isReady) "✓ Installed: ${slot.canonicalFileName}" else "✗ Missing: ${slot.canonicalFileName}",
+                            style = MaterialTheme.typography.titleMedium,
+                            color = statusColor
+                        )
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(50),
+                        color = if (isLoadedInRam) NeonEmerald.copy(alpha = 0.2f) else ObsidianBg
+                    ) {
+                        Text(
+                            text = if (isLoadedInRam) "RAM-ல் உள்ளது ●" else "RAM-ல் இல்லை ○",
+                            style = MaterialTheme.typography.labelSmall,
+                            fontWeight = FontWeight.Bold,
+                            color = if (isLoadedInRam) NeonEmerald else ElectricCyan,
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                        )
+                    }
                 }
 
                 Surface(
@@ -378,6 +419,29 @@ private fun ModelInspectionCard(
                 }
             }
 
+            // Tamil usage explanation box
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(RoyalViolet.copy(alpha = 0.14f))
+                    .border(1.dp, ElectricCyan.copy(alpha = 0.4f), RoundedCornerShape(12.dp))
+                    .padding(12.dp),
+                verticalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Text(
+                    text = "தமிழ் விளக்கம்: ${slot.tamilTitle}",
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    color = NeonEmerald
+                )
+                Text(
+                    text = slot.tamilRoleSummary,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurface
+                )
+            }
+
             Text(
                 text = "Directory: ${slot.categoryTitle}${slot.canonicalFileName} • Approx Size: ${slot.approximateSizeLabel}",
                 style = MaterialTheme.typography.labelMedium,
@@ -386,7 +450,7 @@ private fun ModelInspectionCard(
 
             Text(
                 text = slot.roleSummary,
-                style = MaterialTheme.typography.bodyMedium,
+                style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant
             )
 
@@ -526,10 +590,18 @@ private fun GhostFeasibilityCard(item: GhostComponentFeasibility) {
 @Composable
 private fun MemorySlotRow(
     label: String,
+    tamilPurpose: String,
     isLoaded: Boolean,
     note: String?
 ) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.55f))
+            .padding(10.dp),
+        verticalArrangement = Arrangement.spacedBy(4.dp)
+    ) {
         Row(
             modifier = Modifier.fillMaxWidth(),
             horizontalArrangement = Arrangement.SpaceBetween,
@@ -537,19 +609,24 @@ private fun MemorySlotRow(
         ) {
             Text(
                 text = label,
-                style = MaterialTheme.typography.labelMedium,
-                fontWeight = FontWeight.SemiBold,
-                color = MaterialTheme.colorScheme.onSurface,
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                color = ElectricCyan,
                 modifier = Modifier.weight(1f)
             )
             Spacer(modifier = Modifier.width(8.dp))
             Text(
-                text = if (isLoaded) "IN RAM ●" else "ON DISK ○",
+                text = if (isLoaded) "RAM-ல் உள்ளது ● (IN RAM)" else "டிஸ்க்கில் ○ (ON DISK)",
                 style = MaterialTheme.typography.labelSmall,
                 fontWeight = FontWeight.Bold,
-                color = if (isLoaded) NeonEmerald else ElectricCyan
+                color = if (isLoaded) NeonEmerald else AmberWarning
             )
         }
+        Text(
+            text = tamilPurpose,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface
+        )
         if (!note.isNullOrBlank()) {
             Text(
                 text = note,

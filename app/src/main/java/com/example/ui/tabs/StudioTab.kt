@@ -50,6 +50,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -64,6 +68,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import com.example.R
 import com.example.onnx.DetectedFace
+import com.example.onnx.ModelSlot
 import com.example.ui.FaceSwapUiState
 import com.example.ui.StudioMode
 import com.example.ui.components.FaceDetectionCanvas
@@ -606,6 +611,12 @@ private fun HeroPipelineStatusCard(
                         isReady = uiState.isRecognizerReady,
                         onClick = onOpenModelsTab
                     )
+                    ModelStatusPill(
+                        label = "gfpgan_1.4.onnx",
+                        isReady = uiState.memoryServiceState.gfpganLoaded ||
+                            uiState.modelInspections.any { it.slot == ModelSlot.ENHANCEMENT && it.isValidOnnx },
+                        onClick = onOpenModelsTab
+                    )
                     if (uiState.studioMode == StudioMode.HEAD_REPLACEMENT) {
                         ModelStatusPill(
                             label = if (uiState.isSegmentationOnnxReady) {
@@ -616,6 +627,82 @@ private fun HeroPipelineStatusCard(
                             isReady = true,
                             onClick = onOpenModelsTab
                         )
+                    }
+                }
+
+                // Interactive Tamil In-Memory Model Status & Purpose Panel
+                var showTamilModelGuide by remember { mutableStateOf(true) }
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .background(ObsidianBg)
+                        .border(1.dp, ElectricCyan.copy(alpha = 0.35f), RoundedCornerShape(12.dp))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { showTamilModelGuide = !showTamilModelGuide }
+                            .testTag("toggle_tamil_model_guide"),
+                        horizontalArrangement = Arrangement.SpaceBetween,
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp),
+                            modifier = Modifier.weight(1f)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Memory,
+                                contentDescription = "RAM Models",
+                                tint = NeonEmerald,
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Text(
+                                text = "மெமரியில் (RAM) உள்ள மாடல்கள் (${uiState.memoryServiceState.activeSessionCount}/5) & தமிழ் விளக்கம்",
+                                style = MaterialTheme.typography.labelLarge,
+                                fontWeight = FontWeight.Bold,
+                                color = NeonEmerald
+                            )
+                        }
+                        Text(
+                            text = if (showTamilModelGuide) "மறை ▲" else "விளக்கம் ▼",
+                            style = MaterialTheme.typography.labelSmall,
+                            color = ElectricCyan,
+                            fontWeight = FontWeight.Bold
+                        )
+                    }
+
+                    AnimatedVisibility(visible = showTamilModelGuide) {
+                        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+                            StudioTamilModelRow(
+                                fileName = "det_10g.onnx",
+                                isInRam = uiState.memoryServiceState.detectorLoaded,
+                                tamilRole = "முகத்தைக் கண்டறிய: படத்தில் முகம் எங்கே உள்ளது மற்றும் கண், மூக்கு, வாய் (5 புள்ளிகள்) ஆகியவற்றைக் துல்லியமாகக் கண்டறிய."
+                            )
+                            StudioTamilModelRow(
+                                fileName = "w600k_r50.onnx",
+                                isInRam = uiState.memoryServiceState.w600kLoaded,
+                                tamilRole = "முக அடையாளம் (512-D Identity): மாற்றுவதற்கான (Source) முகத்தின் தனித்துவமான 512-பரிமாண அடையாளத்தைப் பிரித்தெடுக்க."
+                            )
+                            StudioTamilModelRow(
+                                fileName = "inswapper_128.onnx",
+                                isInRam = uiState.memoryServiceState.inswapperLoaded,
+                                tamilRole = "முகம் மாற்றம் (Core Face Swap): Target முகத்தின் பாவனை மற்றும் ஒளியை மாற்றாமல் Source முகத்தைப் பொருத்த."
+                            )
+                            StudioTamilModelRow(
+                                fileName = "gfpgan_1.4.onnx",
+                                isInRam = uiState.memoryServiceState.gfpganLoaded,
+                                tamilRole = "512×512 HD மெருகூட்டல் (Face Restoration): முகம் மாற்றிய பிறகு மங்கலாக இல்லாமல் கண்கள், புருவம் மற்றும் தோலைத் தெளிவாக்க."
+                            )
+                            StudioTamilModelRow(
+                                fileName = "segformer_B5_ce.onnx",
+                                isInRam = uiState.memoryServiceState.segformerLoaded,
+                                tamilRole = "தலை & முடி பிரிப்பு (Head/Hair Parser): Mode 2-ல் தலை, முடி, காது மற்றும் கழுத்தைத் துல்லியமாகப் பிரித்து முழு தலையையும் மாற்ற."
+                            )
+                        }
                     }
                 }
 
@@ -637,7 +724,7 @@ private fun HeroPipelineStatusCard(
                             modifier = Modifier.size(20.dp)
                         )
                         Text(
-                            text = "Tap to open Model Status & GHOST 2.0 Feasibility Matrix or import .onnx files.",
+                            text = "Tap to open ONNX Models tab to import .onnx files or view full Tamil guide.",
                             style = MaterialTheme.typography.bodyMedium,
                             color = MaterialTheme.colorScheme.onSurface
                         )
@@ -645,6 +732,46 @@ private fun HeroPipelineStatusCard(
                 }
             }
         }
+    }
+}
+
+@Composable
+private fun StudioTamilModelRow(
+    fileName: String,
+    isInRam: Boolean,
+    tamilRole: String
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surface.copy(alpha = 0.6f))
+            .padding(8.dp),
+        verticalArrangement = Arrangement.spacedBy(2.dp)
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            Text(
+                text = fileName,
+                style = MaterialTheme.typography.labelMedium,
+                fontWeight = FontWeight.Bold,
+                color = ElectricCyan
+            )
+            Text(
+                text = if (isInRam) "RAM-ல் உள்ளது ●" else "டிஸ்க்கில் / இல்லை ○",
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.Bold,
+                color = if (isInRam) NeonEmerald else AmberWarning
+            )
+        }
+        Text(
+            text = tamilRole,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurface
+        )
     }
 }
 
