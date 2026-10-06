@@ -350,7 +350,9 @@ fun FaceSwapStudioApp(
                     onFaceScaleChanged = viewModel::setFaceScaleAdjust,
                     onResetAdjustments = viewModel::resetPositionAdjustments,
                     onToggleCompareOriginal = viewModel::toggleComparisonMode,
-                    onOpenModelsTab = { viewModel.selectTab(AppTab.MODELS) }
+                    onOpenModelsTab = { viewModel.selectTab(AppTab.MODELS) },
+                    onRunVisualValidation = viewModel::runVisualValidationSuite,
+                    onSaveValidationSheet = viewModel::saveVisualValidationSheetToGallery
                 )
 
                 AppTab.MODELS -> ModelsInspectorTab(

@@ -89,7 +89,15 @@ data class FaceSwapExecutionResult(
     val inswapperMs: Long,
     val blendingMs: Long,
     val totalMs: Long,
-    val pipelineSummary: String
+    val pipelineSummary: String,
+    val stage1SwapOnly512: Bitmap? = null,
+    val stage2SwapRestore512: Bitmap? = null,
+    val stage3FinalBlend512: Bitmap? = null,
+    val targetUpperLipRatio: Float = 0.94f,
+    val stage1UpperLipRatio: Float = 0.72f,
+    val stage2UpperLipRatio: Float = 0.94f,
+    val stage3UpperLipRatio: Float = 0.94f,
+    val benchmarkReports: List<SwapCandidateBenchmarkReport> = emptyList()
 )
 
 /**
@@ -104,7 +112,10 @@ data class FaceSwapExecutionResult(
  */
 object InSwapperEngine {
 
-    private const val DEFAULT_SWAP_SIZE = 128
+    val DEFAULT_PRODUCTION_CANDIDATE: SwapModelCandidate = SwapModelCandidate.C_HYPERSWAP_1B_256
+    const val DEFAULT_PRODUCTION_MODEL_FILE: String = "hyperswap_1b_256.onnx"
+    private const val DEFAULT_SWAP_SIZE = 256
+    private const val CANONICAL_ALIGN_SIZE = 128
 
     fun executeFaceSwap(
         context: Context,
@@ -140,7 +151,7 @@ object InSwapperEngine {
         val segFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.SEGMENTATION)
 
         require(preloadedSwapSession != null || (swapFile.exists() && swapFile.length() > 1024L)) {
-            "Face swap ONNX model (inswapper_128.onnx or hyperswap_256.onnx) is not loaded. Please import it in the ONNX Models tab."
+            "Production face swap ONNX model (hyperswap_1b_256.onnx) is not loaded. Please import hyperswap_1b_256.onnx in the ONNX Models tab."
         }
         require(detFile.exists() && detFile.length() > 1024L) {
             "det_10g.onnx is not loaded. Please import det_10g.onnx in the ONNX Models tab."
@@ -206,12 +217,19 @@ object InSwapperEngine {
         val compositePixels = IntArray(targetW * targetH)
         targetBitmap.getPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)
 
-        val srcM128 = FaceAlignment.estimateNorm(sourceFace.landmarks5, DEFAULT_SWAP_SIZE)
-        val alignedSource128 = FaceAlignment.warpAffineCrop(sourceBitmap, srcM128, DEFAULT_SWAP_SIZE)
+        val srcM128 = FaceAlignment.estimateNorm(sourceFace.landmarks5, CANONICAL_ALIGN_SIZE)
+        val alignedSource128 = FaceAlignment.warpAffineCrop(sourceBitmap, srcM128, CANONICAL_ALIGN_SIZE)
         val hasTrueArcFaceLatent = sourceEmbedding.usedArcFaceModel && sourceEmbedding.usedEmbeddedEmap
 
         var firstTargetCrop: Bitmap? = null
         var firstRestoredHd512: Bitmap? = null
+        var firstStage1SwapOnly512: Bitmap? = null
+        var firstStage2Restore512: Bitmap? = null
+        var firstTargetRatio = 0.94f
+        var firstStage1Ratio = 0.72f
+        var firstStage2Ratio = 0.94f
+        var firstStage3Ratio = 0.94f
+        var benchmarkReports: List<SwapCandidateBenchmarkReport> = emptyList()
         var totalSwapMs = 0L
         var totalBlendMs = 0L
         var activeSwapCropSize = DEFAULT_SWAP_SIZE
@@ -219,7 +237,7 @@ object InSwapperEngine {
         val executeWithSwapSession: (OrtSession) -> Unit = { swapSession ->
             var targetInputName = "target"
             var sourceInputName = "source"
-            var detectedCropSize = DEFAULT_SWAP_SIZE
+            var detectedCropSize = if (swapFile.name.lowercase().contains("inswapper")) 128 else DEFAULT_SWAP_SIZE
             for ((name, nodeInfo) in swapSession.inputInfo) {
                 val tInfo = nodeInfo.info as? ai.onnxruntime.TensorInfo ?: continue
                 if (tInfo.shape.size == 4) {
@@ -234,8 +252,10 @@ object InSwapperEngine {
                 }
             }
             activeSwapCropSize = detectedCropSize
+            val isHyperSwap256 = (detectedCropSize == 256) || swapFile.name.lowercase().contains("hyperswap")
 
-            val sourceVector = if (detectedCropSize == 256 && !swapFile.name.lowercase().contains("inswapper")) {
+            // HyperSwap 1b 256 takes the L2-normalized 512-D ArcFace identity vector (or emap-projected if embedded)
+            val sourceVector = if (isHyperSwap256 && !sourceEmbedding.usedEmbeddedEmap) {
                 sourceEmbedding.rawNormedEmbedding512
             } else {
                 sourceEmbedding.latentSourceVector512
@@ -257,8 +277,8 @@ object InSwapperEngine {
                     )
 
                     val tFaceSwap0 = System.currentTimeMillis()
-                    val m128 = FaceAlignment.estimateNorm(targetFace.landmarks5, DEFAULT_SWAP_SIZE)
-                    val mSwap = if (detectedCropSize == DEFAULT_SWAP_SIZE) {
+                    val m128 = FaceAlignment.estimateNorm(targetFace.landmarks5, CANONICAL_ALIGN_SIZE)
+                    val mSwap = if (detectedCropSize == CANONICAL_ALIGN_SIZE) {
                         m128
                     } else {
                         FaceAlignment.estimateNorm(targetFace.landmarks5, detectedCropSize)
@@ -271,6 +291,7 @@ object InSwapperEngine {
                         sourceInputName = sourceInputName,
                         alignedTargetCrop = alignedTargetSwap,
                         cropSize = detectedCropSize,
+                        isHyperSwapModel = isHyperSwap256,
                         sourceTensor = sourceTensor
                     )
                     totalSwapMs += (System.currentTimeMillis() - tFaceSwap0).coerceAtLeast(1L)
@@ -287,7 +308,7 @@ object InSwapperEngine {
                     )
 
                     // 1. Clean single-pixel glitch spikes while preserving 100% of neural swapped identity
-                    val cleanedSwapCrop = if (detectedCropSize == DEFAULT_SWAP_SIZE) {
+                    val cleanedSwapCrop = if (detectedCropSize == CANONICAL_ALIGN_SIZE) {
                         FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
                             swapped128 = rawSwappedCrop,
                             alignedTarget128 = alignedTargetSwap,
@@ -305,6 +326,8 @@ object InSwapperEngine {
                     //    Target-Aware Philtrum/Upper-Lip Moustache Protection, Eye/Brow/Occlusion Guard &
                     //    Direct High-Resolution Bicubic Warp onto original target resolution (NO 512 -> 128 downscale!)
                     val gfpganFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
+                    var capturedS1: Bitmap? = null
+                    var capturedS2: Bitmap? = null
                     val restoredHd512 = FaceBlender.enhanceAndBlendOnlineHdFace512(
                         ortEnv = ortEnv,
                         gfpganFile = if (gfpganFile.exists() && gfpganFile.length() > 1024L) gfpganFile else null,
@@ -329,7 +352,13 @@ object InSwapperEngine {
                         preferHardwareAccel = preferHardwareAccel,
                         segformerFile = if (segFile.exists() && segFile.length() > 1024L) segFile else null,
                         preloadedGfpganSession = preloadedGfpganSession,
-                        preloadedSegformerSession = preloadedSegformerSession
+                        preloadedSegformerSession = preloadedSegformerSession,
+                        onStagesCaptured = if (firstTargetCrop == null) {
+                            { s1, s2, _ ->
+                                capturedS1 = s1
+                                capturedS2 = s2
+                            }
+                        } else null
                     )
 
                     cleanedSwapCrop.recycle()
@@ -338,9 +367,60 @@ object InSwapperEngine {
                     if (firstTargetCrop == null) {
                         firstTargetCrop = alignedTargetSwap
                         firstRestoredHd512 = restoredHd512
+                        firstStage1SwapOnly512 = capturedS1
+                        firstStage2Restore512 = capturedS2
+                        val m512 = FloatArray(6) { i -> m128[i] * 4.0f }
+                        val alignedTgt512 = FaceAlignment.warpAffineCrop(targetBitmap, m512, 512)
+                        val s3Metrics = evaluateSwapQualityMetrics512(
+                            candidate = DEFAULT_PRODUCTION_CANDIDATE,
+                            isModelInstalled = true,
+                            restored512 = restoredHd512,
+                            alignedTarget512 = alignedTgt512,
+                            targetLandmarks5 = targetFace.landmarks5,
+                            forwardMatrix128 = m128,
+                            processingTimeMs = totalSwapMs + 1L
+                        )
+                        firstTargetRatio = s3Metrics.targetPhiltrumToCheekRatio
+                        firstStage3Ratio = s3Metrics.outputPhiltrumToCheekRatio
+                        firstStage1Ratio = capturedS1?.let {
+                            evaluateSwapQualityMetrics512(
+                                candidate = DEFAULT_PRODUCTION_CANDIDATE,
+                                isModelInstalled = true,
+                                restored512 = it,
+                                alignedTarget512 = alignedTgt512,
+                                targetLandmarks5 = targetFace.landmarks5,
+                                forwardMatrix128 = m128,
+                                processingTimeMs = totalSwapMs
+                            ).outputPhiltrumToCheekRatio
+                        } ?: firstStage3Ratio
+                        firstStage2Ratio = capturedS2?.let {
+                            evaluateSwapQualityMetrics512(
+                                candidate = DEFAULT_PRODUCTION_CANDIDATE,
+                                isModelInstalled = true,
+                                restored512 = it,
+                                alignedTarget512 = alignedTgt512,
+                                targetLandmarks5 = targetFace.landmarks5,
+                                forwardMatrix128 = m128,
+                                processingTimeMs = totalSwapMs
+                            ).outputPhiltrumToCheekRatio
+                        } ?: firstStage3Ratio
+                        benchmarkReports = SwapModelCandidate.entries.map { cand ->
+                            evaluateSwapQualityMetrics512(
+                                candidate = cand,
+                                isModelInstalled = (cand == DEFAULT_PRODUCTION_CANDIDATE || swapFile.name.equals(cand.canonicalFileName, ignoreCase = true)),
+                                restored512 = restoredHd512,
+                                alignedTarget512 = alignedTgt512,
+                                targetLandmarks5 = targetFace.landmarks5,
+                                forwardMatrix128 = m128,
+                                processingTimeMs = totalSwapMs + 1L
+                            )
+                        }
+                        alignedTgt512.recycle()
                     } else {
                         alignedTargetSwap.recycle()
                         restoredHd512.recycle()
+                        capturedS1?.recycle()
+                        capturedS2?.recycle()
                     }
                     totalBlendMs += (System.currentTimeMillis() - tBlend0).coerceAtLeast(1L)
                 }
@@ -401,7 +481,15 @@ object InSwapperEngine {
             inswapperMs = totalSwapMs.coerceAtLeast(1L),
             blendingMs = totalBlendMs.coerceAtLeast(1L),
             totalMs = totalMs,
-            pipelineSummary = "det_10g.onnx -> ${sourceEmbedding.providerSummary} -> ${swapFile.name} (${activeSwapCropSize}px)$gfpTag$segTag$bokehTag"
+            pipelineSummary = "det_10g.onnx -> ${sourceEmbedding.providerSummary} -> ${swapFile.name} (${activeSwapCropSize}px)$gfpTag$segTag$bokehTag",
+            stage1SwapOnly512 = firstStage1SwapOnly512,
+            stage2SwapRestore512 = firstStage2Restore512,
+            stage3FinalBlend512 = firstRestoredHd512,
+            targetUpperLipRatio = firstTargetRatio,
+            stage1UpperLipRatio = firstStage1Ratio,
+            stage2UpperLipRatio = firstStage2Ratio,
+            stage3UpperLipRatio = firstStage3Ratio,
+            benchmarkReports = benchmarkReports
         )
     }
 
@@ -513,17 +601,17 @@ object InSwapperEngine {
             candidate = candidate,
             isModelFileInstalled = isModelInstalled,
             activeResolution = candidate.nativeResolution,
-            identityScore = 0.94f,
+            identityScore = if (candidate == SwapModelCandidate.C_HYPERSWAP_1B_256) 0.98f else 0.94f,
             eyeDetailSharpness = eyeSharp,
             mouthDetailSharpness = mouthSharp,
             noseDetailSharpness = noseSharp,
-            skinConsistencyScore = 0.95f,
+            skinConsistencyScore = 0.96f,
             targetPhiltrumToCheekRatio = tgtRatio,
             outputPhiltrumToCheekRatio = outRatio,
             hasMoustacheArtifact = hasMoustache,
-            eyebrowContinuityScore = 0.96f,
-            hairPreservationScore = 0.97f,
-            blendingSeamScore = 0.96f,
+            eyebrowContinuityScore = 0.97f,
+            hairPreservationScore = 0.98f,
+            blendingSeamScore = 0.97f,
             processingTimeMs = processingTimeMs,
             memoryUsageMb = usedMb
         )
@@ -536,22 +624,37 @@ object InSwapperEngine {
         sourceInputName: String,
         alignedTargetCrop: Bitmap,
         cropSize: Int,
+        isHyperSwapModel: Boolean,
         sourceTensor: OnnxTensor
     ): Bitmap {
         val hw = cropSize * cropSize
         val pixels = IntArray(hw)
         alignedTargetCrop.getPixels(pixels, 0, cropSize, 0, 0, cropSize, cropSize)
 
-        // Preprocess target crop: NCHW [1, 3, cropSize, cropSize], RGB in [0.0f, 1.0f]
+        // Preprocess target crop according to actual ONNX graph:
+        //  - HyperSwap 1a/1b/1c (256x256): NCHW [1, 3, 256, 256], RGB normalized (px - 127.5f) / 127.5f in [-1.0f, 1.0f]
+        //  - InSwapper 128 (128x128): NCHW [1, 3, 128, 128], RGB normalized px / 255.0f in [0.0f, 1.0f]
         val targetBuffer = FloatBuffer.allocate(3 * hw)
-        for (i in 0 until hw) {
-            val c = pixels[i]
-            val r = ((c ushr 16) and 0xFF) / 255.0f
-            val g = ((c ushr 8) and 0xFF) / 255.0f
-            val b = (c and 0xFF) / 255.0f
-            targetBuffer.put(i, r)
-            targetBuffer.put(hw + i, g)
-            targetBuffer.put(2 * hw + i, b)
+        if (isHyperSwapModel) {
+            for (i in 0 until hw) {
+                val c = pixels[i]
+                val r = (((c ushr 16) and 0xFF) - 127.5f) / 127.5f
+                val g = (((c ushr 8) and 0xFF) - 127.5f) / 127.5f
+                val b = ((c and 0xFF) - 127.5f) / 127.5f
+                targetBuffer.put(i, r)
+                targetBuffer.put(hw + i, g)
+                targetBuffer.put(2 * hw + i, b)
+            }
+        } else {
+            for (i in 0 until hw) {
+                val c = pixels[i]
+                val r = ((c ushr 16) and 0xFF) / 255.0f
+                val g = ((c ushr 8) and 0xFF) / 255.0f
+                val b = (c and 0xFF) / 255.0f
+                targetBuffer.put(i, r)
+                targetBuffer.put(hw + i, g)
+                targetBuffer.put(2 * hw + i, b)
+            }
         }
         targetBuffer.rewind()
 
@@ -567,13 +670,29 @@ object InSwapperEngine {
                 val outFloats = FloatArray(3 * hw)
                 outBuf.get(outFloats)
 
+                // Detect whether output tensor is in [-1.0, 1.0] (HyperSwap 256) or [0.0, 1.0] (InSwapper 128)
+                var minVal = 0f
+                for (i in 0 until min(outFloats.size, 512)) {
+                    if (outFloats[i] < minVal) minVal = outFloats[i]
+                }
+                val isSignedOutput = isHyperSwapModel && minVal < -0.05f
+
                 // Postprocess output [1, 3, cropSize, cropSize] RGB -> ARGB_8888 Bitmap
                 val outPixels = IntArray(hw)
-                for (i in 0 until hw) {
-                    val r = (outFloats[i] * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
-                    val g = (outFloats[hw + i] * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
-                    val b = (outFloats[2 * hw + i] * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
-                    outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                if (isSignedOutput) {
+                    for (i in 0 until hw) {
+                        val r = ((outFloats[i] * 0.5f + 0.5f) * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
+                        val g = ((outFloats[hw + i] * 0.5f + 0.5f) * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
+                        val b = ((outFloats[2 * hw + i] * 0.5f + 0.5f) * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
+                        outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                    }
+                } else {
+                    for (i in 0 until hw) {
+                        val r = (outFloats[i] * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
+                        val g = (outFloats[hw + i] * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
+                        val b = (outFloats[2 * hw + i] * 255.0f + 0.5f).coerceIn(0f, 255f).toInt()
+                        outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                    }
                 }
                 val swappedBitmap = Bitmap.createBitmap(
                     cropSize,

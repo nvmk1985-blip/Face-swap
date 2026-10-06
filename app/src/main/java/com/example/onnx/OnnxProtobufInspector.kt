@@ -70,20 +70,20 @@ enum class ModelSlot(
         downloadSourceUrl = "https://github.com/deepinsight/insightface/releases/download/v0.7/buffalo_l.zip (w600k_r50.onnx)"
     ),
     SWAPPER(
-        id = "inswapper_128",
+        id = "hyperswap_1b_256",
         subdirectory = "face_swap",
-        canonicalFileName = "inswapper_128.onnx",
-        displayName = "inswapper_128.onnx (InSwapper Generator)",
+        canonicalFileName = "hyperswap_1b_256.onnx",
+        displayName = "hyperswap_1b_256.onnx (HyperSwap 1b 256px Production Generator)",
         categoryTitle = "models/face_swap/",
-        approximateSizeLabel = "~529 MB",
+        approximateSizeLabel = "~256px NCHW ONNX",
         requirementLevel = ModelRequirementLevel.REQUIRED_CORE,
-        tamilTitle = "3. முகம் மாற்றும் முக்கிய மாடல் (Face Swap Generator)",
-        tamilRoleSummary = "Target புகைப்படத்தின் முக பாவனை மற்றும் வெளிச்சத்திற்கு ஏற்ப Source நபரின் முகத்தைப் பொருத்தி (Face Swap) புதிய முகத்தை உருவாக்குகிறது.",
-        roleSummary = "Synthesizes a 128x128 swapped face from an aligned 128x128 target crop and a 512-D source latent vector transformed by the embedded 512x512 emap matrix.",
-        expectedInputSignature = "target: FLOAT[1, 3, 128, 128] (RGB in [0.0, 1.0]) + source: FLOAT[1, 512]",
-        expectedOutputSignature = "output: FLOAT[1, 3, 128, 128] (Swapped 128x128 RGB face in [0.0, 1.0])",
-        licenseSummary = "InsightFace Model Zoo — Strict Non-Commercial Research Only",
-        downloadSourceUrl = "https://github.com/deepinsight/insightface/releases/download/model-zoo/inswapper_128.onnx"
+        tamilTitle = "3. முகம் மாற்றும் முக்கிய மாடல் (HyperSwap 1b 256px Production Swap)",
+        tamilRoleSummary = "Target புகைப்படத்தின் முக பாவனை மற்றும் வெளிச்சத்திற்கு ஏற்ப Source நபரின் முகத்தை 256×256 துல்லியத்தில் பொருத்தி (Face Swap) புதிய முகத்தை உருவாக்குகிறது.",
+        roleSummary = "Primary production FaceFusion Mobile swap model (hyperswap_1b_256.onnx). Synthesizes a 256x256 swapped face from an aligned 256x256 target crop and a 512-D ArcFace identity vector (also supports A/B/C/D benchmark models in developer mode).",
+        expectedInputSignature = "target: FLOAT[1, 3, 256, 256] (RGB normalized [-1.0, 1.0]) + source: FLOAT[1, 512] (512-D ArcFace embedding)",
+        expectedOutputSignature = "output: FLOAT[1, 3, 256, 256] (Swapped 256x256 RGB face)",
+        licenseSummary = "FaceFusion Mobile / InsightFace — Non-Commercial Research Only",
+        downloadSourceUrl = "https://huggingface.co/facefusion/models-3.3.0/resolve/main/hyperswap_1b_256.onnx"
     ),
     SEGMENTATION(
         id = "segformer_b5_ce",
@@ -327,15 +327,28 @@ object OnnxProtobufInspector {
         if (primaryFile.exists() && primaryFile.length() > 1024L) {
             return primaryFile
         }
-        for (sub in SUBDIRECTORIES) {
-            val candidate = File(File(root, sub), slot.canonicalFileName)
-            if (candidate.exists() && candidate.length() > 1024L) {
-                return candidate
-            }
+        val candidateNames = if (slot == ModelSlot.SWAPPER) {
+            // Production priority: C (hyperswap_1b_256.onnx) first, then B, D, A if installed in developer mode
+            listOf(
+                "hyperswap_1b_256.onnx",
+                "hyperswap_1a_256.onnx",
+                "hyperswap_1c_256.onnx",
+                "inswapper_128.onnx"
+            )
+        } else {
+            listOf(slot.canonicalFileName)
         }
-        val legacyRootFile = File(root, slot.canonicalFileName)
-        if (legacyRootFile.exists() && legacyRootFile.length() > 1024L) {
-            return legacyRootFile
+        for (fileName in candidateNames) {
+            for (sub in SUBDIRECTORIES) {
+                val candidate = File(File(root, sub), fileName)
+                if (candidate.exists() && candidate.length() > 1024L) {
+                    return candidate
+                }
+            }
+            val legacyRootFile = File(root, fileName)
+            if (legacyRootFile.exists() && legacyRootFile.length() > 1024L) {
+                return legacyRootFile
+            }
         }
         return primaryFile
     }
@@ -486,11 +499,11 @@ object OnnxProtobufInspector {
             ModelSlot.DETECTOR to listOf("det_10g.onnx", "scrfd_10g_bnkps.onnx", "det_2.5g.onnx"),
             ModelSlot.RECOGNIZER to listOf("w600k_r50.onnx", "w600k_mbf.onnx", "arcface.onnx"),
             ModelSlot.SWAPPER to listOf(
-                "inswapper_128.onnx",
-                "inswapper_128_fp16.onnx",
-                "hyperswap_1a_256.onnx",
                 "hyperswap_1b_256.onnx",
-                "hyperswap_1c_256.onnx"
+                "hyperswap_1a_256.onnx",
+                "hyperswap_1c_256.onnx",
+                "inswapper_128.onnx",
+                "inswapper_128_fp16.onnx"
             ),
             ModelSlot.SEGMENTATION to listOf("segformer_B5_ce.onnx", "bisenet.onnx", "face_parsing.onnx"),
             ModelSlot.MATTING to listOf("modnet.onnx", "stylematte_synth.onnx"),

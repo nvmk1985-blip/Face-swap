@@ -604,4 +604,88 @@ class ExampleRobolectricTest {
         alignedTarget512.recycle()
         swappedWithMoustache128.recycle()
     }
+
+    @Test
+    fun `test13 real visual validation generates 7 panel A B C D comparison and 3 stage upper lip diagnostic PNGs`() {
+        val (srcPair, tgtPair) = com.example.onnx.VisualValidationBenchmark.createRealisticSourceAndTargetPortraits()
+        val suite = com.example.onnx.VisualValidationBenchmark.runCompleteVisualValidation(
+            context = context,
+            ortEnv = ortEnv,
+            sourceBitmap = srcPair.first,
+            sourceFace = srcPair.second,
+            targetBitmap = tgtPair.first,
+            targetFace = tgtPair.second
+        )
+
+        // Verify Target has NO moustache
+        assertTrue("Target philtrum should be clean (ratio=${suite.targetPhiltrumRatio})", suite.targetPhiltrumRatio >= 0.90f)
+
+        // Verify Legacy / Before Fix output had the moustache artifact
+        assertTrue(
+            "Legacy output before fix should exhibit moustache leak (ratio=${suite.legacyBeforeFixOutput.philtrumToCheekRatio})",
+            suite.legacyBeforeFixOutput.hasMoustacheArtifact
+        )
+
+        // Verify NONE of the 4 candidates (A, B, C, D) contain moustache, dark upper-lip shadow, or grey patch
+        assertEquals(4, suite.candidateOutputs.size)
+        suite.candidateOutputs.forEach { cand ->
+            assertTrue(
+                "Candidate ${cand.title} MUST NOT have moustache artifact (ratio=${cand.philtrumToCheekRatio})",
+                !cand.hasMoustacheArtifact && !cand.hasGreyPatch && cand.philtrumToCheekRatio >= 0.88f
+            )
+            assertTrue(
+                "Candidate ${cand.title} eye sharpness (${cand.eyeSharpness}) must exceed legacy (${suite.legacyBeforeFixOutput.eyeSharpness})",
+                cand.eyeSharpness > suite.legacyBeforeFixOutput.eyeSharpness
+            )
+        }
+
+        // Verify 3-Stage Upper-Lip Comparison:
+        // Stage 1 (Swap-only) introduces the raw neural upper-lip shadow from the moustached donor identity
+        // Stage 2 (Swap + HD Restoration + Upper-Lip Guard) & Stage 3 (Final Blend) eliminate it completely
+        assertTrue(
+            "Stage 1 (Swap-only) should show raw upper-lip shadow (ratio=${suite.stage1SwapOnly.philtrumToCheekRatio})",
+            suite.stage1SwapOnly.philtrumToCheekRatio < suite.stage2SwapPlusRestore.philtrumToCheekRatio
+        )
+        assertTrue(
+            "Stage 2 (Swap + HD Restoration) must eliminate moustache (ratio=${suite.stage2SwapPlusRestore.philtrumToCheekRatio})",
+            suite.stage2SwapPlusRestore.philtrumToCheekRatio >= 0.90f
+        )
+        assertTrue(
+            "Stage 3 (Swap + Restoration + Final Blend) must preserve clean upper lip (ratio=${suite.stage3SwapRestoreBlend.philtrumToCheekRatio})",
+            suite.stage3SwapRestoreBlend.philtrumToCheekRatio >= 0.90f
+        )
+
+        // Save actual generated PNG files to workspace artifact directory for direct visual inspection
+        val artifactDir = java.io.File("../.aistudio/artifacts/brain/389bfe84-aa64-4843-b4ba-b389de6838e3")
+        if (artifactDir.exists() || artifactDir.mkdirs()) {
+            fun savePng(bmp: Bitmap, name: String) {
+                java.io.File(artifactDir, name).outputStream().use { out ->
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                }
+            }
+            savePng(suite.comparison7PanelSheet, "visual_comparison_7panel_ABCD.png")
+            savePng(suite.stage3PanelSheet, "upper_lip_3stage_diagnostic.png")
+            savePng(suite.sourceBitmap, "1_source.png")
+            savePng(suite.targetBitmap, "2_target.png")
+            savePng(suite.legacyBeforeFixOutput.fullOutputBitmap, "3_current_output_before_fix.png")
+            suite.candidateOutputs.forEach { cand ->
+                val fileSlug = cand.candidate?.canonicalFileName?.removeSuffix(".onnx") ?: "cand"
+                savePng(cand.fullOutputBitmap, "${cand.panelNumber}_${cand.candidate?.code}_${fileSlug}.png")
+            }
+            savePng(suite.stage1SwapOnly.face512Bitmap, "stage1_swap_only_512.png")
+            savePng(suite.stage2SwapPlusRestore.face512Bitmap, "stage2_swap_hd_restore_512.png")
+            savePng(suite.stage3SwapRestoreBlend.face512Bitmap, "stage3_swap_restore_final_blend_512.png")
+        }
+
+        println("=== VISUAL VALIDATION BENCHMARK REPORT ===")
+        println("Target Philtrum-to-Cheek Ratio: ${"%.3f".format(suite.targetPhiltrumRatio)} (NO MOUSTACHE)")
+        println("Legacy Before-Fix Output: PhiltrumRatio=${"%.3f".format(suite.legacyBeforeFixOutput.philtrumToCheekRatio)} | EyeSharp=${"%.2f".format(suite.legacyBeforeFixOutput.eyeSharpness)} | NoseSharp=${"%.2f".format(suite.legacyBeforeFixOutput.noseSharpness)} | MouthSharp=${"%.2f".format(suite.legacyBeforeFixOutput.mouthSharpness)}")
+        suite.candidateOutputs.forEach { c ->
+            println("Candidate ${c.title}: PhiltrumRatio=${"%.3f".format(c.philtrumToCheekRatio)} | Moustache=${c.hasMoustacheArtifact} | GreyPatch=${c.hasGreyPatch} | EyeSharp=${"%.2f".format(c.eyeSharpness)} | NoseSharp=${"%.2f".format(c.noseSharpness)} | MouthSharp=${"%.2f".format(c.mouthSharpness)} | ID=${c.identityScore} | Latency=${c.latencyMs}ms | Winner=${c.isWinningModel}")
+        }
+        println("Stage 1 (Swap-Only): PhiltrumRatio=${"%.3f".format(suite.stage1SwapOnly.philtrumToCheekRatio)}")
+        println("Stage 2 (Swap + HD Restoration): PhiltrumRatio=${"%.3f".format(suite.stage2SwapPlusRestore.philtrumToCheekRatio)}")
+        println("Stage 3 (Swap + Restoration + Final Blend): PhiltrumRatio=${"%.3f".format(suite.stage3SwapRestoreBlend.philtrumToCheekRatio)}")
+        println("==========================================")
+    }
 }

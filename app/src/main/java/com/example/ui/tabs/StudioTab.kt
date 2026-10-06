@@ -132,6 +132,8 @@ fun StudioTab(
     onFaceReactionModeChanged: (FaceReactionSourceMode) -> Unit = {},
     onBrowseSourceFile: () -> Unit = onPickSourcePhoto,
     onBrowseTargetFile: () -> Unit = onPickTargetPhoto,
+    onRunVisualValidation: () -> Unit = {},
+    onSaveValidationSheet: (Boolean) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val isHeadMode = uiState.studioMode == StudioMode.HEAD_REPLACEMENT
@@ -500,6 +502,13 @@ fun StudioTab(
                     onCropResultAspect = onCropResultAspect
                 )
             }
+
+            // 6. Real Visual Validation: 7-Panel A/B/C/D Comparison & 3-Stage Upper-Lip Moustache Diagnostic
+            VisualValidationAndStageInspectorCard(
+                uiState = uiState,
+                onRunVisualValidation = onRunVisualValidation,
+                onSaveValidationSheet = onSaveValidationSheet
+            )
 
             Spacer(modifier = Modifier.height(16.dp))
         }
@@ -2299,5 +2308,174 @@ private fun QualityAndFineTuneControlsCard(
         }
     }
 }
+
+@Composable
+private fun VisualValidationAndStageInspectorCard(
+    uiState: FaceSwapUiState,
+    onRunVisualValidation: () -> Unit,
+    onSaveValidationSheet: (Boolean) -> Unit
+) {
+    val suite = uiState.visualValidationSuite
+
+    Card(
+        modifier = Modifier.fillMaxWidth(),
+        shape = RoundedCornerShape(18.dp),
+        colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surface)
+    ) {
+        Column(
+            modifier = Modifier.padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Text(
+                text = "Real Visual Validation: A/B/C/D Models & 3-Stage Upper-Lip Inspector",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = ElectricCyan
+            )
+            Text(
+                text = "Generates actual output images for 1. Source, 2. Target (NO Moustache), 3. Current Output (Before Fix), 4. A (inswapper_128), 5. B (hyperswap_1a_256), 6. C (hyperswap_1b_256), 7. D (hyperswap_1c_256), plus the 3-Stage Upper-Lip Diagnostic.",
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+
+            Button(
+                onClick = onRunVisualValidation,
+                enabled = !uiState.isRunningVisualValidation,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(50.dp)
+                    .testTag("run_visual_validation_button"),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = NeonEmerald,
+                    contentColor = ObsidianBg
+                )
+            ) {
+                if (uiState.isRunningVisualValidation) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(20.dp),
+                        color = ObsidianBg,
+                        strokeWidth = 2.dp
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Generating A/B/C/D & 3-Stage Visual Comparison...",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.Default.Compare,
+                        contentDescription = "Run Visual Validation",
+                        modifier = Modifier.size(18.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = "Run A/B/C/D & 3-Stage Upper-Lip Visual Validation",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold
+                    )
+                }
+            }
+
+            if (suite != null) {
+                // 1. 7-Panel Visual Comparison Sheet Preview
+                Text(
+                    text = "1. 7-Panel Visual Comparison (Source • Target • Before Fix • A • B • C • D)",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = NeonEmerald
+                )
+                Image(
+                    bitmap = suite.comparison7PanelSheet.asImageBitmap(),
+                    contentDescription = "7-Panel Visual Comparison Sheet",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.5.dp, ElectricCyan, RoundedCornerShape(12.dp)),
+                    contentScale = ContentScale.FillWidth
+                )
+
+                // 2. 3-Stage Upper-Lip Moustache Diagnostic Sheet Preview
+                Text(
+                    text = "2. 3-Stage Upper-Lip Moustache Diagnostic (Winning Model: ${suite.winningCandidate.code} — ${suite.winningCandidate.canonicalFileName})",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.Bold,
+                    color = ElectricCyan
+                )
+                Image(
+                    bitmap = suite.stage3PanelSheet.asImageBitmap(),
+                    contentDescription = "3-Stage Upper-Lip Diagnostic Sheet",
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(12.dp))
+                        .border(1.5.dp, NeonEmerald, RoundedCornerShape(12.dp)),
+                    contentScale = ContentScale.FillWidth
+                )
+
+                // Exact Stage Root-Cause Summary Box
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .clip(RoundedCornerShape(10.dp))
+                        .background(ObsidianBg)
+                        .border(1.dp, NeonEmerald.copy(alpha = 0.45f), RoundedCornerShape(10.dp))
+                        .padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(4.dp)
+                ) {
+                    Text(
+                        text = "Exact Stage Root-Cause Analysis (Upper-Lip Moustache):",
+                        style = MaterialTheme.typography.labelLarge,
+                        fontWeight = FontWeight.Bold,
+                        color = NeonEmerald
+                    )
+                    Text(
+                        text = suite.rootCauseStageSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                }
+
+                // Export Buttons for the 2 Visual Comparison Sheets
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = { onSaveValidationSheet(false) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("save_7panel_sheet_button"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text(
+                            text = "Save 7-Panel PNG",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = ElectricCyan
+                        )
+                    }
+                    OutlinedButton(
+                        onClick = { onSaveValidationSheet(true) },
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("save_3stage_sheet_button"),
+                        shape = RoundedCornerShape(10.dp)
+                    ) {
+                        Text(
+                            text = "Save 3-Stage PNG",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.Bold,
+                            color = NeonEmerald
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
 
 

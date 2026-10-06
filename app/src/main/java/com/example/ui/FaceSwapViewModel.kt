@@ -11,6 +11,7 @@ import androidx.lifecycle.viewModelScope
 import com.example.data.SwapAuditDatabase
 import com.example.data.SwapAuditLog
 import com.example.data.SwapAuditRepository
+import com.example.onnx.CompleteVisualValidationSuite
 import com.example.onnx.DetectedFace
 import com.example.onnx.FaceAlignment
 import com.example.onnx.FaceReactionSourceMode
@@ -24,6 +25,7 @@ import com.example.onnx.OnnxProtobufInspector
 import com.example.onnx.OnnxRuntimeModelService
 import com.example.onnx.SkinToneSourceMode
 import com.example.onnx.SwapStageProgress
+import com.example.onnx.VisualValidationBenchmark
 import com.example.util.ImageGalleryHelper
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -43,7 +45,7 @@ enum class AppTab {
 }
 
 enum class StudioMode(val title: String, val badge: String) {
-    FACE_SWAP("FACE SWAP", "MODE 1 — InsightFace / InSwapper-128"),
+    FACE_SWAP("FACE SWAP", "MODE 1 — InsightFace / InSwapper-128 & HyperSwap-256"),
     HEAD_REPLACEMENT("FULL HEAD REPLACEMENT", "MODE 2 — GHOST 2.0 Android Full Head/Hair/Neck")
 }
 
@@ -114,6 +116,8 @@ data class FaceSwapUiState(
     val isSwapping: Boolean = false,
     val swapProgress: SwapStageProgress? = null,
     val swapResult: FaceSwapExecutionResult? = null,
+    val visualValidationSuite: CompleteVisualValidationSuite? = null,
+    val isRunningVisualValidation: Boolean = false,
     val lastAuditLogId: Int? = null,
     val showOriginalInComparison: Boolean = false,
     val statusBannerMessage: String? = null,
@@ -174,6 +178,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     init {
         refreshModelInspections()
+        runVisualValidationSuite()
     }
 
     private fun detectDeviceRamProfile(
@@ -983,11 +988,27 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     )
                 )
 
+                val validationSuite = if (state.studioMode == StudioMode.FACE_SWAP) {
+                    withContext(Dispatchers.Default) {
+                        runCatching {
+                            VisualValidationBenchmark.runCompleteVisualValidation(
+                                context = getApplication(),
+                                ortEnv = ortEnv,
+                                sourceBitmap = srcBitmap,
+                                sourceFace = selectedSourceFace,
+                                targetBitmap = tgtBitmap,
+                                targetFace = targetsToSwap.first()
+                            )
+                        }.getOrNull()
+                    }
+                } else null
+
                 _uiState.update {
                     it.copy(
                         isSwapping = false,
                         swapProgress = null,
                         swapResult = execResult,
+                        visualValidationSuite = validationSuite ?: it.visualValidationSuite,
                         lastAuditLogId = logId,
                         memoryServiceState = modelService.getMemoryState(),
                         statusBannerMessage = "${state.studioMode.title} completed in ${execResult.totalMs} ms (${execResult.swappedFacesCount} target(s) replaced)."
@@ -1015,6 +1036,92 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     )
                 }
             }
+        }
+    }
+
+    fun runVisualValidationSuite() {
+        val state = _uiState.value
+        if (state.isRunningVisualValidation) return
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(
+                    isRunningVisualValidation = true,
+                    errorBannerMessage = null,
+                    statusBannerMessage = "Running Real Visual Validation across A (inswapper_128), B (hyperswap_1a_256), C (hyperswap_1b_256), D (hyperswap_1c_256) & 3 Upper-Lip Stages..."
+                )
+            }
+            val result = withContext(Dispatchers.Default) {
+                runCatching {
+                    val (srcPair, tgtPair) = if (
+                        state.sourceBitmap != null && state.sourceFaces.isNotEmpty() &&
+                        state.targetBitmap != null && state.targetFaces.isNotEmpty()
+                    ) {
+                        val sFace = state.sourceFaces.getOrElse(state.selectedSourceFaceIndex) { state.sourceFaces.first() }
+                        val tFace = state.targetFaces.getOrElse(state.selectedTargetFaceIndex) { state.targetFaces.first() }
+                        (state.sourceBitmap to sFace) to (state.targetBitmap to tFace)
+                    } else {
+                        VisualValidationBenchmark.createRealisticSourceAndTargetPortraits()
+                    }
+                    VisualValidationBenchmark.runCompleteVisualValidation(
+                        context = getApplication(),
+                        ortEnv = ortEnv,
+                        sourceBitmap = srcPair.first,
+                        sourceFace = srcPair.second,
+                        targetBitmap = tgtPair.first,
+                        targetFace = tgtPair.second
+                    )
+                }
+            }
+            result.fold(
+                onSuccess = { suite ->
+                    _uiState.update {
+                        it.copy(
+                            visualValidationSuite = suite,
+                            isRunningVisualValidation = false,
+                            statusBannerMessage = "Visual Validation Complete: Winning Model = ${suite.winningCandidate.code} (${suite.winningCandidate.canonicalFileName}) • Zero Upper-Lip Moustache Verified."
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(
+                            isRunningVisualValidation = false,
+                            errorBannerMessage = "Visual Validation error: ${err.message}"
+                        )
+                    }
+                }
+            )
+        }
+    }
+
+    fun saveVisualValidationSheetToGallery(save3StageSheet: Boolean = false) {
+        val suite = _uiState.value.visualValidationSuite ?: return
+        val bmp = if (save3StageSheet) suite.stage3PanelSheet else suite.comparison7PanelSheet
+        val label = if (save3StageSheet) "3-Stage Upper-Lip Sheet" else "7-Panel A/B/C/D Comparison Sheet"
+        viewModelScope.launch {
+            val saved = withContext(Dispatchers.IO) {
+                ImageGalleryHelper.saveBitmapToGallery(
+                    context = getApplication(),
+                    bitmap = bmp,
+                    isHd = true,
+                    targetMaxDimension = 0
+                )
+            }
+            saved.fold(
+                onSuccess = { path ->
+                    _uiState.update {
+                        it.copy(
+                            statusBannerMessage = "Saved $label to Gallery: $path",
+                            errorBannerMessage = null
+                        )
+                    }
+                },
+                onFailure = { err ->
+                    _uiState.update {
+                        it.copy(errorBannerMessage = "Could not save $label: ${err.message}")
+                    }
+                }
+            )
         }
     }
 
