@@ -494,7 +494,7 @@ class ExampleRobolectricTest {
         tgtBmp.getPixels(targetPixels, 0, tgtBmp.width, 0, 0, tgtBmp.width, tgtBmp.height)
 
         val hdRestored512 = com.example.onnx.FaceBlender.enhanceAndBlendOnlineHdFace512(
-            ortEnv = ortEnv ?: OrtEnvironment.getEnvironment(),
+            ortEnv = ortEnv,
             gfpganFile = null,
             targetBitmap = tgtBmp,
             targetPixels = targetPixels,
@@ -519,14 +519,89 @@ class ExampleRobolectricTest {
         // Verify DSLR Portrait Mode Background Bokeh preserves full target resolution
         val outBmp = Bitmap.createBitmap(tgtBmp.width, tgtBmp.height, Bitmap.Config.ARGB_8888)
         outBmp.setPixels(targetPixels, 0, tgtBmp.width, 0, 0, tgtBmp.width, tgtBmp.height)
-        val bokehBmp = HeadSegmentationAndInpainting.applyPortraitModeBackgroundBokeh(
-            ortEnv = ortEnv,
+        HeadSegmentationAndInpainting.applyPortraitModeBackgroundBokeh(
             bitmap = outBmp,
-            detectedFaces = listOf(tgtFace),
-            blurStrength = 0.65f,
-            segModelFile = null
+            faces = listOf(tgtFace),
+            blurStrength = 0.65f
         )
-        assertEquals(480, bokehBmp.width)
-        assertEquals(640, bokehBmp.height)
+        assertEquals(480, outBmp.width)
+        assertEquals(640, outBmp.height)
+    }
+
+    @Test
+    fun `test12 facefusion style pipeline eliminates unwanted upper lip moustache and benchmarks A B C D candidates`() {
+        val (tgtBmp, tgtFace) = createSyntheticPortrait(
+            width = 640,
+            height = 800,
+            bgColor = Color.rgb(185, 195, 205),
+            skinColor = Color.rgb(218, 178, 152),
+            hairColor = Color.rgb(35, 25, 20),
+            rollDegrees = 0f
+        )
+        // Simulate a swapped crop that has a dark moustache/stubble shadow above the upper lip (philtrum)
+        // while the Target portrait has NO moustache
+        val m128 = FaceAlignment.estimateNorm(tgtFace.landmarks5, 128)
+        val swappedWithMoustache128 = FaceAlignment.warpAffineCrop(tgtBmp, m128, 128)
+        val canvas128 = android.graphics.Canvas(swappedWithMoustache128)
+        val moustachePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+            color = Color.rgb(55, 42, 38) // Dark brown/black moustache shadow above upper lip
+            style = android.graphics.Paint.Style.FILL
+        }
+        // Philtrum / upper-lip region in canonical 128x128 space is around y=[76..88], x=[44..84]
+        canvas128.drawOval(android.graphics.RectF(42f, 75f, 86f, 88f), moustachePaint)
+
+        val targetPixels = IntArray(tgtBmp.width * tgtBmp.height)
+        tgtBmp.getPixels(targetPixels, 0, tgtBmp.width, 0, 0, tgtBmp.width, tgtBmp.height)
+
+        val t0 = System.currentTimeMillis()
+        val restored512 = com.example.onnx.FaceBlender.enhanceAndBlendOnlineHdFace512(
+            ortEnv = ortEnv,
+            gfpganFile = null,
+            targetBitmap = tgtBmp,
+            targetPixels = targetPixels,
+            targetWidth = tgtBmp.width,
+            targetHeight = tgtBmp.height,
+            colorCorrected128 = swappedWithMoustache128,
+            forwardMatrix128 = m128,
+            targetLandmarks5 = tgtFace.landmarks5,
+            skinToneMode = com.example.onnx.SkinToneSourceMode.TARGET_SCENE,
+            faceReactionMode = com.example.onnx.FaceReactionSourceMode.SOURCE_REACTION,
+            enableColorTransfer = true,
+            enableOcclusionProtection = true,
+            blendStrength = 1.0f,
+            enhancementStrength = 0.85f
+        )
+        val elapsedMs = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+
+        val m512 = FloatArray(6) { i -> m128[i] * 4.0f }
+        val alignedTarget512 = FaceAlignment.warpAffineCrop(tgtBmp, m512, 512)
+
+        // Benchmark A = inswapper_128, B = HyperSwap 1a, C = HyperSwap 1b, D = HyperSwap 1c
+        val reports = com.example.onnx.SwapModelCandidate.entries.map { candidate ->
+            com.example.onnx.InSwapperEngine.evaluateSwapQualityMetrics512(
+                candidate = candidate,
+                isModelInstalled = (candidate == com.example.onnx.SwapModelCandidate.A_INSWAPPER_128),
+                restored512 = restored512,
+                alignedTarget512 = alignedTarget512,
+                targetLandmarks5 = tgtFace.landmarks5,
+                forwardMatrix128 = m128,
+                processingTimeMs = elapsedMs
+            )
+        }
+
+        assertEquals(4, reports.size)
+        val reportA = reports.first { it.candidate == com.example.onnx.SwapModelCandidate.A_INSWAPPER_128 }
+        // Verify that the unwanted moustache shadow was eliminated (hasMoustacheArtifact == false)
+        assertTrue(
+            "Expected unwanted moustache artifact to be eliminated on moustache-free target (ratio=${reportA.outputPhiltrumToCheekRatio})",
+            !reportA.hasMoustacheArtifact && reportA.outputPhiltrumToCheekRatio >= 0.80f
+        )
+        assertTrue("Expected positive eye detail sharpness", reportA.eyeDetailSharpness > 0.1f)
+        assertTrue("Expected positive nose detail sharpness", reportA.noseDetailSharpness > 0.1f)
+        assertTrue("Expected positive mouth detail sharpness", reportA.mouthDetailSharpness > 0.1f)
+
+        restored512.recycle()
+        alignedTarget512.recycle()
+        swappedWithMoustache128.recycle()
     }
 }

@@ -391,7 +391,7 @@ object OnnxProtobufInspector {
                 ModelSlot.DETECTOR
             lower.contains("w600k") || lower.contains("arcface") || lower.contains("backbone50") ->
                 ModelSlot.RECOGNIZER
-            lower.contains("inswapper") ->
+            lower.contains("inswapper") || lower.contains("hyperswap") ->
                 ModelSlot.SWAPPER
             lower.contains("segformer") || lower.contains("bisenet") || lower.contains("face_parsing") ->
                 ModelSlot.SEGMENTATION
@@ -485,7 +485,13 @@ object OnnxProtobufInspector {
         val aliases = mapOf(
             ModelSlot.DETECTOR to listOf("det_10g.onnx", "scrfd_10g_bnkps.onnx", "det_2.5g.onnx"),
             ModelSlot.RECOGNIZER to listOf("w600k_r50.onnx", "w600k_mbf.onnx", "arcface.onnx"),
-            ModelSlot.SWAPPER to listOf("inswapper_128.onnx", "inswapper_128_fp16.onnx"),
+            ModelSlot.SWAPPER to listOf(
+                "inswapper_128.onnx",
+                "inswapper_128_fp16.onnx",
+                "hyperswap_1a_256.onnx",
+                "hyperswap_1b_256.onnx",
+                "hyperswap_1c_256.onnx"
+            ),
             ModelSlot.SEGMENTATION to listOf("segformer_B5_ce.onnx", "bisenet.onnx", "face_parsing.onnx"),
             ModelSlot.MATTING to listOf("modnet.onnx", "stylematte_synth.onnx"),
             ModelSlot.INPAINTING to listOf("lama_fp32.onnx", "big-lama.onnx", "lama.onnx"),

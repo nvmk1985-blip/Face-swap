@@ -218,4 +218,92 @@ object FaceAlignment {
 
         return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
     }
+
+    data class AlignedCropResult(
+        val croppedBitmap: Bitmap,
+        val forwardMatrix: FloatArray,
+        val inverseMatrix: FloatArray
+    )
+
+    fun alignCrop128(srcBitmap: Bitmap, landmarks5: List<PointF>): AlignedCropResult {
+        val m = estimateNorm(landmarks5, 128)
+        val inv = invertAffine2x3(m)
+        val crop = warpAffineCrop(srcBitmap, m, 128)
+        return AlignedCropResult(crop, m, inv)
+    }
+
+    fun alignCrop256(srcBitmap: Bitmap, landmarks5: List<PointF>): AlignedCropResult {
+        val m = estimateNorm(landmarks5, 256)
+        val inv = invertAffine2x3(m)
+        val crop = warpAffineCrop(srcBitmap, m, 256)
+        return AlignedCropResult(crop, m, inv)
+    }
+
+    fun alignCrop512(srcBitmap: Bitmap, landmarks5: List<PointF>): AlignedCropResult {
+        val m = estimateNorm(landmarks5, 512)
+        val inv = invertAffine2x3(m)
+        val crop = warpAffineCrop(srcBitmap, m, 512)
+        return AlignedCropResult(crop, m, inv)
+    }
+
+    /**
+     * 4x4 Catmull-Rom Bicubic interpolation sampler for high-resolution 512x512 -> Target warping,
+     * preserving crisp iris, eyelash, nostril, and lip vermilion micro-contrast without bilinear blur.
+     */
+    fun sampleBicubicClamped(
+        pixels: IntArray,
+        width: Int,
+        height: Int,
+        x: Float,
+        y: Float
+    ): Int {
+        val cx = x.coerceIn(0f, (width - 1).toFloat())
+        val cy = y.coerceIn(0f, (height - 1).toFloat())
+        val xInt = cx.toInt()
+        val yInt = cy.toInt()
+        val tx = cx - xInt
+        val ty = cy - yInt
+
+        fun cubicWeight(t: Float): FloatArray {
+            val t2 = t * t
+            val t3 = t2 * t
+            val w0 = -0.5f * t + t2 - 0.5f * t3
+            val w1 = 1.0f - 2.5f * t2 + 1.5f * t3
+            val w2 = 0.5f * t + 2.0f * t2 - 1.5f * t3
+            val w3 = -0.5f * t2 + 0.5f * t3
+            return floatArrayOf(w0, w1, w2, w3)
+        }
+
+        val wx = cubicWeight(tx)
+        val wy = cubicWeight(ty)
+
+        var rSum = 0f
+        var gSum = 0f
+        var bSum = 0f
+
+        for (j in -1..2) {
+            val py = (yInt + j).coerceIn(0, height - 1)
+            val rowOffset = py * width
+            val wyj = wy[j + 1]
+            var rRow = 0f
+            var gRow = 0f
+            var bRow = 0f
+            for (i in -1..2) {
+                val px = (xInt + i).coerceIn(0, width - 1)
+                val c = pixels[rowOffset + px]
+                val wxi = wx[i + 1]
+                rRow += ((c ushr 16) and 0xFF) * wxi
+                gRow += ((c ushr 8) and 0xFF) * wxi
+                bRow += (c and 0xFF) * wxi
+            }
+            rSum += rRow * wyj
+            gSum += gRow * wyj
+            bSum += bRow * wyj
+        }
+
+        val r = (rSum + 0.5f).toInt().coerceIn(0, 255)
+        val g = (gSum + 0.5f).toInt().coerceIn(0, 255)
+        val b = (bSum + 0.5f).toInt().coerceIn(0, 255)
+        return (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+    }
 }
