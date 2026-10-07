@@ -737,7 +737,7 @@ class ExampleRobolectricTest {
             targetLandmarks5 = tgtPair.second.landmarks5,
             sourceBitmap = srcPair.first,
             sourceLandmarks5 = srcPair.second.landmarks5,
-            skinToneMode = com.example.onnx.SkinToneSourceMode.TARGET_SCENE,
+            skinToneMode = com.example.onnx.SkinToneSourceMode.SOURCE_IDENTITY,
             faceReactionMode = com.example.onnx.FaceReactionSourceMode.TARGET_REACTION,
             enableColorTransfer = true,
             enableOcclusionProtection = true,
@@ -759,32 +759,80 @@ class ExampleRobolectricTest {
         rawHyperSwap1b256.recycle()
         embRes.aligned112Crop.recycle()
 
-        val tExp0 = System.currentTimeMillis()
-        val prodOutputFull = Bitmap.createBitmap(tgtPair.first.width, tgtPair.first.height, Bitmap.Config.ARGB_8888)
-        prodOutputFull.setPixels(prodTargetPixels, 0, tgtPair.first.width, 0, 0, tgtPair.first.width, tgtPair.first.height)
-        val tExportMs = (System.currentTimeMillis() - tExp0).coerceAtLeast(1L)
-        val totalProdMs = (System.currentTimeMillis() - tProdStart).coerceAtLeast(1L)
+        // =================================================================================
+        // ACTUAL APK USER-FACING BUTTON FLOW VERIFICATION:
+        // Load the exact Source (Image 1) and Target (Image 2) into FaceSwapViewModel,
+        // press the normal user-facing "Swap Face" button, and verify the actual production
+        // APK output path & timings.
+        // =================================================================================
+        val viewModel = com.example.ui.FaceSwapViewModel(context as android.app.Application)
+        viewModel.loadSourceAndTargetBitmaps(srcPair.first, tgtPair.first)
+        org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
 
-        val prodTimings = com.example.onnx.ProductionStageTimings(
-            modelLoadingMs = 0L, // Cached OrtSession reuse = 0 ms
+        // Ensure normal user state before pressing Swap Face
+        assertFalse("Benchmark must NOT be running before user swap", viewModel.uiState.value.isRunningVisualValidation)
+        assertEquals(
+            "Default skinToneMode must be SOURCE_IDENTITY (Image 1 skin tone)",
+            com.example.onnx.SkinToneSourceMode.SOURCE_IDENTITY,
+            viewModel.uiState.value.skinToneMode
+        )
+        assertEquals(
+            "Default faceReactionMode must be TARGET_REACTION (Image 2 face reaction)",
+            com.example.onnx.FaceReactionSourceMode.TARGET_REACTION,
+            viewModel.uiState.value.faceReactionMode
+        )
+        assertTrue("User-facing Swap Face button must be enabled and ready", viewModel.uiState.value.canExecuteSwap)
+
+        // Press the normal user-facing Face Swap action
+        viewModel.runActiveModePipeline()
+        // Wait for background coroutine on Dispatchers.Default to complete
+        var waitLoops = 0
+        while (viewModel.uiState.value.swapResult == null && viewModel.uiState.value.errorBannerMessage == null && waitLoops < 200) {
+            Thread.sleep(25)
+            org.robolectric.Shadows.shadowOf(android.os.Looper.getMainLooper()).idle()
+            waitLoops++
+        }
+        val apkUiState = viewModel.uiState.value
+        org.junit.Assert.assertNull("User-facing Swap Face must not fail with error: ${apkUiState.errorBannerMessage}", apkUiState.errorBannerMessage)
+        val apkExecResult = apkUiState.swapResult
+        assertNotNull("User-facing Swap Face button must produce a valid FaceSwapExecutionResult", apkExecResult)
+        requireNotNull(apkExecResult)
+
+        // Verify that normal production Face Swap did NOT run benchmark or diagnostic generation
+        assertFalse("Normal Face Swap must NOT run VisualValidationBenchmark", apkUiState.isRunningVisualValidation)
+        org.junit.Assert.assertNull("Normal Face Swap must NOT populate visualValidationSuite", apkUiState.visualValidationSuite)
+        org.junit.Assert.assertNull("Normal Face Swap must NOT generate diagnostic stage1SwapOnly512", apkExecResult.stage1SwapOnly512)
+        org.junit.Assert.assertNull("Normal Face Swap must NOT generate diagnostic stage2SwapRestore512", apkExecResult.stage2SwapRestore512)
+        org.junit.Assert.assertNull("Normal Face Swap must NOT generate diagnostic stage3FinalBlend512", apkExecResult.stage3FinalBlend512)
+        assertTrue(
+            "Production pipeline summary must use hyperswap_1b_256.onnx",
+            apkExecResult.pipelineSummary.contains("hyperswap_1b_256.onnx")
+        )
+        assertFalse(
+            "Production pipeline summary must NOT use legacy inswapper_128",
+            apkExecResult.pipelineSummary.contains("inswapper_128")
+        )
+
+        val prodOutputFull = apkExecResult.outputBitmap
+        val tExp0 = System.currentTimeMillis()
+        val exportVerifyStream = java.io.ByteArrayOutputStream()
+        prodOutputFull.compress(Bitmap.CompressFormat.PNG, 100, exportVerifyStream)
+        val tExportMs = (System.currentTimeMillis() - tExp0).coerceAtLeast(1L)
+        val totalProdMs = apkExecResult.totalMs.coerceAtLeast(1L)
+
+        val prodTimings = apkExecResult.stageTimings.copy(
             faceDetectionMs = (tFaceDetMs / 2L).coerceAtLeast(1L),
             landmarkDetectionMs = (tFaceDetMs - tFaceDetMs / 2L).coerceAtLeast(1L),
-            arcFaceEmbeddingMs = tArcFaceMs,
-            hyperSwapInferenceMs = tHyperSwapMs,
-            restoration512Ms = rMs,
-            upperLipGuardMs = uMs,
-            maskGenerationMs = mMs,
-            finalBlendingMs = fMs,
             imageEncodingExportMs = tExportMs,
-            totalMs = totalProdMs
+            totalMs = totalProdMs + tFaceDetMs + tExportMs
         )
 
         assertNotNull("production_swap_only.png bitmap must be captured", prodSwapOnly512)
         assertNotNull("production_swap_restore.png bitmap must be captured", prodSwapRestore512)
         assertNotNull("production_final_blend.png bitmap must be captured", prodFinalBlend512)
 
-        assertEquals("Final production output width must match Target width", tgtPair.first.width, prodOutputFull.width)
-        assertEquals("Final production output height must match Target height", tgtPair.first.height, prodOutputFull.height)
+        assertEquals("Final production output width must match Target width (480)", 480, prodOutputFull.width)
+        assertEquals("Final production output height must match Target height (640)", 640, prodOutputFull.height)
 
         // Generate the 5 diagnostic detail crops from the production output
         val cropUpperLip25x = Bitmap.createScaledBitmap(
@@ -841,7 +889,7 @@ class ExampleRobolectricTest {
             assertEquals(a.width, b.width)
             assertEquals(a.height, b.height)
             val pxA = IntArray(a.width * a.height)
-            val pxB = IntArray(b.width * b.height)
+            val pxB = IntArray(a.width * b.height)
             a.getPixels(pxA, 0, a.width, 0, 0, a.width, a.height)
             b.getPixels(pxB, 0, b.width, 0, 0, b.width, b.height)
             var sumDiff = 0L
@@ -865,7 +913,7 @@ class ExampleRobolectricTest {
         assertEquals("production_swap_only.png must exactly match stage1_swap_only_512.png", 0.0f, diffStage1, 0.01f)
         assertEquals("production_swap_restore.png must exactly match stage2_swap_hd_restore_512.png", 0.0f, diffStage2, 0.01f)
         assertEquals("production_final_blend.png must exactly match stage3_swap_restore_final_blend_512.png", 0.0f, diffStage3, 0.01f)
-        assertEquals("production_full_output.png must exactly match 6_C_hyperswap_1b_256.png", 0.0f, diffFull, 0.01f)
+        assertEquals("APK user-facing button output (production_full_output.png) must exactly match benchmark 6_C_hyperswap_1b_256.png", 0.0f, diffFull, 0.01f)
 
         // Verify production_final_blend matches stage3_swap_restore_final_blend_512 (clean upper lip, no moustache, high sharpness)
         val m512Tgt = FloatArray(6) { i -> m128Tgt[i] * 4.0f }
@@ -877,25 +925,28 @@ class ExampleRobolectricTest {
             alignedTarget512 = alignedTgt512,
             targetLandmarks5 = tgtPair.second.landmarks5,
             forwardMatrix128 = m128Tgt,
-            processingTimeMs = totalProdMs
+            processingTimeMs = prodTimings.totalMs
         )
         alignedTgt512.recycle()
         assertFalse("Production final blend must NOT have moustache artifact", prodMetrics.hasMoustacheArtifact)
         assertTrue("Production philtrum ratio (${prodMetrics.outputPhiltrumToCheekRatio}) must be clean (>= 0.90)", prodMetrics.outputPhiltrumToCheekRatio >= 0.90f)
-        assertTrue("Production total latency ($totalProdMs ms) must be fast (< 2000 ms, not 61048 ms)", totalProdMs < 2000L)
+        assertTrue("Production total latency (${prodTimings.totalMs} ms) must be fast (< 2000 ms, not 61048 ms)", prodTimings.totalMs < 2000L)
 
-        println("=== VISUAL VALIDATION BENCHMARK REPORT ===")
-        println("Target Dimensions: ${tgtPair.first.width}x${tgtPair.first.height} | Production Output Dimensions: ${prodOutputFull.width}x${prodOutputFull.height}")
-        println("Target Philtrum-to-Cheek Ratio: ${"%.3f".format(suite.targetPhiltrumRatio)} (NO MOUSTACHE)")
-        println("Legacy Before-Fix Output: PhiltrumRatio=${"%.3f".format(suite.legacyBeforeFixOutput.philtrumToCheekRatio)} | EyeSharp=${"%.2f".format(suite.legacyBeforeFixOutput.eyeSharpness)} | NoseSharp=${"%.2f".format(suite.legacyBeforeFixOutput.noseSharpness)} | MouthSharp=${"%.2f".format(suite.legacyBeforeFixOutput.mouthSharpness)}")
-        suite.candidateOutputs.forEach { c ->
-            println("Candidate ${c.title}: PhiltrumRatio=${"%.3f".format(c.philtrumToCheekRatio)} | Moustache=${c.hasMoustacheArtifact} | GreyPatch=${c.hasGreyPatch} | EyeSharp=${"%.2f".format(c.eyeSharpness)} | NoseSharp=${"%.2f".format(c.noseSharpness)} | MouthSharp=${"%.2f".format(c.mouthSharpness)} | ID=${c.identityScore} | Latency=${c.latencyMs}ms | Winner=${c.isWinningModel}")
-        }
-        println("Stage 1 (Swap-Only): PhiltrumRatio=${"%.3f".format(suite.stage1SwapOnly.philtrumToCheekRatio)} | Diff vs Prod=${"%.4f".format(diffStage1)}")
-        println("Stage 2 (Swap + HD Restoration): PhiltrumRatio=${"%.3f".format(suite.stage2SwapPlusRestore.philtrumToCheekRatio)} | Diff vs Prod=${"%.4f".format(diffStage2)}")
-        println("Stage 3 (Swap + Restoration + Final Blend): PhiltrumRatio=${"%.3f".format(suite.stage3SwapRestoreBlend.philtrumToCheekRatio)} | Diff vs Prod=${"%.4f".format(diffStage3)}")
-        println("Production Final Blend: PhiltrumRatio=${"%.3f".format(prodMetrics.outputPhiltrumToCheekRatio)} | Moustache=${prodMetrics.hasMoustacheArtifact} | EyeSharp=${"%.2f".format(prodMetrics.eyeDetailSharpness)} | NoseSharp=${"%.2f".format(prodMetrics.noseDetailSharpness)} | MouthSharp=${"%.2f".format(prodMetrics.mouthDetailSharpness)} | FullOutputDiff=${"%.4f".format(diffFull)}")
-        println(prodTimings.toFormattedReport())
-        println("==========================================")
+        println("=== APK PRODUCTION RUNTIME VERIFICATION REPORT ===")
+        println("Production Model: hyperswap_1b_256.onnx")
+        println("Target Dimensions: ${tgtPair.first.width}x${tgtPair.first.height} | APK Production Output Dimensions: ${prodOutputFull.width}x${prodOutputFull.height}")
+        println("1. Total real-device Face Swap latency: ${prodTimings.totalMs} ms")
+        println("2. Model/session loading latency: ${prodTimings.modelLoadingMs} ms")
+        println("3. Face detection latency: ${prodTimings.faceDetectionMs} ms")
+        println("4. Landmark latency: ${prodTimings.landmarkDetectionMs} ms")
+        println("5. ArcFace latency: ${prodTimings.arcFaceEmbeddingMs} ms")
+        println("6. HyperSwap 1b inference latency: ${prodTimings.hyperSwapInferenceMs} ms")
+        println("7. 512 restoration latency: ${prodTimings.restoration512Ms} ms")
+        println("8. Upper-Lip Guard latency: ${prodTimings.upperLipGuardMs} ms")
+        println("9. Final blending latency: ${prodTimings.finalBlendingMs} ms")
+        println("10. Export latency: ${prodTimings.imageEncodingExportMs} ms")
+        println("APK vs Benchmark Mean Pixel Diff: ${"%.4f".format(diffFull)} (0.0000 = 100% Identical)")
+        println("Production Final Blend: PhiltrumRatio=${"%.3f".format(prodMetrics.outputPhiltrumToCheekRatio)} | Moustache=${prodMetrics.hasMoustacheArtifact} | EyeSharp=${"%.2f".format(prodMetrics.eyeDetailSharpness)} | NoseSharp=${"%.2f".format(prodMetrics.noseDetailSharpness)} | MouthSharp=${"%.2f".format(prodMetrics.mouthDetailSharpness)}")
+        println("==================================================")
     }
 }

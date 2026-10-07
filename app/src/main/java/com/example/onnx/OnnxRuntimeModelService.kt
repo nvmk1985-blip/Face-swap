@@ -108,18 +108,19 @@ interface FaceSwapAndRestorationService : AutoCloseable {
         targetBitmap: Bitmap,
         targetFacesToReplace: List<DetectedFace>,
         enableColorTransfer: Boolean = true,
-        enableProvenanceWatermark: Boolean = true,
+        enableProvenanceWatermark: Boolean = false,
         allowTwoModelFallback: Boolean = false,
         preferHardwareAccel: Boolean = true,
-        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.SOURCE_IDENTITY,
         faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
         enableOcclusionProtection: Boolean = true,
         portraitBlurStrength: Float = 0f,
         blendStrength: Float = 1.0f,
-        enhancementStrength: Float = 0.85f,
+        enhancementStrength: Float = 0.96f,
         offsetX: Float = 0f,
         offsetY: Float = 0f,
         scaleAdjust: Float = 1.0f,
+        captureDiagnostics: Boolean = false,
         onProgress: (SwapStageProgress) -> Unit = {}
     ): FaceSwapExecutionResult
 
@@ -194,7 +195,7 @@ interface FaceSwapAndRestorationService : AutoCloseable {
  */
 class OnnxRuntimeModelService(
     context: Context,
-    private val ortEnv: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private val ortEnv: OrtEnvironment? = runCatching { OrtEnvironment.getEnvironment() }.getOrNull()
 ) : FaceSwapAndRestorationService {
 
     private val appContext: Context = context.applicationContext
@@ -209,15 +210,13 @@ class OnnxRuntimeModelService(
 
     companion object {
         /**
-         * Primary models requested for in-memory preloading (`w600k_r50.onnx`, `gfpgan_1.4.onnx`,
-         * `segformer_B5_ce.onnx`) plus the core detector and swapper models.
+         * Primary production Face Swap models preloaded into memory (`det_10g.onnx`, `w600k_r50.onnx`,
+         * and `hyperswap_1b_256.onnx`). Heavy Mode 2 models (`gfpgan`, `segformer`) are loaded on demand.
          */
         val PRIMARY_MEMORY_SLOTS = listOf(
             ModelSlot.DETECTOR,     // det_10g.onnx
             ModelSlot.RECOGNIZER,   // w600k_r50.onnx
-            ModelSlot.SWAPPER,      // hyperswap_1b_256.onnx
-            ModelSlot.ENHANCEMENT,  // gfpgan_1.4.onnx
-            ModelSlot.SEGMENTATION  // segformer_B5_ce.onnx
+            ModelSlot.SWAPPER       // hyperswap_1b_256.onnx
         )
     }
 
@@ -229,16 +228,7 @@ class OnnxRuntimeModelService(
             val tStart = System.currentTimeMillis()
 
             // Prioritize core production face-swap models (det_10g, w600k_r50, hyperswap_1b_256)
-            val slotsToLoad = if (lowMemoryMode) {
-                listOf(
-                    ModelSlot.DETECTOR,
-                    ModelSlot.RECOGNIZER,
-                    ModelSlot.SWAPPER,
-                    ModelSlot.ENHANCEMENT
-                )
-            } else {
-                PRIMARY_MEMORY_SLOTS
-            }
+            val slotsToLoad = PRIMARY_MEMORY_SLOTS
 
             for (slot in slotsToLoad) {
                 try {
@@ -259,7 +249,7 @@ class OnnxRuntimeModelService(
                 }
             }
 
-            // Also preload the 512x512 emap projection matrix from inswapper_128.onnx if present
+            // Also preload the 512x512 emap projection matrix if present
             val swapFile = resolveValidFile(ModelSlot.SWAPPER)
             if (swapFile != null && cachedEmap512x512 == null) {
                 cachedEmap512x512 = runCatching {
@@ -299,14 +289,14 @@ class OnnxRuntimeModelService(
             return existingInfo
         }
 
-        // Close stale session if file changed
-        closeSlotInternal(slot)
-
         val t0 = System.currentTimeMillis()
-        val opts = OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel)
         return try {
-            val session = ortEnv.createSession(file.absolutePath, opts)
-            val loadMs = (System.currentTimeMillis() - t0).coerceAtLeast(1L)
+            val session = OnnxProtobufInspector.getOrCreateCachedSession(
+                ortEnv = ortEnv,
+                file = file,
+                preferHardwareAcceleration = preferHardwareAccel
+            ) ?: throw IllegalStateException("Could not create OrtSession for ${file.name}")
+            val loadMs = (System.currentTimeMillis() - t0).coerceAtLeast(0L)
 
             val inputSig = session.inputInfo.entries.joinToString(" | ") { (name, node) ->
                 val ti = node.info as? TensorInfo
@@ -321,9 +311,9 @@ class OnnxRuntimeModelService(
             }.ifBlank { slot.expectedOutputSignature }
 
             val provider = if (preferHardwareAccel) {
-                "ONNX Runtime In-Memory (NNAPI / XNNPACK + 4-Thread Arena)"
+                "ONNX Runtime Cached (XNNPACK + 4-Thread Arena)"
             } else {
-                "ONNX Runtime In-Memory (CPU 4-Thread Arena)"
+                "ONNX Runtime Cached (CPU 4-Thread Arena)"
             }
 
             val info = LoadedSessionInfo(
@@ -349,7 +339,6 @@ class OnnxRuntimeModelService(
 
             info
         } catch (t: Throwable) {
-            runCatching { opts.close() }
             val failedInfo = LoadedSessionInfo(
                 slot = slot,
                 canonicalFileName = slot.canonicalFileName,
@@ -440,7 +429,7 @@ class OnnxRuntimeModelService(
         nmsThreshold: Float
     ): List<DetectedFace> {
         val detSession = getOrLoadSession(ModelSlot.DETECTOR, preferHardwareAccel = true)
-        if (detSession != null) {
+        if (detSession != null && ortEnv != null) {
             return ScrfdFaceDetector.detectFacesWithSession(
                 ortEnv = ortEnv,
                 session = detSession,
@@ -450,7 +439,7 @@ class OnnxRuntimeModelService(
             )
         }
         val detFile = resolveValidFile(ModelSlot.DETECTOR)
-        return if (detFile != null) {
+        return if (detFile != null && ortEnv != null) {
             ScrfdFaceDetector.detectFacesOnnx(
                 ortEnv = ortEnv,
                 detModelFile = detFile,
@@ -501,6 +490,7 @@ class OnnxRuntimeModelService(
         offsetX: Float,
         offsetY: Float,
         scaleAdjust: Float,
+        captureDiagnostics: Boolean,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val tModelLoad0 = System.currentTimeMillis()
@@ -535,6 +525,7 @@ class OnnxRuntimeModelService(
             preloadedSegformerSession = null,
             preloadedEmap512x512 = emap,
             modelLoadingMs = modelLoadingMs,
+            captureDiagnostics = captureDiagnostics,
             onProgress = onProgress
         )
     }

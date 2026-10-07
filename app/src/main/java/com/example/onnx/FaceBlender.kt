@@ -878,12 +878,12 @@ object FaceBlender {
         targetLandmarks5: List<PointF>,
         sourceBitmap: Bitmap? = null,
         sourceLandmarks5: List<PointF>? = null,
-        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.SOURCE_IDENTITY,
         faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
         enableColorTransfer: Boolean = true,
         enableOcclusionProtection: Boolean = true,
         blendStrength: Float = 1.0f,
-        enhancementStrength: Float = 0.85f,
+        enhancementStrength: Float = 0.96f,
         offsetX: Float = 0f,
         offsetY: Float = 0f,
         scaleAdjust: Float = 1.0f,
@@ -1611,7 +1611,8 @@ object FaceBlender {
                 val nx = (x - 256.0) / 136.0
                 if (nx * nx + ny * ny <= 1.0) {
                     if (computeEyeAndBrowProtectionWeight(x.toFloat(), y.toFloat(), geom512) > 0.12f) continue
-                    if (y in 320..412 && x in 164..348) continue
+                    // Strictly exclude nose base, philtrum/moustache arch, and mouth when sampling clean cheek/forehead skin
+                    if (y in 280..425 && x in 150..362) continue
 
                     val idx = y * HD_SIZE + x
                     val sc = swapPx512[idx]
@@ -1619,7 +1620,7 @@ object FaceBlender {
                     val dc = srcPx512?.get(idx) ?: sc
                     val tLum = 0.299 * (tc ushr 16 and 0xFF) + 0.587 * (tc ushr 8 and 0xFF) + 0.114 * (tc and 0xFF)
                     val dLum = 0.299 * (dc ushr 16 and 0xFF) + 0.587 * (dc ushr 8 and 0xFF) + 0.114 * (dc and 0xFF)
-                    if (tLum < 50.0 || dLum < 45.0) continue
+                    if (tLum < 50.0 || dLum < 55.0) continue
 
                     sRMean += (sc ushr 16) and 0xFF
                     sGMean += (sc ushr 8) and 0xFF
@@ -1658,7 +1659,7 @@ object FaceBlender {
                 val nx = (x - 256.0) / 136.0
                 if (nx * nx + ny * ny <= 1.0) {
                     if (computeEyeAndBrowProtectionWeight(x.toFloat(), y.toFloat(), geom512) > 0.12f) continue
-                    if (y in 320..412 && x in 164..348) continue
+                    if (y in 280..425 && x in 150..362) continue
                     val idx = y * HD_SIZE + x
                     val sc = swapPx512[idx]
                     val tc = tgtPx512[idx]
@@ -1694,9 +1695,9 @@ object FaceBlender {
                 tBMean * 0.96 + sBMean * 0.04
             )
             SkinToneSourceMode.SOURCE_IDENTITY -> Triple(
-                dRMean * 0.82 + tRMean * 0.18,
-                dGMean * 0.82 + tGMean * 0.18,
-                dBMean * 0.82 + tBMean * 0.18
+                dRMean * 0.85 + tRMean * 0.15,
+                dGMean * 0.85 + tGMean * 0.15,
+                dBMean * 0.85 + tBMean * 0.15
             )
             SkinToneSourceMode.BALANCED_BLEND -> Triple(
                 dRMean * 0.50 + tRMean * 0.50,
@@ -1711,7 +1712,7 @@ object FaceBlender {
 
         val strength = when (skinToneMode) {
             SkinToneSourceMode.TARGET_SCENE -> 0.94f
-            SkinToneSourceMode.SOURCE_IDENTITY -> 0.78f
+            SkinToneSourceMode.SOURCE_IDENTITY -> 0.88f
             SkinToneSourceMode.BALANCED_BLEND -> 0.86f
         }
 
@@ -1743,8 +1744,8 @@ object FaceBlender {
     }
 
     /**
-     * Preserves crisp 512x512 bright visible teeth enamel from the Target photo when
-     * `FaceReactionSourceMode.TARGET_REACTION` is active, without overwriting the swapped lip shape.
+     * Preserves crisp 512x512 Target mouth expression, visible teeth enamel, tongue, and smile reaction
+     * from the Target photo (Image 2) when `FaceReactionSourceMode.TARGET_REACTION` is active.
      */
     private fun preserveTargetMouthTeethAndTongue512(
         swapPx512: IntArray,
@@ -1759,7 +1760,7 @@ object FaceBlender {
         ).toFloat().coerceIn(72f, 220f)
 
         val rx = mouthWidth * 0.52f
-        val ry = mouthWidth * 0.32f
+        val ry = mouthWidth * 0.30f
         val minX = (mouthMidX - rx - 4f).toInt().coerceIn(8, HD_SIZE - 9)
         val maxX = (mouthMidX + rx + 4f).toInt().coerceIn(8, HD_SIZE - 9)
         val minY = (mouthMidY - ry - 4f).toInt().coerceIn(8, HD_SIZE - 9)
@@ -1770,7 +1771,7 @@ object FaceBlender {
             for (x in minX..maxX) {
                 val dSq = orientedEllipseDistSq(
                     x.toFloat(), y.toFloat(),
-                    mouthMidX, mouthMidY,
+                    mouthMidX, mouthMidY + 2f,
                     rx, ry,
                     geom512.cosA, geom512.sinA
                 )
@@ -1788,16 +1789,17 @@ object FaceBlender {
                 val minCh = min(tR, min(tG, tB))
                 val tSat = (maxCh - minCh).toFloat() / maxCh.toFloat()
 
-                // Only restore clearly visible bright white teeth enamel inside an open smile
-                val isVisibleTeeth = r <= 0.55f && tLum > 168f && tSat < 0.18f
+                // Restore visible bright white teeth enamel or open oral cavity inside Target's smile reaction
+                val isVisibleTeeth = r <= 0.60f && tLum > 148f && tSat < 0.22f
+                val isOpenOralCavity = r <= 0.52f && tLum < 52f
 
                 val sc = swapPx512[idx]
                 val sR = (sc ushr 16) and 0xFF
                 val sG = (sc ushr 8) and 0xFF
                 val sB = sc and 0xFF
 
-                if (isVisibleTeeth) {
-                    val directWeight = (0.45f * env).coerceIn(0f, 0.50f)
+                if (isVisibleTeeth || isOpenOralCavity) {
+                    val directWeight = (0.72f * env).coerceIn(0f, 0.78f)
                     val invW = 1.0f - directWeight
                     val outR = (sR * invW + tR * directWeight).toInt().coerceIn(0, 255)
                     val outG = (sG * invW + tG * directWeight).toInt().coerceIn(0, 255)
@@ -1873,7 +1875,7 @@ object FaceBlender {
 
     /**
      * Creates a landmark-fitted 512x512 Biometric Inner-Face Mask that:
-     *  - Covers 100% of the eyebrows, eyes, nose, lips, and inner cheeks (`innerCoreRatio = 0.56f`)
+     *  - Covers 100% of the eyebrows, eyes, nose, lips, and inner cheeks (`innerCoreRatio = 0.58f`)
      *  - Tapers smoothly along the outer cheek, forehead, and jawline contour (`radiusX = 1.12 * eyeDist`, `radiusY = 1.24 * eyeDist`)
      *  - Applies foreground hair/glasses occlusion protection strictly on the outer perimeter (`r > 0.54f`)
      *    so the inner swapped face is never suppressed and the swap box border never leaks onto hair/ears/neck.
@@ -1882,7 +1884,7 @@ object FaceBlender {
         geom512: WarpedFaceGeometry,
         tgtPx512: IntArray,
         swapPx512: IntArray,
-        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+        skinToneMode: SkinToneSourceMode = SkinToneSourceMode.SOURCE_IDENTITY,
         enableOcclusionProtection: Boolean = true,
         neuralOcclusionGate512: FloatArray? = null
     ): FloatArray {
@@ -1897,7 +1899,7 @@ object FaceBlender {
 
         val radiusX = (geom512.eyeDist * 1.12f).coerceIn(136f, 174f)
         val radiusY = (geom512.eyeDist * 1.24f).coerceIn(152f, 194f)
-        val innerCoreRatio = if (skinToneMode == SkinToneSourceMode.SOURCE_IDENTITY) 0.52f else 0.56f
+        val innerCoreRatio = 0.58f
         val borderMargin = 24
 
         for (y in 0 until HD_SIZE) {

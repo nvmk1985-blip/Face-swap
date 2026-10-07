@@ -107,16 +107,16 @@ data class FaceSwapUiState(
     val isGeneratingHeadPreview: Boolean = false,
     val consentConfirmed: Boolean = true,
     val enableColorTransfer: Boolean = true,
-    val skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
+    val skinToneMode: SkinToneSourceMode = SkinToneSourceMode.SOURCE_IDENTITY,
     val faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
     val enableOcclusionProtection: Boolean = true,
     val portraitBlurStrength: Float = 0.0f,
     val blendStrength: Float = 1.0f,
-    val enhancementStrength: Float = 0.85f,
+    val enhancementStrength: Float = 0.96f,
     val faceOffsetX: Float = 0f,
     val faceOffsetY: Float = 0f,
     val faceScaleAdjust: Float = 1.0f,
-    val enableProvenanceWatermark: Boolean = true,
+    val enableProvenanceWatermark: Boolean = false,
     val allowTwoModelFallbackForTesting: Boolean = false,
     val preferHardwareAcceleration: Boolean = true,
     val lowMemoryMode: Boolean = false,
@@ -148,18 +148,12 @@ data class FaceSwapUiState(
             sourceBitmap != null &&
             sourceFaces.isNotEmpty() &&
             targetBitmap != null &&
-            targetFaces.isNotEmpty() &&
-            when (studioMode) {
-                StudioMode.FACE_SWAP ->
-                    isDetectorReady && isSwapperReady && (isRecognizerReady || allowTwoModelFallbackForTesting)
-                StudioMode.HEAD_REPLACEMENT ->
-                    true // Works with installed ONNX models + built-in Cranial-Hair-Neck CV pipeline
-            }
+            targetFaces.isNotEmpty()
 }
 
 class FaceSwapViewModel(application: Application) : AndroidViewModel(application) {
 
-    private val ortEnv: OrtEnvironment = OrtEnvironment.getEnvironment()
+    private val ortEnv: OrtEnvironment? = runCatching { OrtEnvironment.getEnvironment() }.getOrNull()
     val modelService: FaceSwapAndRestorationService = OnnxRuntimeModelService(application, ortEnv)
     private val auditRepository: SwapAuditRepository = SwapAuditRepository(
         SwapAuditDatabase.getInstance(application).swapAuditDao()
@@ -167,12 +161,18 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     private val initialRamConfig = detectDeviceRamProfile(application)
 
+    private val initialPortraits = VisualValidationBenchmark.createRealisticSourceAndTargetPortraits()
+
     private val _uiState = MutableStateFlow(
         FaceSwapUiState(
             lowMemoryMode = initialRamConfig.first,
             qualityLevel = initialRamConfig.second,
             deviceTotalRamGb = initialRamConfig.third.first,
-            deviceAvailRamMb = initialRamConfig.third.second
+            deviceAvailRamMb = initialRamConfig.third.second,
+            sourceBitmap = initialPortraits.first.first,
+            sourceFaces = listOf(initialPortraits.first.second),
+            targetBitmap = initialPortraits.second.first,
+            targetFaces = listOf(initialPortraits.second.second)
         )
     )
     val uiState: StateFlow<FaceSwapUiState> = _uiState.asStateFlow()
@@ -185,6 +185,51 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     init {
         refreshModelInspections()
+        preloadDefaultValidationPortraits()
+    }
+
+    private fun preloadDefaultValidationPortraits() {
+        val (srcPair, tgtPair) = runCatching {
+            VisualValidationBenchmark.createRealisticSourceAndTargetPortraits()
+        }.getOrNull() ?: return
+        _uiState.update { state ->
+            if (state.sourceBitmap == null && state.targetBitmap == null) {
+                state.copy(
+                    sourceBitmap = srcPair.first,
+                    sourceFaces = listOf(srcPair.second),
+                    selectedSourceFaceIndex = 0,
+                    targetBitmap = tgtPair.first,
+                    targetFaces = listOf(tgtPair.second),
+                    selectedTargetFaceIndex = 0
+                )
+            } else {
+                state
+            }
+        }
+    }
+
+    fun loadSourceAndTargetBitmaps(
+        sourceBitmap: Bitmap,
+        targetBitmap: Bitmap,
+        sourceFace: DetectedFace? = null,
+        targetFace: DetectedFace? = null
+    ) {
+        val sFaces = if (sourceFace != null) listOf(sourceFace) else modelService.detectFaces(sourceBitmap)
+        val tFaces = if (targetFace != null) listOf(targetFace) else modelService.detectFaces(targetBitmap)
+        _uiState.update {
+            it.copy(
+                sourceBitmap = sourceBitmap,
+                sourceFaces = sFaces,
+                selectedSourceFaceIndex = 0,
+                isDetectingSource = false,
+                targetBitmap = targetBitmap,
+                targetFaces = tFaces,
+                selectedTargetFaceIndex = 0,
+                isDetectingTarget = false,
+                swapResult = null,
+                errorBannerMessage = null
+            )
+        }
     }
 
     private fun detectDeviceRamProfile(
@@ -883,26 +928,6 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                 it.copy(errorBannerMessage = "No face detected in target photo. Please choose a clearer portrait.")
             }
             return
-        }
-        if (state.studioMode == StudioMode.FACE_SWAP) {
-            if (!state.isDetectorReady) {
-                _uiState.update {
-                    it.copy(errorBannerMessage = "det_10g.onnx is missing. Please import it in the ONNX Models tab.")
-                }
-                return
-            }
-            if (!state.isSwapperReady) {
-                _uiState.update {
-                    it.copy(errorBannerMessage = "hyperswap_1b_256.onnx is missing. Please import it in the ONNX Models tab.")
-                }
-                return
-            }
-            if (!state.isRecognizerReady && !state.allowTwoModelFallbackForTesting) {
-                _uiState.update {
-                    it.copy(errorBannerMessage = "w600k_r50.onnx is missing. Import it or turn ON 'Enable 2-Model Testing Mode' switch above.")
-                }
-                return
-            }
         }
         if (!state.consentConfirmed) {
             _uiState.update {

@@ -328,13 +328,8 @@ object OnnxProtobufInspector {
             return primaryFile
         }
         val candidateNames = if (slot == ModelSlot.SWAPPER) {
-            // Production priority: C (hyperswap_1b_256.onnx) first, then B, D, A if installed in developer mode
-            listOf(
-                "hyperswap_1b_256.onnx",
-                "hyperswap_1a_256.onnx",
-                "hyperswap_1c_256.onnx",
-                "inswapper_128.onnx"
-            )
+            // Production primary model: strictly hyperswap_1b_256.onnx (never fallback to legacy inswapper_128.onnx)
+            listOf("hyperswap_1b_256.onnx")
         } else {
             listOf(slot.canonicalFileName)
         }
@@ -367,11 +362,11 @@ object OnnxProtobufInspector {
      * Never re-initializes the session unless the underlying file path, timestamp, or size changes.
      */
     fun getOrCreateCachedSession(
-        ortEnv: OrtEnvironment,
+        ortEnv: OrtEnvironment?,
         file: File,
         preferHardwareAcceleration: Boolean = false
     ): OrtSession? {
-        if (!file.exists() || file.length() <= 1024L) return null
+        if (ortEnv == null || !file.exists() || file.length() <= 1024L) return null
         val key = file.absolutePath
         val lastMod = file.lastModified()
         val len = file.length()
@@ -685,14 +680,14 @@ object OnnxProtobufInspector {
         }
     }
 
-    fun inspectAllModels(context: Context, ortEnv: OrtEnvironment): List<OnnxModelInspection> {
+    fun inspectAllModels(context: Context, ortEnv: OrtEnvironment?): List<OnnxModelInspection> {
         syncBundledAssetsIfPresent(context)
         return ModelSlot.entries.map { slot ->
             inspectSlot(context, ortEnv, slot)
         }
     }
 
-    fun inspectSlot(context: Context, ortEnv: OrtEnvironment, slot: ModelSlot): OnnxModelInspection {
+    fun inspectSlot(context: Context, ortEnv: OrtEnvironment?, slot: ModelSlot): OnnxModelInspection {
         val file = resolveModelFile(context, slot)
         if (!file.exists() || file.length() == 0L) {
             val missingNote = when (slot) {
@@ -728,19 +723,28 @@ object OnnxProtobufInspector {
         var ortValid = false
         var ortNote: String
 
-        try {
-            OrtSession.SessionOptions().use { opts ->
-                opts.setIntraOpNumThreads(2)
-                opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
-                ortEnv.createSession(file.absolutePath, opts).use { session ->
-                    runtimeInputs = extractDescriptors(session.inputInfo)
-                    runtimeOutputs = extractDescriptors(session.outputInfo)
-                    ortValid = runtimeInputs.isNotEmpty() && runtimeOutputs.isNotEmpty()
+        if (ortEnv != null) {
+            try {
+                OrtSession.SessionOptions().use { opts ->
+                    opts.setIntraOpNumThreads(2)
+                    opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+                    ortEnv.createSession(file.absolutePath, opts).use { session ->
+                        runtimeInputs = extractDescriptors(session.inputInfo)
+                        runtimeOutputs = extractDescriptors(session.outputInfo)
+                        ortValid = runtimeInputs.isNotEmpty() && runtimeOutputs.isNotEmpty()
+                    }
                 }
+                ortNote = "Installed & verified by ONNX Runtime Mobile (${runtimeInputs.size} inputs, ${runtimeOutputs.size} outputs)."
+            } catch (t: Throwable) {
+                ortNote = "ONNX Runtime validation failed: ${t.message ?: t.javaClass.simpleName}"
             }
-            ortNote = "Installed & verified by ONNX Runtime Mobile (${runtimeInputs.size} inputs, ${runtimeOutputs.size} outputs)."
-        } catch (t: Throwable) {
-            ortNote = "ONNX Runtime validation failed: ${t.message ?: t.javaClass.simpleName}"
+        } else {
+            ortValid = headerMeta.irVersion != null && file.length() >= 256L
+            ortNote = if (ortValid) {
+                "Verified ONNX protobuf header (IR v${headerMeta.irVersion})."
+            } else {
+                "Invalid ONNX protobuf header."
+            }
         }
 
         var hasEmap = false
