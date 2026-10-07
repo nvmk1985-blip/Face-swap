@@ -1,12 +1,12 @@
 <resources>
     <string name="app_name">FaceSwap Studio</string>
-    <string name="subtitle_offline_engine">100% Offline Face Swap &amp; GHOST Head Replacement</string>
-    <string name="tab_studio">Swap Studio</string>
-    <string name="tab_models">Model Status</string>
-    <string name="tab_history">History &amp; Audit</string>
-    <string name="tab_ethics">Safety &amp; Licenses</string>
+    <string name="subtitle_offline_engine">100% Offline • On-Device AI</string>
+    <string name="tab_studio">Swap</string>
+    <string name="tab_models">Models</string>
+    <string name="tab_history">History</string>
+    <string name="tab_ethics">Safety</string>
     <string name="mode_face_swap">Face Swap</string>
-    <string name="mode_head_replacement">Head Replacement</string>
+    <string name="mode_head_replacement">Full Head Replacement</string>
     <string name="btn_select_source">Select Photo</string>
     <string name="btn_select_target">Select Photo</string>
     <string name="btn_detect_head">Detect Head</string>

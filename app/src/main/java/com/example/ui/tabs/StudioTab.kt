@@ -82,9 +82,12 @@ import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.input.pointer.pointerInput
+import androidx.activity.compose.BackHandler
+import androidx.compose.material.icons.automirrored.filled.ArrowBack
 import com.example.ui.OutputResolutionOption
 import com.example.ui.ProcessingQualityLevel
 import com.example.ui.StudioMode
+import com.example.ui.StudioSubPage
 import com.example.ui.components.FaceDetectionCanvas
 import com.example.ui.theme.AmberWarning
 import com.example.ui.theme.ElectricCyan
@@ -134,9 +137,44 @@ fun StudioTab(
     onBrowseTargetFile: () -> Unit = onPickTargetPhoto,
     onRunVisualValidation: () -> Unit = {},
     onSaveValidationSheet: (Boolean) -> Unit = {},
+    onSelectStudioSubPage: (StudioSubPage) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
+    // Front Page: Clean, focused UI matching the user's reference design
+    if (uiState.studioSubPage == StudioSubPage.FRONT_HOME) {
+        StudioFrontPage(
+            uiState = uiState,
+            onSelectStudioMode = onSelectStudioMode,
+            onPickSourcePhoto = onPickSourcePhoto,
+            onPickTargetPhoto = onPickTargetPhoto,
+            onDetectFaces = onDetectHead,
+            onPreviewAlignmentPage = {
+                if (uiState.sourceBitmap != null && uiState.targetBitmap != null) {
+                    onPreviewHead()
+                }
+                onSelectStudioSubPage(StudioSubPage.ALIGNMENT_PREVIEW)
+            },
+            onOpenSettingsPage = {
+                onSelectStudioSubPage(StudioSubPage.SETTINGS_AND_DIAGNOSTICS)
+            },
+            onRunSwap = onRunSwap,
+            onDownloadHd = onSaveHdToGallery,
+            onSaveToGallery = onSaveToGallery,
+            onInspectResultDetails = {
+                onSelectStudioSubPage(StudioSubPage.ALIGNMENT_PREVIEW)
+            },
+            modifier = modifier
+        )
+        return
+    }
+
+    // Secondary Pages ("மற்றவற்றை வேறு page இல் வை"): Settings, Fine-Tuning, Alignment & Visual Validation
+    BackHandler {
+        onSelectStudioSubPage(StudioSubPage.FRONT_HOME)
+    }
+
     val isHeadMode = uiState.studioMode == StudioMode.HEAD_REPLACEMENT
+    val isSettingsPage = uiState.studioSubPage == StudioSubPage.SETTINGS_AND_DIAGNOSTICS
 
     Column(
         modifier = modifier
@@ -152,363 +190,298 @@ fun StudioTab(
                 .widthIn(max = 640.dp),
             verticalArrangement = Arrangement.spacedBy(16.dp)
         ) {
-            // Mode Switcher: MODE 1 (Face Swap) vs MODE 2 (Head Replacement)
-            StudioModeSwitcherCard(
-                currentMode = uiState.studioMode,
-                onSelectMode = onSelectStudioMode
-            )
-
-            // Hero Studio Banner + Pipeline Status
-            HeroPipelineStatusCard(
-                uiState = uiState,
-                onOpenModelsTab = onOpenModelsTab
-            )
-
-            // 1. Source Photo Selection Card (SOURCE FACE vs SOURCE HEAD)
-            PhotoSelectionCard(
-                title = if (isHeadMode) "SOURCE HEAD" else "1. Source Identity Face",
-                subtitle = if (isHeadMode) {
-                    "Head, hair, skull structure & upper neck to transfer"
-                } else {
-                    "Select photo containing the donor face identity (112x112 -> 512-D embedding)"
-                },
-                buttonLabel = stringResource(R.string.btn_select_source),
-                buttonTestTag = "select_source_photo_button",
-                browseTestTag = "browse_source_file_button",
-                bitmap = uiState.sourceBitmap,
-                faces = uiState.sourceFaces,
-                selectedFaceIndex = uiState.selectedSourceFaceIndex,
-                replaceAllFaces = false,
-                showCranialHeadBounds = isHeadMode,
-                isDetecting = uiState.isDetectingSource,
-                onPickPhoto = onPickSourcePhoto,
-                onBrowseFile = onBrowseSourceFile,
-                onSelectFace = onSelectSourceFace,
-                showMultiFaceToggle = false,
-                onToggleMultiFace = {}
-            )
-
-            // 2. Target Photo Selection Card
-            PhotoSelectionCard(
-                title = if (isHeadMode) "TARGET PHOTO" else "2. Target Scene Photo",
-                subtitle = if (isHeadMode) {
-                    "Body, pose, clothing & background to preserve (tap head to replace)"
-                } else {
-                    "Select target photo and tap any detected face to replace"
-                },
-                buttonLabel = stringResource(R.string.btn_select_target),
-                buttonTestTag = "select_target_photo_button",
-                browseTestTag = "browse_target_file_button",
-                bitmap = uiState.targetBitmap,
-                faces = uiState.targetFaces,
-                selectedFaceIndex = uiState.selectedTargetFaceIndex,
-                replaceAllFaces = uiState.replaceAllTargetFaces,
-                showCranialHeadBounds = isHeadMode,
-                isDetecting = uiState.isDetectingTarget,
-                onPickPhoto = onPickTargetPhoto,
-                onBrowseFile = onBrowseTargetFile,
-                onSelectFace = onSelectTargetFace,
-                showMultiFaceToggle = uiState.targetFaces.size > 1,
-                onToggleMultiFace = onToggleReplaceAllFaces
-            )
-
-            // [ Detect ] and [ Preview ] Controls (Available in BOTH Mode 1 & Mode 2)
-            Row(
+            // Top Secondary Page Navigation Bar: Back to Front Page + Sub-Page Switcher
+            Card(
                 modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.spacedBy(12.dp)
+                shape = RoundedCornerShape(16.dp),
+                colors = CardDefaults.cardColors(
+                    containerColor = Color(0xFF101932)
+                )
             ) {
-                OutlinedButton(
-                    onClick = onDetectHead,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .testTag("detect_head_button"),
-                    shape = RoundedCornerShape(12.dp)
+                Column(
+                    modifier = Modifier.padding(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
                 ) {
-                    Icon(
-                        imageVector = Icons.Default.Radar,
-                        contentDescription = stringResource(R.string.btn_detect_head),
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(if (isHeadMode) stringResource(R.string.btn_detect_head) else "Detect Faces")
-                }
-
-                OutlinedButton(
-                    onClick = onPreviewHead,
-                    enabled = !uiState.isGeneratingHeadPreview,
-                    modifier = Modifier
-                        .weight(1f)
-                        .height(48.dp)
-                        .testTag("preview_head_button"),
-                    shape = RoundedCornerShape(12.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Preview,
-                        contentDescription = stringResource(R.string.btn_preview_head),
-                        modifier = Modifier.size(18.dp)
-                    )
-                    Spacer(modifier = Modifier.width(6.dp))
-                    Text(
-                        if (uiState.isGeneratingHeadPreview) {
-                            "Segmenting..."
-                        } else {
-                            "Preview Alignment"
-                        }
-                    )
-                }
-            }
-
-            // Live Head / Hair / Neck Segmentation & Cranial Alignment Preview
-            uiState.headPreviewState?.let { preview ->
-                Card(
-                    modifier = Modifier.fillMaxWidth(),
-                    shape = RoundedCornerShape(16.dp),
-                    colors = CardDefaults.cardColors(
-                        containerColor = MaterialTheme.colorScheme.surface
-                    )
-                ) {
-                    Column(
-                        modifier = Modifier.padding(14.dp),
-                        verticalArrangement = Arrangement.spacedBy(10.dp)
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
                     ) {
+                        OutlinedButton(
+                            onClick = { onSelectStudioSubPage(StudioSubPage.FRONT_HOME) },
+                            shape = RoundedCornerShape(10.dp),
+                            modifier = Modifier.testTag("btn_back_to_front_page")
+                        ) {
+                            Icon(
+                                imageVector = Icons.AutoMirrored.Filled.ArrowBack,
+                                contentDescription = "Back to Front Page",
+                                modifier = Modifier.size(18.dp)
+                            )
+                            Spacer(modifier = Modifier.width(6.dp))
+                            Text("Back to Swap Page")
+                        }
+
                         Text(
-                            text = "Head / Hair / Neck Segmentation & Pose Preview",
-                            style = MaterialTheme.typography.titleMedium,
+                            text = if (isSettingsPage) "Skin Tone & Settings" else "Alignment & Diagnostics",
+                            style = MaterialTheme.typography.titleSmall,
+                            fontWeight = FontWeight.Bold,
                             color = ElectricCyan
                         )
-                        Text(
-                            text = "Parser: ${preview.segmentationLabel}",
-                            style = MaterialTheme.typography.labelMedium,
-                            color = NeonEmerald
+                    }
+
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = isSettingsPage,
+                            onClick = { onSelectStudioSubPage(StudioSubPage.SETTINGS_AND_DIAGNOSTICS) },
+                            label = { Text("Skin Tone & Settings") },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("subpage_tab_settings")
                         )
-                        Row(
-                            modifier = Modifier.fillMaxWidth(),
-                            horizontalArrangement = Arrangement.SpaceEvenly
-                        ) {
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Image(
-                                    bitmap = preview.segmentedSourceHeadBitmap.asImageBitmap(),
-                                    contentDescription = "Segmented Source Head & Hair Mask",
-                                    modifier = Modifier
-                                        .size(128.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .border(
-                                            1.5.dp,
-                                            ElectricCyan,
-                                            RoundedCornerShape(12.dp)
-                                        )
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = "Source Matte (${"%.1f".format(preview.sourceRollDeg)}°)",
-                                    style = MaterialTheme.typography.labelMedium
-                                )
-                            }
-                            Column(horizontalAlignment = Alignment.CenterHorizontally) {
-                                Image(
-                                    bitmap = preview.alignedTargetHeadBitmap.asImageBitmap(),
-                                    contentDescription = "Aligned Target Head Region",
-                                    modifier = Modifier
-                                        .size(128.dp)
-                                        .clip(RoundedCornerShape(12.dp))
-                                        .border(
-                                            1.5.dp,
-                                            RoyalViolet,
-                                            RoundedCornerShape(12.dp)
-                                        )
-                                )
-                                Spacer(modifier = Modifier.height(4.dp))
-                                Text(
-                                    text = "Target Pose (${"%.1f".format(preview.targetRollDeg)}°)",
-                                    style = MaterialTheme.typography.labelMedium
-                                )
-                            }
-                        }
+                        FilterChip(
+                            selected = !isSettingsPage,
+                            onClick = { onSelectStudioSubPage(StudioSubPage.ALIGNMENT_PREVIEW) },
+                            label = { Text("Alignment & Inspector") },
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("subpage_tab_alignment")
+                        )
                     }
                 }
             }
 
-            // 2b. Skin Tone (Source vs Target) & Face Reaction (Smile, Visible Teeth, Visible Tongue) Selector Card
-            SkinToneAndReactionSelectorCard(
-                skinToneMode = uiState.skinToneMode,
-                faceReactionMode = uiState.faceReactionMode,
-                onSkinToneModeChanged = onSkinToneModeChanged,
-                onFaceReactionModeChanged = onFaceReactionModeChanged
-            )
+            if (isSettingsPage) {
+                // Page A: Skin Tone, Face Reaction, Quality, Blending Sliders, Safeguards & Engine Status
+                SkinToneAndReactionSelectorCard(
+                    skinToneMode = uiState.skinToneMode,
+                    faceReactionMode = uiState.faceReactionMode,
+                    onSkinToneModeChanged = onSkinToneModeChanged,
+                    onFaceReactionModeChanged = onFaceReactionModeChanged
+                )
 
-            // 2c. Quality Levels (FAST / BALANCED / HIGH QUALITY) + Fine-Tune Studio Controls
-            QualityAndFineTuneControlsCard(
-                uiState = uiState,
-                onQualityLevelChanged = onQualityLevelChanged,
-                onOutputResolutionChanged = onOutputResolutionChanged,
-                onBlendStrengthChanged = onBlendStrengthChanged,
-                onEnhancementStrengthChanged = onEnhancementStrengthChanged,
-                onOcclusionProtectionChanged = onOcclusionProtectionChanged,
-                onPortraitBlurStrengthChanged = onPortraitBlurStrengthChanged,
-                onFaceOffsetXChanged = onFaceOffsetXChanged,
-                onFaceOffsetYChanged = onFaceOffsetYChanged,
-                onFaceScaleChanged = onFaceScaleChanged,
-                onResetAdjustments = onResetAdjustments
-            )
+                QualityAndFineTuneControlsCard(
+                    uiState = uiState,
+                    onQualityLevelChanged = onQualityLevelChanged,
+                    onOutputResolutionChanged = onOutputResolutionChanged,
+                    onBlendStrengthChanged = onBlendStrengthChanged,
+                    onEnhancementStrengthChanged = onEnhancementStrengthChanged,
+                    onOcclusionProtectionChanged = onOcclusionProtectionChanged,
+                    onPortraitBlurStrengthChanged = onPortraitBlurStrengthChanged,
+                    onFaceOffsetXChanged = onFaceOffsetXChanged,
+                    onFaceOffsetYChanged = onFaceOffsetYChanged,
+                    onFaceScaleChanged = onFaceScaleChanged,
+                    onResetAdjustments = onResetAdjustments
+                )
 
-            // 3. Performance, Blending & Ethical Consent Card
-            SafeguardsAndBlendingCard(
-                uiState = uiState,
-                onConsentChanged = onConsentChanged,
-                onColorTransferChanged = onColorTransferChanged,
-                onWatermarkChanged = onWatermarkChanged,
-                onTwoModelFallbackChanged = onTwoModelFallbackChanged,
-                onHardwareAccelChanged = onHardwareAccelChanged,
-                onLowMemoryChanged = onLowMemoryChanged
-            )
+                SafeguardsAndBlendingCard(
+                    uiState = uiState,
+                    onConsentChanged = onConsentChanged,
+                    onColorTransferChanged = onColorTransferChanged,
+                    onWatermarkChanged = onWatermarkChanged,
+                    onTwoModelFallbackChanged = onTwoModelFallbackChanged,
+                    onHardwareAccelChanged = onHardwareAccelChanged,
+                    onLowMemoryChanged = onLowMemoryChanged
+                )
 
-            // 3b. Checklist showing exactly what is required to enable the action button
-            if (!uiState.canExecuteSwap && !uiState.isSwapping) {
-                SwapRequirementsCard(
+                HeroPipelineStatusCard(
                     uiState = uiState,
                     onOpenModelsTab = onOpenModelsTab
                 )
-            }
 
-            // 4. Primary Action Button: [ REPLACE HEAD ] or [ Run Offline Face Swap ]
-            Button(
-                onClick = onRunSwap,
-                enabled = !uiState.isSwapping,
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(56.dp)
-                    .testTag("run_face_swap_button"),
-                shape = RoundedCornerShape(14.dp),
-                colors = ButtonDefaults.buttonColors(
-                    containerColor = when {
-                        !uiState.canExecuteSwap -> MaterialTheme.colorScheme.surfaceVariant
-                        isHeadMode -> NeonEmerald
-                        else -> ElectricCyan
-                    },
-                    contentColor = if (!uiState.canExecuteSwap) AmberWarning else ObsidianBg
-                )
-            ) {
-                if (uiState.isSwapping) {
-                    CircularProgressIndicator(
-                        modifier = Modifier.size(22.dp),
-                        color = ObsidianBg,
-                        strokeWidth = 2.5.dp
-                    )
-                    Spacer(modifier = Modifier.width(12.dp))
-                    Text(
-                        text = if (isHeadMode) {
-                            "Replacing Head, Hair & Neck..."
-                        } else {
-                            "Running Offline ONNX Inference..."
-                        },
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
-                    )
-                } else if (!uiState.canExecuteSwap) {
-                    Icon(
-                        imageVector = Icons.Default.WarningAmber,
-                        contentDescription = null,
-                        tint = AmberWarning
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = "Complete Checklist Above (Tap to Check)",
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold,
-                        color = AmberWarning
-                    )
-                } else {
-                    Icon(
-                        imageVector = Icons.Default.AutoFixHigh,
-                        contentDescription = null
-                    )
-                    Spacer(modifier = Modifier.width(10.dp))
-                    Text(
-                        text = if (isHeadMode) {
-                            stringResource(R.string.btn_replace_head)
-                        } else {
-                            stringResource(R.string.btn_run_swap)
-                        },
-                        style = MaterialTheme.typography.titleMedium,
-                        fontWeight = FontWeight.Bold
+                if (!uiState.canExecuteSwap && !uiState.isSwapping) {
+                    SwapRequirementsCard(
+                        uiState = uiState,
+                        onOpenModelsTab = onOpenModelsTab
                     )
                 }
-            }
+            } else {
+                // Page B: Alignment Preview, Multi-Face Selection, Interactive Before/After & Visual Validation
+                uiState.swapResult?.let {
+                    SwapResultCard(
+                        uiState = uiState,
+                        onToggleCompareOriginal = onToggleCompareOriginal,
+                        onSaveToGallery = onSaveToGallery,
+                        onSaveHdToGallery = onSaveHdToGallery,
+                        onShareResult = onShareResult,
+                        onRotateResult90 = onRotateResult90,
+                        onCropResultAspect = onCropResultAspect
+                    )
+                }
 
-            // Processing Progress Stages
-            AnimatedVisibility(visible = uiState.swapProgress != null) {
-                uiState.swapProgress?.let { prog ->
+                // 1. Source Photo Selection & 5-Point Landmark Overlay Card
+                PhotoSelectionCard(
+                    title = if (isHeadMode) "SOURCE HEAD" else "1. Source Identity Face & Landmarks",
+                    subtitle = if (isHeadMode) {
+                        "Head, hair, skull structure & upper neck to transfer"
+                    } else {
+                        "Select photo containing the donor face identity (112x112 -> 512-D embedding)"
+                    },
+                    buttonLabel = stringResource(R.string.btn_select_source),
+                    buttonTestTag = "select_source_photo_button",
+                    browseTestTag = "browse_source_file_button",
+                    bitmap = uiState.sourceBitmap,
+                    faces = uiState.sourceFaces,
+                    selectedFaceIndex = uiState.selectedSourceFaceIndex,
+                    replaceAllFaces = false,
+                    showCranialHeadBounds = isHeadMode,
+                    isDetecting = uiState.isDetectingSource,
+                    onPickPhoto = onPickSourcePhoto,
+                    onBrowseFile = onBrowseSourceFile,
+                    onSelectFace = onSelectSourceFace,
+                    showMultiFaceToggle = false,
+                    onToggleMultiFace = {}
+                )
+
+                // 2. Target Photo Selection & Multi-Face Selector Card
+                PhotoSelectionCard(
+                    title = if (isHeadMode) "TARGET PHOTO" else "2. Target Scene Photo & Landmarks",
+                    subtitle = if (isHeadMode) {
+                        "Body, pose, clothing & background to preserve (tap head to replace)"
+                    } else {
+                        "Select target photo and tap any detected face to replace"
+                    },
+                    buttonLabel = stringResource(R.string.btn_select_target),
+                    buttonTestTag = "select_target_photo_button",
+                    browseTestTag = "browse_target_file_button",
+                    bitmap = uiState.targetBitmap,
+                    faces = uiState.targetFaces,
+                    selectedFaceIndex = uiState.selectedTargetFaceIndex,
+                    replaceAllFaces = uiState.replaceAllTargetFaces,
+                    showCranialHeadBounds = isHeadMode,
+                    isDetecting = uiState.isDetectingTarget,
+                    onPickPhoto = onPickTargetPhoto,
+                    onBrowseFile = onBrowseTargetFile,
+                    onSelectFace = onSelectTargetFace,
+                    showMultiFaceToggle = uiState.targetFaces.size > 1,
+                    onToggleMultiFace = onToggleReplaceAllFaces
+                )
+
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    OutlinedButton(
+                        onClick = onDetectHead,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("detect_head_button"),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Radar,
+                            contentDescription = stringResource(R.string.btn_detect_head),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(if (isHeadMode) stringResource(R.string.btn_detect_head) else "Detect Faces")
+                    }
+
+                    OutlinedButton(
+                        onClick = onPreviewHead,
+                        enabled = !uiState.isGeneratingHeadPreview,
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(48.dp)
+                            .testTag("preview_head_button"),
+                        shape = RoundedCornerShape(12.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Preview,
+                            contentDescription = stringResource(R.string.btn_preview_head),
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Spacer(modifier = Modifier.width(6.dp))
+                        Text(
+                            if (uiState.isGeneratingHeadPreview) {
+                                "Segmenting..."
+                            } else {
+                                "Generate Alignment Preview"
+                            }
+                        )
+                    }
+                }
+
+                // Live Head / Hair / Neck Segmentation & Cranial Alignment Preview
+                uiState.headPreviewState?.let { preview ->
                     Card(
                         modifier = Modifier.fillMaxWidth(),
+                        shape = RoundedCornerShape(16.dp),
                         colors = CardDefaults.cardColors(
-                            containerColor = MaterialTheme.colorScheme.surfaceVariant
-                        ),
-                        shape = RoundedCornerShape(14.dp)
+                            containerColor = MaterialTheme.colorScheme.surface
+                        )
                     ) {
                         Column(
-                            modifier = Modifier.padding(16.dp),
-                            verticalArrangement = Arrangement.spacedBy(8.dp)
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
-                            Row(
-                                modifier = Modifier.fillMaxWidth(),
-                                horizontalArrangement = Arrangement.SpaceBetween,
-                                verticalAlignment = Alignment.CenterVertically
-                            ) {
-                                Text(
-                                    text = prog.stageTitle,
-                                    style = MaterialTheme.typography.titleMedium,
-                                    color = ElectricCyan
-                                )
-                                Text(
-                                    text = "${(prog.progressFraction * 100).toInt()}%",
-                                    style = MaterialTheme.typography.labelMedium,
-                                    color = NeonEmerald
-                                )
-                            }
-                            LinearProgressIndicator(
-                                progress = { prog.progressFraction },
-                                modifier = Modifier
-                                    .fillMaxWidth()
-                                    .height(8.dp)
-                                    .clip(CircleShape),
-                                color = ElectricCyan,
-                                trackColor = ObsidianBg
+                            Text(
+                                text = "Head / Hair / Neck Segmentation & Pose Preview",
+                                style = MaterialTheme.typography.titleMedium,
+                                color = ElectricCyan
                             )
                             Text(
-                                text = prog.detailMessage,
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Text(
-                                text = "Stages: Detection -> Alignment -> Segmentation -> AI Processing -> Blending -> Enhancement",
+                                text = "Parser: ${preview.segmentationLabel}",
                                 style = MaterialTheme.typography.labelMedium,
                                 color = NeonEmerald
                             )
+                            Row(
+                                modifier = Modifier.fillMaxWidth(),
+                                horizontalArrangement = Arrangement.SpaceEvenly
+                            ) {
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Image(
+                                        bitmap = preview.segmentedSourceHeadBitmap.asImageBitmap(),
+                                        contentDescription = "Segmented Source Head & Hair Mask",
+                                        modifier = Modifier
+                                            .size(128.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .border(
+                                                1.5.dp,
+                                                ElectricCyan,
+                                                RoundedCornerShape(12.dp)
+                                            )
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Source Matte (${"%.1f".format(preview.sourceRollDeg)}°)",
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                }
+                                Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                                    Image(
+                                        bitmap = preview.alignedTargetHeadBitmap.asImageBitmap(),
+                                        contentDescription = "Aligned Target Head Region",
+                                        modifier = Modifier
+                                            .size(128.dp)
+                                            .clip(RoundedCornerShape(12.dp))
+                                            .border(
+                                                1.5.dp,
+                                                RoyalViolet,
+                                                RoundedCornerShape(12.dp)
+                                            )
+                                    )
+                                    Spacer(modifier = Modifier.height(4.dp))
+                                    Text(
+                                        text = "Target Pose (${"%.1f".format(preview.targetRollDeg)}°)",
+                                        style = MaterialTheme.typography.labelMedium
+                                    )
+                                }
+                            }
                         }
                     }
                 }
-            }
 
-            // 5. Result Preview + [ Before / After ] + [ Save HD ] / [ Save ] / [ Share ]
-            uiState.swapResult?.let {
-                SwapResultCard(
+                // Real Visual Validation: 7-Panel A/B/C/D Comparison & 3-Stage Upper-Lip Moustache Diagnostic
+                VisualValidationAndStageInspectorCard(
                     uiState = uiState,
-                    onToggleCompareOriginal = onToggleCompareOriginal,
-                    onSaveToGallery = onSaveToGallery,
-                    onSaveHdToGallery = onSaveHdToGallery,
-                    onShareResult = onShareResult,
-                    onRotateResult90 = onRotateResult90,
-                    onCropResultAspect = onCropResultAspect
+                    onRunVisualValidation = onRunVisualValidation,
+                    onSaveValidationSheet = onSaveValidationSheet
                 )
             }
-
-            // 6. Real Visual Validation: 7-Panel A/B/C/D Comparison & 3-Stage Upper-Lip Moustache Diagnostic
-            VisualValidationAndStageInspectorCard(
-                uiState = uiState,
-                onRunVisualValidation = onRunVisualValidation,
-                onSaveValidationSheet = onSaveValidationSheet
-            )
 
             Spacer(modifier = Modifier.height(16.dp))
         }

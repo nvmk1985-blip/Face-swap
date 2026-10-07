@@ -10,22 +10,28 @@ import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.AutoFixHigh
 import androidx.compose.material.icons.filled.Close
 import androidx.compose.material.icons.filled.History
 import androidx.compose.material.icons.filled.Memory
+import androidx.compose.material.icons.filled.Settings
 import androidx.compose.material.icons.filled.Shield
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.Icon
@@ -33,6 +39,7 @@ import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
@@ -45,23 +52,32 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.text.SpanStyle
+import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import androidx.lifecycle.viewmodel.compose.viewModel
 import com.example.onnx.ModelSlot
 import com.example.ui.AppTab
 import com.example.ui.FaceSwapViewModel
+import com.example.ui.StudioSubPage
 import com.example.ui.tabs.HistoryAuditTab
 import com.example.ui.tabs.ModelsInspectorTab
 import com.example.ui.tabs.SafetyLicensesTab
+import com.example.ui.tabs.SplitFaceMaskLogo
 import com.example.ui.tabs.StudioTab
 import com.example.ui.theme.CoralError
 import com.example.ui.theme.ElectricCyan
 import com.example.ui.theme.MyApplicationTheme
 import com.example.ui.theme.NeonEmerald
+import com.example.ui.theme.RoyalViolet
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -182,29 +198,119 @@ fun FaceSwapStudioApp(
         topBar = {
             TopAppBar(
                 title = {
-                    Column {
-                        Text(
-                            text = stringResource(R.string.app_name),
-                            style = MaterialTheme.typography.titleLarge,
-                            fontWeight = FontWeight.ExtraBold
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(10.dp)
+                    ) {
+                        SplitFaceMaskLogo(
+                            modifier = Modifier.size(38.dp)
+                        )
+                        Column {
+                            Text(
+                                text = buildAnnotatedString {
+                                    withStyle(
+                                        SpanStyle(
+                                            color = Color.White,
+                                            fontWeight = FontWeight.ExtraBold
+                                        )
+                                    ) {
+                                        append("FaceSwap ")
+                                    }
+                                    withStyle(
+                                        SpanStyle(
+                                            brush = Brush.horizontalGradient(
+                                                colors = listOf(
+                                                    Color(0xFF00D4FF),
+                                                    Color(0xFF8B5CF6)
+                                                )
+                                            ),
+                                            fontWeight = FontWeight.ExtraBold
+                                        )
+                                    ) {
+                                        append("Studio")
+                                    }
+                                },
+                                fontSize = 21.sp,
+                                lineHeight = 24.sp
+                            )
+                            Text(
+                                text = stringResource(R.string.subtitle_offline_engine),
+                                style = MaterialTheme.typography.labelMedium,
+                                color = Color(0xFFA6B4D0),
+                                fontSize = 11.5.sp
+                            )
+                        }
+                    }
+                },
+                actions = {
+                    // [ ● Offline Ready ] pill
+                    Row(
+                        modifier = Modifier
+                            .clip(RoundedCornerShape(50))
+                            .background(Color(0xFF0A2E26))
+                            .border(1.dp, Color(0xFF15694F), RoundedCornerShape(50))
+                            .clickable {
+                                viewModel.selectTab(AppTab.MODELS)
+                            }
+                            .padding(horizontal = 11.dp, vertical = 6.dp)
+                            .testTag("top_offline_ready_badge"),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Box(
+                            modifier = Modifier
+                                .size(8.dp)
+                                .clip(CircleShape)
+                                .background(NeonEmerald)
                         )
                         Text(
-                            text = stringResource(R.string.subtitle_offline_engine),
-                            style = MaterialTheme.typography.labelMedium,
-                            color = ElectricCyan
+                            text = "Offline Ready",
+                            color = Color.White,
+                            fontWeight = FontWeight.SemiBold,
+                            fontSize = 11.5.sp
+                        )
+                    }
+
+                    Spacer(modifier = Modifier.width(4.dp))
+
+                    // Settings gear icon button -> opens/toggles the Secondary Settings & Diagnostics page
+                    IconButton(
+                        onClick = {
+                            if (uiState.currentTab == AppTab.STUDIO &&
+                                uiState.studioSubPage == StudioSubPage.SETTINGS_AND_DIAGNOSTICS
+                            ) {
+                                viewModel.selectStudioSubPage(StudioSubPage.FRONT_HOME)
+                            } else {
+                                viewModel.selectStudioSubPage(StudioSubPage.SETTINGS_AND_DIAGNOSTICS)
+                            }
+                        },
+                        modifier = Modifier.testTag("top_settings_button")
+                    ) {
+                        Icon(
+                            imageVector = Icons.Default.Settings,
+                            contentDescription = "Settings & Advanced Tools",
+                            tint = Color(0xFF9FB0D0),
+                            modifier = Modifier.size(22.dp)
                         )
                     }
                 },
                 colors = TopAppBarDefaults.topAppBarColors(
-                    containerColor = MaterialTheme.colorScheme.background,
-                    titleContentColor = MaterialTheme.colorScheme.onBackground
+                    containerColor = Color(0xFF070C1A),
+                    titleContentColor = Color.White
                 )
             )
         },
         bottomBar = {
             NavigationBar(
-                containerColor = MaterialTheme.colorScheme.surface
+                containerColor = Color(0xFF090F20)
             ) {
+                val navItemColors = NavigationBarItemDefaults.colors(
+                    selectedIconColor = Color(0xFFA855F7),
+                    selectedTextColor = Color(0xFFA855F7),
+                    indicatorColor = Color(0xFF1C163B),
+                    unselectedIconColor = Color(0xFF7D90B8),
+                    unselectedTextColor = Color(0xFF7D90B8)
+                )
                 NavigationBarItem(
                     selected = uiState.currentTab == AppTab.STUDIO,
                     onClick = { viewModel.selectTab(AppTab.STUDIO) },
@@ -215,6 +321,7 @@ fun FaceSwapStudioApp(
                         )
                     },
                     label = { Text(stringResource(R.string.tab_studio)) },
+                    colors = navItemColors,
                     modifier = Modifier.testTag("nav_tab_studio")
                 )
                 NavigationBarItem(
@@ -227,6 +334,7 @@ fun FaceSwapStudioApp(
                         )
                     },
                     label = { Text(stringResource(R.string.tab_models)) },
+                    colors = navItemColors,
                     modifier = Modifier.testTag("nav_tab_models")
                 )
                 NavigationBarItem(
@@ -239,6 +347,7 @@ fun FaceSwapStudioApp(
                         )
                     },
                     label = { Text(stringResource(R.string.tab_history)) },
+                    colors = navItemColors,
                     modifier = Modifier.testTag("nav_tab_history")
                 )
                 NavigationBarItem(
@@ -251,6 +360,7 @@ fun FaceSwapStudioApp(
                         )
                     },
                     label = { Text(stringResource(R.string.tab_ethics)) },
+                    colors = navItemColors,
                     modifier = Modifier.testTag("nav_tab_ethics")
                 )
             }
@@ -259,6 +369,7 @@ fun FaceSwapStudioApp(
         Column(
             modifier = Modifier
                 .fillMaxSize()
+                .background(Color(0xFF070C1A))
                 .padding(innerPadding)
         ) {
             AnimatedVisibility(
@@ -352,7 +463,8 @@ fun FaceSwapStudioApp(
                     onToggleCompareOriginal = viewModel::toggleComparisonMode,
                     onOpenModelsTab = { viewModel.selectTab(AppTab.MODELS) },
                     onRunVisualValidation = viewModel::runVisualValidationSuite,
-                    onSaveValidationSheet = viewModel::saveVisualValidationSheetToGallery
+                    onSaveValidationSheet = viewModel::saveVisualValidationSheetToGallery,
+                    onSelectStudioSubPage = viewModel::selectStudioSubPage
                 )
 
                 AppTab.MODELS -> ModelsInspectorTab(

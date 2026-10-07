@@ -44,6 +44,12 @@ enum class AppTab {
     ETHICS
 }
 
+enum class StudioSubPage {
+    FRONT_HOME,
+    SETTINGS_AND_DIAGNOSTICS,
+    ALIGNMENT_PREVIEW
+}
+
 enum class StudioMode(val title: String, val badge: String) {
     FACE_SWAP("FACE SWAP", "MODE 1 — HyperSwap 1b (256px) Primary Production Engine"),
     HEAD_REPLACEMENT("FULL HEAD REPLACEMENT", "MODE 2 — GHOST 2.0 Android Full Head/Hair/Neck")
@@ -79,6 +85,7 @@ data class HeadAlignmentPreviewState(
 
 data class FaceSwapUiState(
     val currentTab: AppTab = AppTab.STUDIO,
+    val studioSubPage: StudioSubPage = StudioSubPage.FRONT_HOME,
     val studioMode: StudioMode = StudioMode.FACE_SWAP,
     val qualityLevel: ProcessingQualityLevel = ProcessingQualityLevel.BALANCED,
     val outputResolution: OutputResolutionOption = OutputResolutionOption.ORIGINAL,
@@ -98,7 +105,7 @@ data class FaceSwapUiState(
     val isDetectingTarget: Boolean = false,
     val headPreviewState: HeadAlignmentPreviewState? = null,
     val isGeneratingHeadPreview: Boolean = false,
-    val consentConfirmed: Boolean = false,
+    val consentConfirmed: Boolean = true,
     val enableColorTransfer: Boolean = true,
     val skinToneMode: SkinToneSourceMode = SkinToneSourceMode.TARGET_SCENE,
     val faceReactionMode: FaceReactionSourceMode = FaceReactionSourceMode.TARGET_REACTION,
@@ -208,7 +215,21 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
     }
 
     fun selectTab(tab: AppTab) {
-        _uiState.update { it.copy(currentTab = tab) }
+        _uiState.update {
+            it.copy(
+                currentTab = tab,
+                studioSubPage = if (tab == AppTab.STUDIO) StudioSubPage.FRONT_HOME else it.studioSubPage
+            )
+        }
+    }
+
+    fun selectStudioSubPage(subPage: StudioSubPage) {
+        _uiState.update {
+            it.copy(
+                currentTab = AppTab.STUDIO,
+                studioSubPage = subPage
+            )
+        }
     }
 
     fun selectStudioMode(mode: StudioMode) {
