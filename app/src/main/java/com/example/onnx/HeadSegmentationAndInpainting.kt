@@ -291,11 +291,14 @@ object HeadSegmentationAndInpainting {
         alignedHeadCrop: Bitmap,
         preferHardwareAccel: Boolean
     ): HeadSegmentationMasks {
-        OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
-            ortEnv.createSession(segModelFile.absolutePath, opts).use { session ->
-                return runSegformerSession(ortEnv, session, alignedHeadCrop, isPreloaded = false)
-            }
-        }
+        val session = requireNotNull(
+            OnnxProtobufInspector.getOrCreateCachedSession(
+                ortEnv = ortEnv,
+                file = segModelFile,
+                preferHardwareAcceleration = preferHardwareAccel
+            )
+        ) { "Failed to load SegFormer session from ${segModelFile.absolutePath}" }
+        return runSegformerSession(ortEnv, session, alignedHeadCrop, isPreloaded = true)
     }
 
     private fun runModnetOnnx(
@@ -327,24 +330,27 @@ object HeadSegmentationAndInpainting {
         fb.rewind()
 
         val refined = FloatArray(cropSize * cropSize)
-        OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
-            ortEnv.createSession(mattingFile.absolutePath, opts).use { session ->
-                val inputName = session.inputNames.first()
-                val shape = longArrayOf(1L, 3L, modelSize.toLong(), modelSize.toLong())
-                OnnxTensor.createTensor(ortEnv, fb, shape).use { inTensor ->
-                    session.run(mapOf(inputName to inTensor)).use { res ->
-                        val outTensor = res[0] as OnnxTensor
-                        val matte512 = FloatArray(hw)
-                        outTensor.floatBuffer.get(matte512)
-                        for (y in 0 until cropSize) {
-                            val sy = (y * modelSize / cropSize).coerceIn(0, modelSize - 1)
-                            for (x in 0 until cropSize) {
-                                val sx = (x * modelSize / cropSize).coerceIn(0, modelSize - 1)
-                                val modVal = matte512[sy * modelSize + sx].coerceIn(0f, 1f)
-                                val idx = y * cropSize + x
-                                refined[idx] = (0.55f * coarseAlpha[idx] + 0.45f * modVal).coerceIn(0f, 1f)
-                            }
-                        }
+        val session = requireNotNull(
+            OnnxProtobufInspector.getOrCreateCachedSession(
+                ortEnv = ortEnv,
+                file = mattingFile,
+                preferHardwareAcceleration = preferHardwareAccel
+            )
+        ) { "Failed to load MODNet session from ${mattingFile.absolutePath}" }
+        val inputName = session.inputNames.first()
+        val shape = longArrayOf(1L, 3L, modelSize.toLong(), modelSize.toLong())
+        OnnxTensor.createTensor(ortEnv, fb, shape).use { inTensor ->
+            session.run(mapOf(inputName to inTensor)).use { res ->
+                val outTensor = res[0] as OnnxTensor
+                val matte512 = FloatArray(hw)
+                outTensor.floatBuffer.get(matte512)
+                for (y in 0 until cropSize) {
+                    val sy = (y * modelSize / cropSize).coerceIn(0, modelSize - 1)
+                    for (x in 0 until cropSize) {
+                        val sx = (x * modelSize / cropSize).coerceIn(0, modelSize - 1)
+                        val modVal = matte512[sy * modelSize + sx].coerceIn(0f, 1f)
+                        val idx = y * cropSize + x
+                        refined[idx] = (0.55f * coarseAlpha[idx] + 0.45f * modVal).coerceIn(0f, 1f)
                     }
                 }
             }

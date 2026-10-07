@@ -641,7 +641,7 @@ private fun HeroPipelineStatusCard(
                         text = if (uiState.studioMode == StudioMode.HEAD_REPLACEMENT) {
                             "Mode 2: Full Head, Hair, Skull & Neck Replacement"
                         } else {
-                            "Mode 1: SCRFD-10G + ArcFace + InSwapper-128"
+                            "Mode 1: SCRFD-10G + ArcFace + HyperSwap 1b (256px)"
                         },
                         style = MaterialTheme.typography.titleLarge,
                         color = Color.White
@@ -664,7 +664,7 @@ private fun HeroPipelineStatusCard(
                         onClick = onOpenModelsTab
                     )
                     ModelStatusPill(
-                        label = "inswapper_128.onnx",
+                        label = "hyperswap_1b_256.onnx",
                         isReady = uiState.isSwapperReady,
                         onClick = onOpenModelsTab
                     )
@@ -750,9 +750,9 @@ private fun HeroPipelineStatusCard(
                                 tamilRole = "முக அடையாளம் (512-D Identity): மாற்றுவதற்கான (Source) முகத்தின் தனித்துவமான 512-பரிமாண அடையாளத்தைப் பிரித்தெடுக்க."
                             )
                             StudioTamilModelRow(
-                                fileName = "inswapper_128.onnx",
+                                fileName = "hyperswap_1b_256.onnx",
                                 isInRam = uiState.memoryServiceState.inswapperLoaded,
-                                tamilRole = "முகம் மாற்றம் (Core Face Swap): Target முகத்தின் பாவனை மற்றும் ஒளியை மாற்றாமல் Source முகத்தைப் பொருத்த."
+                                tamilRole = "முகம் மாற்றம் (Primary 256×256 Face Swap): Target முகத்தின் பாவனை மற்றும் ஒளியை மாற்றாமல் Source முகத்தைப் பொருத்த."
                             )
                             StudioTamilModelRow(
                                 fileName = "gfpgan_1.4.onnx",
@@ -1362,31 +1362,102 @@ private fun SwapResultCard(
                 }
             }
 
-            // Interactive Before | After Split-Screen Comparison Slider
-            var splitPosition by remember { mutableFloatStateOf(1.0f) }
-            val splitComparisonPreview = remember(result.outputBitmap, uiState.targetBitmap, splitPosition, uiState.showOriginalInComparison) {
+            // Interactive Before | After & Multi-Stage Split-Screen Comparison
+            var splitPosition by remember { mutableFloatStateOf(0.50f) }
+            var selectedSplitModeIndex by remember { mutableStateOf(0) }
+            val splitModeOptions = listOf(
+                "Final vs Target",
+                "Stage 2 (Restore) vs Stage 1 (Swap-Only)",
+                "Stage 3 (Final) vs Stage 2 (Restore)",
+                "Stage 3 (512px) vs Target Crop"
+            )
+
+            if (result.stage1SwapOnly512 != null && result.stage2SwapRestore512 != null && result.stage3FinalBlend512 != null) {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp),
+                    verticalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    splitModeOptions.forEachIndexed { idx, label ->
+                        FilterChip(
+                            selected = selectedSplitModeIndex == idx,
+                            onClick = {
+                                selectedSplitModeIndex = idx
+                                if (splitPosition > 0.95f || splitPosition < 0.05f) {
+                                    splitPosition = 0.50f
+                                }
+                            },
+                            label = {
+                                Text(
+                                    text = label,
+                                    style = MaterialTheme.typography.labelSmall
+                                )
+                            },
+                            modifier = Modifier.testTag("split_stage_mode_$idx")
+                        )
+                    }
+                }
+            }
+
+            val splitComparisonPreview = remember(
+                result.outputBitmap,
+                result.stage1SwapOnly512,
+                result.stage2SwapRestore512,
+                result.stage3FinalBlend512,
+                result.alignedTarget128,
+                uiState.targetBitmap,
+                splitPosition,
+                selectedSplitModeIndex,
+                uiState.showOriginalInComparison
+            ) {
                 if (uiState.showOriginalInComparison && uiState.targetBitmap != null) {
                     uiState.targetBitmap
-                } else if (splitPosition in 0.02f..0.98f && uiState.targetBitmap != null &&
-                    uiState.targetBitmap.width == result.outputBitmap.width &&
-                    uiState.targetBitmap.height == result.outputBitmap.height
-                ) {
-                    val w = result.outputBitmap.width
-                    val h = result.outputBitmap.height
-                    val splitX = (w * splitPosition).toInt().coerceIn(1, w - 1)
-                    val combined = result.outputBitmap.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
-                    val origSlice = IntArray((w - splitX) * h)
-                    uiState.targetBitmap.getPixels(origSlice, 0, w - splitX, splitX, 0, w - splitX, h)
-                    combined.setPixels(origSlice, 0, w - splitX, splitX, 0, w - splitX, h)
-                    val canvas = android.graphics.Canvas(combined)
-                    val linePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
-                        color = android.graphics.Color.rgb(0, 229, 255)
-                        strokeWidth = (w / 240f).coerceAtLeast(3f)
-                    }
-                    canvas.drawLine(splitX.toFloat(), 0f, splitX.toFloat(), h.toFloat(), linePaint)
-                    combined
                 } else {
-                    result.outputBitmap
+                    val leftBmp: android.graphics.Bitmap
+                    val rightBmp: android.graphics.Bitmap?
+                    when (selectedSplitModeIndex) {
+                        1 -> {
+                            leftBmp = result.stage2SwapRestore512 ?: result.outputBitmap
+                            rightBmp = result.stage1SwapOnly512
+                        }
+                        2 -> {
+                            leftBmp = result.stage3FinalBlend512 ?: result.outputBitmap
+                            rightBmp = result.stage2SwapRestore512
+                        }
+                        3 -> {
+                            leftBmp = result.stage3FinalBlend512 ?: result.outputBitmap
+                            rightBmp = result.alignedTarget128.let { crop ->
+                                if (crop.width != leftBmp.width || crop.height != leftBmp.height) {
+                                    android.graphics.Bitmap.createScaledBitmap(crop, leftBmp.width, leftBmp.height, true)
+                                } else crop
+                            }
+                        }
+                        else -> {
+                            leftBmp = result.outputBitmap
+                            rightBmp = uiState.targetBitmap
+                        }
+                    }
+
+                    if (splitPosition in 0.02f..0.98f && rightBmp != null &&
+                        rightBmp.width == leftBmp.width && rightBmp.height == leftBmp.height
+                    ) {
+                        val w = leftBmp.width
+                        val h = leftBmp.height
+                        val splitX = (w * splitPosition).toInt().coerceIn(1, w - 1)
+                        val combined = leftBmp.copy(android.graphics.Bitmap.Config.ARGB_8888, true)
+                        val origSlice = IntArray((w - splitX) * h)
+                        rightBmp.getPixels(origSlice, 0, w - splitX, splitX, 0, w - splitX, h)
+                        combined.setPixels(origSlice, 0, w - splitX, splitX, 0, w - splitX, h)
+                        val canvas = android.graphics.Canvas(combined)
+                        val linePaint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                            color = android.graphics.Color.rgb(0, 229, 255)
+                            strokeWidth = (w / 240f).coerceAtLeast(3f)
+                        }
+                        canvas.drawLine(splitX.toFloat(), 0f, splitX.toFloat(), h.toFloat(), linePaint)
+                        combined
+                    } else {
+                        leftBmp
+                    }
                 }
             }
 
@@ -1450,13 +1521,13 @@ private fun SwapResultCard(
                     horizontalArrangement = Arrangement.SpaceBetween
                 ) {
                     Text(
-                        text = "AFTER | BEFORE Split Slider (இடது: After • வலது: Before)",
+                        text = "AFTER | BEFORE Split Slider (${splitModeOptions.getOrElse(selectedSplitModeIndex) { "Final vs Target" }})",
                         style = MaterialTheme.typography.labelSmall,
                         color = NeonEmerald,
                         fontWeight = FontWeight.Bold
                     )
                     Text(
-                        text = "${(splitPosition * 100).toInt()}% After",
+                        text = "${(splitPosition * 100).toInt()}% Left",
                         style = MaterialTheme.typography.labelSmall,
                         color = ElectricCyan
                     )
@@ -1544,32 +1615,56 @@ private fun SwapResultCard(
             ) {
                 AlignedCropThumb(bitmap = result.alignedSource112, label = "Source Crop")
                 AlignedCropThumb(bitmap = result.alignedTarget128, label = "Target Crop")
-                AlignedCropThumb(bitmap = result.rawSwapped128, label = "Synthesized")
+                result.stage1SwapOnly512?.let {
+                    AlignedCropThumb(bitmap = it, label = "1. Swap-Only")
+                }
+                result.stage2SwapRestore512?.let {
+                    AlignedCropThumb(bitmap = it, label = "2. Restore")
+                }
+                AlignedCropThumb(bitmap = result.rawSwapped128, label = "3. Final 512")
             }
 
-            Row(
+            // 10-Stage Production Timing Breakdown Panel
+            val st = result.stageTimings
+            Column(
                 modifier = Modifier
                     .fillMaxWidth()
                     .clip(RoundedCornerShape(10.dp))
                     .background(ObsidianBg)
                     .padding(10.dp),
-                horizontalArrangement = Arrangement.SpaceBetween
+                verticalArrangement = Arrangement.spacedBy(4.dp)
             ) {
                 Text(
-                    text = "Align/Emb: ${result.embeddingMs}ms",
+                    text = "Production 10-Stage Latency Breakdown (Total: ${result.totalMs} ms)",
                     style = MaterialTheme.typography.labelMedium,
-                    color = ElectricCyan
-                )
-                Text(
-                    text = "Gen: ${result.inswapperMs}ms",
-                    style = MaterialTheme.typography.labelMedium,
-                    color = RoyalViolet
-                )
-                Text(
-                    text = "Seg/Blend: ${result.blendingMs}ms",
-                    style = MaterialTheme.typography.labelMedium,
+                    fontWeight = FontWeight.Bold,
                     color = NeonEmerald
                 )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("1. Model Load: ${st.modelLoadingMs}ms", style = MaterialTheme.typography.labelSmall, color = ElectricCyan)
+                    Text("2. Face Det: ${st.faceDetectionMs}ms", style = MaterialTheme.typography.labelSmall, color = ElectricCyan)
+                    Text("3. Landmarks: ${st.landmarkDetectionMs}ms", style = MaterialTheme.typography.labelSmall, color = ElectricCyan)
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("4. ArcFace: ${st.arcFaceEmbeddingMs}ms", style = MaterialTheme.typography.labelSmall, color = RoyalViolet)
+                    Text("5. HyperSwap 1b: ${st.hyperSwapInferenceMs}ms", style = MaterialTheme.typography.labelSmall, color = RoyalViolet)
+                    Text("6. 512 Restore: ${st.restoration512Ms}ms", style = MaterialTheme.typography.labelSmall, color = NeonEmerald)
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween
+                ) {
+                    Text("7. Lip Guard: ${st.upperLipGuardMs}ms", style = MaterialTheme.typography.labelSmall, color = NeonEmerald)
+                    Text("8. Mask Gen: ${st.maskGenerationMs}ms", style = MaterialTheme.typography.labelSmall, color = NeonEmerald)
+                    Text("9. Blend: ${st.finalBlendingMs}ms", style = MaterialTheme.typography.labelSmall, color = NeonEmerald)
+                    Text("10. Export: ${st.imageEncodingExportMs}ms", style = MaterialTheme.typography.labelSmall, color = ElectricCyan)
+                }
             }
 
             // [ Save HD ] | [ Save ] | [ Share ] Action Buttons
@@ -1736,7 +1831,7 @@ private fun SwapRequirementsCard(
                 }
             )
 
-            // 3. Models requirement (Face Swap mode requires det_10g, inswapper_128, and w600k_r50/fallback)
+            // 3. Models requirement (Face Swap mode requires det_10g, hyperswap_1b_256, and w600k_r50/fallback)
             if (!isHeadMode) {
                 RequirementRowItem(
                     isSatisfied = uiState.isDetectorReady,
@@ -1746,7 +1841,7 @@ private fun SwapRequirementsCard(
                 )
                 RequirementRowItem(
                     isSatisfied = uiState.isSwapperReady,
-                    text = "inswapper_128.onnx installed",
+                    text = "hyperswap_1b_256.onnx installed",
                     actionLabel = if (!uiState.isSwapperReady) "Install" else null,
                     onAction = onOpenModelsTab
                 )

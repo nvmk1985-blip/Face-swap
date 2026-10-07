@@ -253,15 +253,9 @@ object FaceBlender {
 
         val geom = computeWarpedGeometry(forwardMatrix128, targetLandmarks5, scale = 1.0f)
 
-        // Step 1: Zero Source-Pixel Ghosting Base Synthesis
-        // - When hasTrueArcFaceLatent == true: preserve 100% of inswapper_128's neural pose-aligned swapped face,
-        //   healing only isolated single-pixel dark glitch spikes using the swapped face's own local neighborhood.
-        // - When hasTrueArcFaceLatent == false (2-Model fallback): use occlusion-filtered inner feature transfer.
-        val outPx = if (hasTrueArcFaceLatent) {
-            healCheekScratchesAndNegativeAnomalies128(swapPx, tgtPx, geom)
-        } else {
-            buildGlitchFreeTwoModelFallback128(srcPx128, tgtPx, geom)
-        }
+        // Preserve 100% of the neural swapped face output from the ONNX swap session,
+        // healing only isolated single-pixel dark glitch spikes using the swapped face's own neighborhood.
+        val outPx = healCheekScratchesAndNegativeAnomalies128(swapPx, tgtPx, geom)
 
         val out = Bitmap.createBitmap(CROP_SIZE, CROP_SIZE, Bitmap.Config.ARGB_8888)
         out.setPixels(outPx, 0, CROP_SIZE, 0, 0, CROP_SIZE, CROP_SIZE)
@@ -897,7 +891,8 @@ object FaceBlender {
         segformerFile: File? = null,
         preloadedGfpganSession: OrtSession? = null,
         preloadedSegformerSession: OrtSession? = null,
-        onStagesCaptured: ((stage1SwapOnly512: Bitmap, stage2SwapRestore512: Bitmap, stage3FinalBlend512: Bitmap) -> Unit)? = null
+        onStagesCaptured: ((stage1SwapOnly512: Bitmap, stage2SwapRestore512: Bitmap, stage3FinalBlend512: Bitmap) -> Unit)? = null,
+        onSubStageTimings: ((restoration512Ms: Long, upperLipGuardMs: Long, maskGenerationMs: Long, finalBlendingMs: Long) -> Unit)? = null
     ): Bitmap {
         val activeSwapCrop = colorCorrected128 ?: swappedCrop128
             ?: throw IllegalArgumentException("Either colorCorrected128 or swappedCrop128 must be provided.")
@@ -906,8 +901,9 @@ object FaceBlender {
         val alignedTarget512 = FaceAlignment.warpAffineCrop(targetBitmap, m512, HD_SIZE)
         val geom512 = computeWarpedGeometry(m128, targetLandmarks5, scale = 4.0f)
 
-        // Optional Neural Occlusion Gate via segformer_B5_ce.onnx (protects eyeglasses, hair bangs, hats & earrings)
-        val neuralOcclusionGate512 = if (enableOcclusionProtection) {
+        // Optional Neural Occlusion Gate via segformer_B5_ce.onnx (when explicitly provided for Mode 2)
+        val tMask0 = System.currentTimeMillis()
+        val neuralOcclusionGate512 = if (enableOcclusionProtection && (preloadedSegformerSession != null || segformerFile != null)) {
             HeadSegmentationAndInpainting.computeFaceOcclusionGate512(
                 ortEnv = ortEnv,
                 alignedTarget512 = alignedTarget512,
@@ -916,6 +912,7 @@ object FaceBlender {
                 preloadedSegformerSession = preloadedSegformerSession
             )
         } else null
+        var maskGenMs = (System.currentTimeMillis() - tMask0).coerceAtLeast(0L)
 
         val mSrc128 = if (sourceBitmap != null && sourceLandmarks5 != null && sourceLandmarks5.size >= 5) {
             FaceAlignment.estimateNorm(sourceLandmarks5, 128)
@@ -929,7 +926,8 @@ object FaceBlender {
         } else null
 
         val clampedEnhance = enhancementStrength.coerceIn(0f, 1f)
-        val gfp512 = if (clampedEnhance > 0.05f) {
+        val tRestore0 = System.currentTimeMillis()
+        val gfp512 = if (clampedEnhance > 0.05f && (preloadedGfpganSession != null || gfpganFile != null)) {
             runOptionalGfpganEnhancement512(
                 ortEnv = ortEnv,
                 gfpganFile = gfpganFile,
@@ -950,7 +948,7 @@ object FaceBlender {
         alignedTarget512.recycle()
         alignedSource512?.recycle()
 
-        // Capture Stage 1: Swap-Only Output (before GFPGAN restoration, upper-lip guard, or blending)
+        // Capture Stage 1: Swap-Only Output (raw neural swap before restoration, upper-lip guard, or blending)
         val stage1SwapOnlyBmp = if (onStagesCaptured != null) {
             Bitmap.createBitmap(HD_SIZE, HD_SIZE, Bitmap.Config.ARGB_8888).apply {
                 setPixels(swapPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
@@ -973,29 +971,8 @@ object FaceBlender {
             }
         }
 
-        // First-pass Target-Aware Upper-Lip / Philtrum Moustache & Grey-Patch Elimination BEFORE sharpening
-        protectTargetUpperLipAndEliminateMoustache512(
-            swapPx512 = swapPx512,
-            tgtPx512 = tgtPx512,
-            geom512 = geom512
-        )
-
-        // Apply frequency-separated anatomical feature crispness boost on eyes, nose nostrils/bridge, and lips
-        // (strictly excluding the philtrum/upper-lip skin region)
-        enhanceAnatomicalFeatures512(
-            swapPx512 = swapPx512,
-            geom512 = geom512,
-            strength = (0.38f + 0.54f * clampedEnhance).coerceIn(0.28f, 0.92f)
-        )
-
-        // Capture Stage 2: Swap + 512x512 HD Restoration + Upper-Lip Guard Output (before final scene blending)
-        val stage2RestoreBmp = if (onStagesCaptured != null) {
-            Bitmap.createBitmap(HD_SIZE, HD_SIZE, Bitmap.Config.ARGB_8888).apply {
-                setPixels(swapPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
-            }
-        } else null
-
-        // 1. Unified 512x512 Skin-Tone & Scene Illumination Harmonization
+        // 1. Unified 512x512 Skin-Tone & Scene Illumination Harmonization (Mean + Contrast Transfer)
+        //    Run BEFORE Upper-Lip Guard & HD feature sharpening so swapPx512 and tgtPx512 share the exact same skin tone!
         if (enableColorTransfer) {
             harmonizeSkinToneByMode512(
                 swapPx512 = swapPx512,
@@ -1006,29 +983,24 @@ object FaceBlender {
             )
         }
 
-        // 2. Face Reaction Synthesis (Zero Source-Pixel Ghosting: never copy raw source mouth/skin pixels)
-        when (faceReactionMode) {
-            FaceReactionSourceMode.TARGET_REACTION -> {
-                preserveTargetMouthTeethAndTongue512(
-                    swapPx512 = swapPx512,
-                    tgtPx512 = tgtPx512,
-                    geom512 = geom512
-                )
-            }
-            FaceReactionSourceMode.SOURCE_REACTION -> {
-                if (srcPx512 != null && srcGeom512 != null) {
-                    transferSourceReactionSmileTeethTongue512(
-                        swapPx512 = swapPx512,
-                        srcPx512 = srcPx512,
-                        tgtGeom512 = geom512,
-                        srcGeom512 = srcGeom512
-                    )
-                }
-            }
-        }
+        // 2. First-pass Target-Aware Upper-Lip / Philtrum Moustache & Grey-Patch Guard
+        val tGuard0 = System.currentTimeMillis()
+        protectTargetUpperLipAndEliminateMoustache512(
+            swapPx512 = swapPx512,
+            tgtPx512 = tgtPx512,
+            geom512 = geom512
+        )
+        var upperLipGuardMs = (System.currentTimeMillis() - tGuard0).coerceAtLeast(1L)
 
-        // 3. Subtle 512x512 Skin Pore Micro-Texture Harmonization strictly on smooth cheek/forehead skin
-        //    (strictly excluding eyes, eyebrows, nose, philtrum, and mouth so target features never bleed in)
+        // 3. Apply frequency-separated 512x512 HD anatomical feature crispness boost on eyes, nose nostrils/bridge, and lips
+        //    (strictly excluding the philtrum/upper-lip skin region)
+        enhanceAnatomicalFeatures512(
+            swapPx512 = swapPx512,
+            geom512 = geom512,
+            strength = (0.42f + 0.52f * clampedEnhance).coerceIn(0.32f, 0.94f)
+        )
+
+        // 4. Subtle 512x512 Skin Pore Micro-Texture Harmonization strictly on smooth cheek/forehead skin
         val poreScale = (if (skinToneMode == SkinToneSourceMode.SOURCE_IDENTITY) 0.08f else 0.14f) *
             (0.4f + 0.6f * clampedEnhance)
         val mouthMidX512 = (geom512.leftMouth.x + geom512.rightMouth.x) * 0.5f
@@ -1085,7 +1057,7 @@ object FaceBlender {
             }
         }
 
-        // 4. Dynamic Landmark Eye & Eyebrow Anomaly Protection (preserves 100% of swapped eye/brow identity)
+        // 5. Dynamic Landmark Eye & Eyebrow Protection (preserves 100% of swapped eye/brow identity)
         restoreDynamicEyebrowContinuity(
             outPx = swapPx512,
             tgtPx = tgtPx512,
@@ -1099,8 +1071,39 @@ object FaceBlender {
             size = HD_SIZE,
             geom = geom512
         )
+        val restoration512Ms = ((System.currentTimeMillis() - tRestore0) - upperLipGuardMs).coerceAtLeast(1L)
 
-        // 5. Build 512x512 Target-Aware Biometric Landmark-Fitted Mask with Hair/Occlusion Protection
+        // Capture Stage 2: Swap + 512x512 HD Restoration + Upper-Lip Guard Output (before final scene blending)
+        val stage2RestoreBmp = if (onStagesCaptured != null) {
+            Bitmap.createBitmap(HD_SIZE, HD_SIZE, Bitmap.Config.ARGB_8888).apply {
+                setPixels(swapPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
+            }
+        } else null
+
+        val tBlendStage0 = System.currentTimeMillis()
+        // 6. Face Reaction Synthesis (Zero Source-Pixel Ghosting: never copy raw source mouth/skin pixels)
+        when (faceReactionMode) {
+            FaceReactionSourceMode.TARGET_REACTION -> {
+                preserveTargetMouthTeethAndTongue512(
+                    swapPx512 = swapPx512,
+                    tgtPx512 = tgtPx512,
+                    geom512 = geom512
+                )
+            }
+            FaceReactionSourceMode.SOURCE_REACTION -> {
+                if (srcPx512 != null && srcGeom512 != null) {
+                    transferSourceReactionSmileTeethTongue512(
+                        swapPx512 = swapPx512,
+                        srcPx512 = srcPx512,
+                        tgtGeom512 = geom512,
+                        srcGeom512 = srcGeom512
+                    )
+                }
+            }
+        }
+
+        // 7. Build 512x512 Target-Aware Biometric Landmark-Fitted Mask with Hair/Occlusion Protection
+        val tMask1 = System.currentTimeMillis()
         val mask512 = createBiometricFaceMask512(
             geom512 = geom512,
             tgtPx512 = tgtPx512,
@@ -1109,24 +1112,27 @@ object FaceBlender {
             enableOcclusionProtection = enableOcclusionProtection,
             neuralOcclusionGate512 = neuralOcclusionGate512
         )
+        val maskElapsed = (System.currentTimeMillis() - tMask1).coerceAtLeast(1L)
+        maskGenMs = (maskGenMs + maskElapsed).coerceAtLeast(1L)
 
-        // 6. 2-Band Multi-Band (Low-Frequency Illumination + High-Frequency Facial Detail) Boundary Fusion
+        // 8. 2-Band Multi-Band (Low-Frequency Illumination + High-Frequency Facial Detail) Boundary Fusion
         applyMultiBandBoundaryAndJawlineFusion512(
             swapPx512 = swapPx512,
             tgtPx512 = tgtPx512,
             mask512 = mask512
         )
 
-        // 7. Final-pass Target-Aware Upper-Lip, Philtrum, Mouth-Corner & Perioral Facial-Hair Protection
-        //    after all color, reaction, and multi-band passes so the final output NEVER contains any
-        //    moustache, dark upper-lip shadow, source facial-hair leakage, or grey patch above the lips!
+        // 9. Final-pass Target-Aware Upper-Lip & Philtrum Protection Lock
+        val tGuard1 = System.currentTimeMillis()
         protectTargetUpperLipAndEliminateMoustache512(
             swapPx512 = swapPx512,
             tgtPx512 = tgtPx512,
             geom512 = geom512
         )
+        val guard2Elapsed = (System.currentTimeMillis() - tGuard1).coerceAtLeast(0L)
+        upperLipGuardMs = (upperLipGuardMs + guard2Elapsed).coerceAtLeast(1L)
 
-        // 8. Direct High-Resolution Warp of 512x512 HD Face onto full-resolution targetPixels using Catmull-Rom Bicubic
+        // 10. Direct High-Resolution Warp of 512x512 HD Face onto full-resolution targetPixels using Catmull-Rom Bicubic
         val inv = FaceAlignment.invertAffine2x3(m512)
         val corners = arrayOf(
             0f to 0f,
@@ -1205,8 +1211,25 @@ object FaceBlender {
             }
         }
 
+        // Composite swapPx512 with tgtPx512 using mask512 so Stage 3 (production_final_blend.png)
+        // shows the exact final blended 512x512 face (including target hair, forehead, temples & jawline)
+        val stage3BlendedPx512 = IntArray(total512)
+        for (i in 0 until total512) {
+            val a = (mask512[i] * clampedBlend).coerceIn(0f, 1f)
+            val invA = 1.0f - a
+            val sc = swapPx512[i]
+            val tc = tgtPx512[i]
+            val r = (((sc ushr 16) and 0xFF) * a + ((tc ushr 16) and 0xFF) * invA).toInt().coerceIn(0, 255)
+            val g = (((sc ushr 8) and 0xFF) * a + ((tc ushr 8) and 0xFF) * invA).toInt().coerceIn(0, 255)
+            val b = ((sc and 0xFF) * a + (tc and 0xFF) * invA).toInt().coerceIn(0, 255)
+            stage3BlendedPx512[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+        }
+
+        val finalBlendingMs = ((System.currentTimeMillis() - tBlendStage0) - maskElapsed - guard2Elapsed).coerceAtLeast(1L)
+        onSubStageTimings?.invoke(restoration512Ms, upperLipGuardMs, maskGenMs, finalBlendingMs)
+
         val restoredHd512 = Bitmap.createBitmap(HD_SIZE, HD_SIZE, Bitmap.Config.ARGB_8888)
-        restoredHd512.setPixels(swapPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
+        restoredHd512.setPixels(stage3BlendedPx512, 0, HD_SIZE, 0, 0, HD_SIZE, HD_SIZE)
         if (onStagesCaptured != null && stage1SwapOnlyBmp != null && stage2RestoreBmp != null) {
             onStagesCaptured(stage1SwapOnlyBmp, stage2RestoreBmp, restoredHd512)
         }
@@ -1321,18 +1344,23 @@ object FaceBlender {
             (geom512.rightMouth.y - geom512.leftMouth.y).toDouble()
         ).toFloat().coerceIn(72f, 220f)
 
+        val dxNM = mouthMidX - geom512.nose.x
+        val dyNM = mouthMidY - geom512.nose.y
+        val noseToMouthDist = hypot(dxNM.toDouble(), dyNM.toDouble()).toFloat().coerceAtLeast(48f)
+        // Unit vector (vx, vy) pointing downward from nose tip to mouth center
+        val vx = dxNM / noseToMouthDist
+        val vy = dyNM / noseToMouthDist
+        // Unit vector (ux, uy) pointing horizontally along the eye/mouth axis
+        val ux = geom512.cosA
+        val uy = geom512.sinA
+
         // Philtrum center lies between nose tip and mouth center along the facial vertical axis
         val philtrumCx = geom512.nose.x * 0.38f + mouthMidX * 0.62f
         val philtrumCy = geom512.nose.y * 0.40f + mouthMidY * 0.60f
-        val noseToMouthDist = hypot(
-            (mouthMidX - geom512.nose.x).toDouble(),
-            (mouthMidY - geom512.nose.y).toDouble()
-        ).toFloat().coerceAtLeast(48f)
+        val philtrumRx = max(mouthW * 0.62f, geom512.eyeDist * 0.48f)
+        val philtrumRy = (noseToMouthDist * 0.52f).coerceIn(28f, 64f)
 
-        val philtrumRx = max(mouthW * 0.75f, geom512.eyeDist * 0.58f)
-        val philtrumRy = (noseToMouthDist * 0.60f).coerceIn(32f, 72f)
-
-        // 1. Sample clean upper-malar cheek skin reference (0.68 * eye + 0.32 * mouth, strictly above any beard zone)
+        // 1. Sample clean upper-malar cheek skin reference (strictly above any beard/moustache zone)
         val leftCheekCx = geom512.leftEye.x * 0.65f + geom512.leftMouth.x * 0.35f - geom512.cosA * (geom512.eyeDist * 0.14f)
         val leftCheekCy = geom512.leftEye.y * 0.55f + geom512.leftMouth.y * 0.45f
         val rightCheekCx = geom512.rightEye.x * 0.65f + geom512.rightMouth.x * 0.35f + geom512.cosA * (geom512.eyeDist * 0.14f)
@@ -1372,16 +1400,15 @@ object FaceBlender {
         tCheekR /= cheekCount
         tCheekG /= cheekCount
         tCheekB /= cheekCount
-        val sCheekLum = (0.299f * sCheekR + 0.587f * sCheekG + 0.114f * sCheekB).coerceAtLeast(25f)
         val tCheekLum = (0.299f * tCheekR + 0.587f * tCheekG + 0.114f * tCheekB).coerceAtLeast(25f)
 
         // 2. Measure Target philtrum luminance to verify whether Target has a moustache
         var tPhiltrumLumSum = 0f
         var philtrumSamples = 0
-        val pMinX = (philtrumCx - philtrumRx * 0.65f).toInt().coerceIn(16, HD_SIZE - 17)
-        val pMaxX = (philtrumCx + philtrumRx * 0.65f).toInt().coerceIn(16, HD_SIZE - 17)
-        val pMinY = (philtrumCy - philtrumRy * 0.45f).toInt().coerceIn(16, HD_SIZE - 17)
-        val pMaxY = (philtrumCy + philtrumRy * 0.35f).toInt().coerceIn(16, HD_SIZE - 17)
+        val pMinX = (philtrumCx - philtrumRx * 0.60f).toInt().coerceIn(16, HD_SIZE - 17)
+        val pMaxX = (philtrumCx + philtrumRx * 0.60f).toInt().coerceIn(16, HD_SIZE - 17)
+        val pMinY = (philtrumCy - philtrumRy * 0.40f).toInt().coerceIn(16, HD_SIZE - 17)
+        val pMaxY = (philtrumCy + philtrumRy * 0.30f).toInt().coerceIn(16, HD_SIZE - 17)
         for (y in pMinY..pMaxY step 2) {
             for (x in pMinX..pMaxX step 2) {
                 val tc = tgtPx512[y * HD_SIZE + x]
@@ -1394,21 +1421,21 @@ object FaceBlender {
         val targetHasNoMoustache = (tPhiltrumMeanLum / tCheekLum) >= 0.62f
         if (!targetHasNoMoustache) return
 
-        // 3. Target has NO moustache: reconstruct clean, moustache-free upper-lip skin across philtrum,
-        //    upper-lip arch, and mouth corners so ZERO moustache, dark shadow, or grey patch can appear!
-        val boundMinX = (philtrumCx - philtrumRx - 16f).toInt().coerceIn(12, HD_SIZE - 13)
-        val boundMaxX = (philtrumCx + philtrumRx + 16f).toInt().coerceIn(12, HD_SIZE - 13)
-        val boundMinY = (philtrumCy - philtrumRy - 12f).toInt().coerceIn(12, HD_SIZE - 13)
-        val boundMaxY = (mouthMidY + philtrumRy * 0.68f).toInt().coerceIn(12, HD_SIZE - 13)
+        // 3. Target has NO moustache: use the Target's actual 512x512 clean philtrum skin texture (`tgtPx512`)
+        //    matched to the active cheek skin tone `(sCheek - tCheek)`, across the full cutaneous philtrum /
+        //    moustache arch above the upper-lip vermilion border.
+        val residualR = sCheekR - tCheekR
+        val residualG = sCheekG - tCheekG
+        val residualB = sCheekB - tCheekB
+
+        val halfSpanU = max(mouthW * 0.62f, geom512.eyeDist * 0.50f)
+        val boundMinX = (min(geom512.nose.x, mouthMidX) - halfSpanU - 14f).toInt().coerceIn(12, HD_SIZE - 13)
+        val boundMaxX = (max(geom512.nose.x, mouthMidX) + halfSpanU + 14f).toInt().coerceIn(12, HD_SIZE - 13)
+        val boundMinY = (min(geom512.nose.y, mouthMidY) - 10f).toInt().coerceIn(12, HD_SIZE - 13)
+        val boundMaxY = (max(geom512.nose.y, mouthMidY) + noseToMouthDist * 0.15f).toInt().coerceIn(12, HD_SIZE - 13)
 
         val nostrilRx = geom512.eyeDist * 0.20f
         val nostrilRy = geom512.eyeDist * 0.09f
-        val lipCoreRx = mouthW * 0.45f
-        val lipCoreRy = noseToMouthDist * 0.20f
-
-        val baseCheekR = 0.62f * tCheekR + 0.38f * sCheekR
-        val baseCheekG = 0.62f * tCheekG + 0.38f * sCheekG
-        val baseCheekB = 0.62f * tCheekB + 0.38f * sCheekB
 
         for (y in boundMinY..boundMaxY) {
             val row = y * HD_SIZE
@@ -1416,67 +1443,73 @@ object FaceBlender {
                 val xf = x.toFloat()
                 val yf = y.toFloat()
 
-                val dPhilSq = orientedEllipseDistSq(
-                    xf, yf, philtrumCx, philtrumCy, philtrumRx, philtrumRy, geom512.cosA, geom512.sinA
-                )
-                val dLeftCornerSq = orientedEllipseDistSq(
-                    xf, yf, geom512.leftMouth.x, geom512.leftMouth.y, mouthW * 0.32f, philtrumRy * 0.72f, geom512.cosA, geom512.sinA
-                )
-                val dRightCornerSq = orientedEllipseDistSq(
-                    xf, yf, geom512.rightMouth.x, geom512.rightMouth.y, mouthW * 0.32f, philtrumRy * 0.72f, geom512.cosA, geom512.sinA
-                )
-                val minZoneSq = min(dPhilSq, min(dLeftCornerSq, dRightCornerSq))
-                if (minZoneSq >= 1.0f) continue
+                // Local anatomical coordinates (uNorm, vFrac) from nose tip (vFrac = 0) to mouth center (vFrac = 1)
+                val dx = xf - geom512.nose.x
+                val dy = yf - geom512.nose.y
+                val u = dx * ux + dy * uy
+                val v = dx * vx + dy * vy
+                val uNorm = abs(u) / halfSpanU
+                if (uNorm >= 1.0f) continue
+
+                val vFrac = v / noseToMouthDist
+                // Upper boundary: below nose tip & nostrils (vTop = 0.14 in center, 0.10 at sides)
+                val vTop = 0.14f - 0.04f * uNorm
+                // Lower boundary: covers the entire cutaneous philtrum & moustache arch (vFrac up to 0.85)
+                // while staying above the oral slit (vFrac = 1.0)
+                val vBottom = 0.85f + 0.07f * (uNorm * uNorm)
+                if (vFrac <= vTop || vFrac >= vBottom) continue
 
                 val dNostrilSq = orientedEllipseDistSq(
-                    xf, yf, geom512.nose.x, geom512.nose.y + nostrilRy * 0.25f, nostrilRx, nostrilRy, geom512.cosA, geom512.sinA
+                    xf, yf, geom512.nose.x, geom512.nose.y + nostrilRy * 0.15f, nostrilRx, nostrilRy, geom512.cosA, geom512.sinA
                 )
-                if (dNostrilSq < 0.78f) continue
-
-                val dLipCoreSq = orientedEllipseDistSq(
-                    xf, yf, mouthMidX, mouthMidY + 3f, lipCoreRx, lipCoreRy, geom512.cosA, geom512.sinA
-                )
+                if (dNostrilSq < 0.85f) continue
 
                 val idx = row + x
+                val tc = tgtPx512[idx]
+                val tR = (tc ushr 16) and 0xFF
+                val tG = (tc ushr 8) and 0xFF
+                val tB = tc and 0xFF
+
+                // Chromatic lip-vermilion guard: never overwrite actual red/pink lip vermilion pixels
+                if (vFrac > 0.72f && (tR - tG) > 64) continue
+
                 val sc = swapPx512[idx]
                 val sR = (sc ushr 16) and 0xFF
                 val sG = (sc ushr 8) and 0xFF
                 val sB = sc and 0xFF
                 val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
 
-                val tc = tgtPx512[idx]
-                val tR = (tc ushr 16) and 0xFF
-                val tG = (tc ushr 8) and 0xFF
-                val tB = tc and 0xFF
-                val tLum = 0.299f * tR + 0.587f * tG + 0.114f * tB
-
-                val lipRedness = sR - 0.5f * (sG + sB)
-                val isVermilionLip = dLipCoreSq < 0.84f && lipRedness > 20f
-                if (isVermilionLip) continue
-
-                // Preserve subtle 3D philtrum dimple modulation and micro-pore texture from the moustache-free Target
-                val localShading = (tLum / tPhiltrumMeanLum).coerceIn(0.94f, 1.05f)
-                val cleanSkinR = (baseCheekR * localShading).coerceIn(0f, 255f)
-                val cleanSkinG = (baseCheekG * localShading).coerceIn(0f, 255f)
-                val cleanSkinB = (baseCheekB * localShading).coerceIn(0f, 255f)
+                // Tone-matched clean Target philtrum skin pixel (preserving real Target skin pores & 3D philtrum shading)
+                val cleanSkinR = (tR + residualR).coerceIn(0f, 255f)
+                val cleanSkinG = (tG + residualG).coerceIn(0f, 255f)
+                val cleanSkinB = (tB + residualB).coerceIn(0f, 255f)
                 val expectedCleanLum = 0.299f * cleanSkinR + 0.587f * cleanSkinG + 0.114f * cleanSkinB
 
-                // Detect ANY luminance darkening (moustache shadow), grey/cyan facial-hair cast, or pigment mismatch
+                // Smooth raised-cosine spatial envelope horizontally (envU) and vertically (envV)
+                val envU = if (uNorm <= 0.74f) {
+                    1.0f
+                } else {
+                    val t = (uNorm - 0.74f) / 0.26f
+                    (0.5f * (1.0f + cos(Math.PI * t))).toFloat()
+                }
+                val vMid = (vTop + vBottom) * 0.5f
+                val vHalf = (vBottom - vTop) * 0.5f
+                val vDistNorm = (abs(vFrac - vMid) / vHalf).coerceIn(0f, 1f)
+                val envV = if (vDistNorm <= 0.76f) {
+                    1.0f
+                } else {
+                    val t = (vDistNorm - 0.76f) / 0.24f
+                    (0.5f * (1.0f + cos(Math.PI * t))).toFloat()
+                }
+                val zoneEnv = envU * envV
+
                 val shadowDeficit = expectedCleanLum - sLum
                 val cleanWarmth = cleanSkinR - cleanSkinB
                 val swapWarmth = (sR - sB).toFloat()
                 val greyCastDeficit = cleanWarmth - swapWarmth
 
-                if (shadowDeficit > -1.0f || greyCastDeficit > 1.0f) {
-                    val rNorm = sqrt(minZoneSq).coerceIn(0f, 1f)
-                    val zoneEnv = if (rNorm <= 0.65f) {
-                        1.0f
-                    } else {
-                        val t = (rNorm - 0.65f) / 0.35f
-                        (0.5f * (1.0f + cos(Math.PI * t))).toFloat()
-                    }
-                    val replaceWeight = (0.97f * zoneEnv).coerceIn(0f, 0.97f)
-
+                if (shadowDeficit > -3.0f || greyCastDeficit > 0.2f) {
+                    val replaceWeight = (0.98f * zoneEnv).coerceIn(0f, 0.98f)
                     val outR = (sR * (1f - replaceWeight) + cleanSkinR * replaceWeight).toInt().coerceIn(0, 255)
                     val outG = (sG * (1f - replaceWeight) + cleanSkinG * replaceWeight).toInt().coerceIn(0, 255)
                     val outB = (sB * (1f - replaceWeight) + cleanSkinB * replaceWeight).toInt().coerceIn(0, 255)
@@ -1489,7 +1522,7 @@ object FaceBlender {
     /**
      * 2-Band (Low-Frequency Illumination + High-Frequency Detail) Multi-Band & Jawline Shadow Fusion
      * in 512x512 HD space: smoothly aligns the outer cheek, forehead, and chin/neck jawline shadow
-     * envelope of `swapPx512` to `tgtPx512` across the transition ring (`0.05 < mask512 < 0.92`)
+     * envelope of `swapPx512` to `tgtPx512` across the transition ring (`0.02 < mask512 < 0.96`)
      * while preserving 100% of the swapped face's crisp high-frequency detail.
      */
     private fun applyMultiBandBoundaryAndJawlineFusion512(
@@ -1497,27 +1530,39 @@ object FaceBlender {
         tgtPx512: IntArray,
         mask512: FloatArray
     ) {
-        val step = 12
-        for (y in step until HD_SIZE - step) {
+        val origSwap = swapPx512.copyOf()
+        val step1 = 8
+        val step2 = 18
+        for (y in step2 until HD_SIZE - step2) {
             val row = y * HD_SIZE
-            val jawlineBoost = if (y > 340) 0.35f else 0.22f
-            for (x in step until HD_SIZE - step) {
+            val jawlineBoost = if (y > 330) 0.76f else 0.64f
+            for (x in step2 until HD_SIZE - step2) {
                 val idx = row + x
                 val m = mask512[idx]
-                if (m <= 0.04f || m >= 0.94f) continue
+                if (m <= 0.02f || m >= 0.96f) continue
 
-                val boundaryWeight = ((1.0f - m) * jawlineBoost).coerceIn(0f, 0.42f)
-                val sLow = compute5PointLowPassRGB512(swapPx512, x, y, step)
-                val tLow = compute5PointLowPassRGB512(tgtPx512, x, y, step)
+                val boundaryWeight = ((1.0f - m) * jawlineBoost).coerceIn(0f, 0.74f)
+                val sLow1 = compute5PointLowPassRGB512(origSwap, x, y, step1)
+                val sLow2 = compute5PointLowPassRGB512(origSwap, x, y, step2)
+                val tLow1 = compute5PointLowPassRGB512(tgtPx512, x, y, step1)
+                val tLow2 = compute5PointLowPassRGB512(tgtPx512, x, y, step2)
 
-                val sc = swapPx512[idx]
+                val sLowR = 0.45f * sLow1[0] + 0.55f * sLow2[0]
+                val sLowG = 0.45f * sLow1[1] + 0.55f * sLow2[1]
+                val sLowB = 0.45f * sLow1[2] + 0.55f * sLow2[2]
+
+                val tLowR = 0.45f * tLow1[0] + 0.55f * tLow2[0]
+                val tLowG = 0.45f * tLow1[1] + 0.55f * tLow2[1]
+                val tLowB = 0.45f * tLow1[2] + 0.55f * tLow2[2]
+
+                val sc = origSwap[idx]
                 val sr = (sc ushr 16) and 0xFF
                 val sg = (sc ushr 8) and 0xFF
                 val sb = sc and 0xFF
 
-                val nr = (sr + (tLow[0] - sLow[0]) * boundaryWeight).toInt().coerceIn(0, 255)
-                val ng = (sg + (tLow[1] - sLow[1]) * boundaryWeight).toInt().coerceIn(0, 255)
-                val nb = (sb + (tLow[2] - sLow[2]) * boundaryWeight).toInt().coerceIn(0, 255)
+                val nr = (sr + (tLowR - sLowR) * boundaryWeight).toInt().coerceIn(0, 255)
+                val ng = (sg + (tLowG - sLowG) * boundaryWeight).toInt().coerceIn(0, 255)
+                val nb = (sb + (tLowB - sLowB) * boundaryWeight).toInt().coerceIn(0, 255)
                 swapPx512[idx] = (0xFF shl 24) or (nr shl 16) or (ng shl 8) or nb
             }
         }
@@ -1539,8 +1584,8 @@ object FaceBlender {
 
     /**
      * Harmonizes the 512x512 restored crop according to the user's chosen [SkinToneSourceMode]
-     * (`TARGET_SCENE`, `SOURCE_IDENTITY`, or `BALANCED_BLEND`) while protecting dark iris/lash
-     * contrast and natural lip vermilion chrominance.
+     * (`TARGET_SCENE`, `SOURCE_IDENTITY`, or `BALANCED_BLEND`) using full Mean + Contrast (StdDev)
+     * transfer across the face while protecting dark iris/lash contrast.
      */
     private fun harmonizeSkinToneByMode512(
         swapPx512: IntArray,
@@ -1601,11 +1646,52 @@ object FaceBlender {
         dGMean /= count
         dBMean /= count
 
+        var sRVar = 0.0
+        var sGVar = 0.0
+        var sBVar = 0.0
+        var tRVar = 0.0
+        var tGVar = 0.0
+        var tBVar = 0.0
+        for (y in 120..410 step 4) {
+            val ny = (y - 268.0) / 148.0
+            for (x in 120..392 step 4) {
+                val nx = (x - 256.0) / 136.0
+                if (nx * nx + ny * ny <= 1.0) {
+                    if (computeEyeAndBrowProtectionWeight(x.toFloat(), y.toFloat(), geom512) > 0.12f) continue
+                    if (y in 320..412 && x in 164..348) continue
+                    val idx = y * HD_SIZE + x
+                    val sc = swapPx512[idx]
+                    val tc = tgtPx512[idx]
+                    val tLum = 0.299 * (tc ushr 16 and 0xFF) + 0.587 * (tc ushr 8 and 0xFF) + 0.114 * (tc and 0xFF)
+                    if (tLum < 50.0) continue
+                    val dSr = ((sc ushr 16) and 0xFF) - sRMean
+                    val dSg = ((sc ushr 8) and 0xFF) - sGMean
+                    val dSb = (sc and 0xFF) - sBMean
+                    val dTr = ((tc ushr 16) and 0xFF) - tRMean
+                    val dTg = ((tc ushr 8) and 0xFF) - tGMean
+                    val dTb = (tc and 0xFF) - tBMean
+                    sRVar += dSr * dSr
+                    sGVar += dSg * dSg
+                    sBVar += dSb * dSb
+                    tRVar += dTr * dTr
+                    tGVar += dTg * dTg
+                    tBVar += dTb * dTb
+                }
+            }
+        }
+        val varCount = (count / 4).coerceAtLeast(1)
+        val sRStd = sqrt(sRVar / varCount).coerceAtLeast(10.0)
+        val sGStd = sqrt(sGVar / varCount).coerceAtLeast(10.0)
+        val sBStd = sqrt(sBVar / varCount).coerceAtLeast(10.0)
+        val tRStd = sqrt(tRVar / varCount).coerceAtLeast(10.0)
+        val tGStd = sqrt(tGVar / varCount).coerceAtLeast(10.0)
+        val tBStd = sqrt(tBVar / varCount).coerceAtLeast(10.0)
+
         val (goalRMean, goalGMean, goalBMean) = when (skinToneMode) {
             SkinToneSourceMode.TARGET_SCENE -> Triple(
-                tRMean * 0.85 + sRMean * 0.15,
-                tGMean * 0.85 + sGMean * 0.15,
-                tBMean * 0.85 + sBMean * 0.15
+                tRMean * 0.96 + sRMean * 0.04,
+                tGMean * 0.96 + sGMean * 0.04,
+                tBMean * 0.96 + sBMean * 0.04
             )
             SkinToneSourceMode.SOURCE_IDENTITY -> Triple(
                 dRMean * 0.82 + tRMean * 0.18,
@@ -1619,38 +1705,38 @@ object FaceBlender {
             )
         }
 
-        val shiftR = (goalRMean - sRMean).toFloat().coerceIn(-62f, 62f)
-        val shiftG = (goalGMean - sGMean).toFloat().coerceIn(-56f, 56f)
-        val shiftB = (goalBMean - sBMean).toFloat().coerceIn(-48f, 48f)
-        val strength = when (skinToneMode) {
-            SkinToneSourceMode.TARGET_SCENE -> 0.65f
-            SkinToneSourceMode.SOURCE_IDENTITY -> 0.70f
-            SkinToneSourceMode.BALANCED_BLEND -> 0.65f
-        }
+        val scaleR = ((0.85 * tRStd + 0.15 * sRStd) / sRStd).toFloat().coerceIn(0.78f, 1.26f)
+        val scaleG = ((0.85 * tGStd + 0.15 * sGStd) / sGStd).toFloat().coerceIn(0.78f, 1.26f)
+        val scaleB = ((0.85 * tBStd + 0.15 * sBStd) / sBStd).toFloat().coerceIn(0.78f, 1.26f)
 
-        val mouthMidX = (geom512.leftMouth.x + geom512.rightMouth.x) * 0.5f
-        val mouthMidY = (geom512.leftMouth.y + geom512.rightMouth.y) * 0.5f
-        val mouthRx = geom512.eyeDist * 0.45f
-        val mouthRy = geom512.eyeDist * 0.24f
+        val strength = when (skinToneMode) {
+            SkinToneSourceMode.TARGET_SCENE -> 0.94f
+            SkinToneSourceMode.SOURCE_IDENTITY -> 0.78f
+            SkinToneSourceMode.BALANCED_BLEND -> 0.86f
+        }
 
         for (y in 0 until HD_SIZE) {
             val row = y * HD_SIZE
             for (x in 0 until HD_SIZE) {
                 val idx = row + x
-                val eyeProt = computeEyeAndBrowProtectionWeight(x.toFloat(), y.toFloat(), geom512)
-                val dMouthSq = orientedEllipseDistSq(
-                    x.toFloat(), y.toFloat(),
-                    mouthMidX, mouthMidY,
-                    mouthRx, mouthRy,
-                    geom512.cosA, geom512.sinA
-                )
-                val lipProt = if (dMouthSq < 1.0f) (1.0f - dMouthSq) * 0.55f else 0f
-                val featureProt = max(eyeProt * 0.85f, lipProt)
-                val blend = strength * (1.0f - featureProt)
                 val c = swapPx512[idx]
-                val r = ((c ushr 16 and 0xFF) + shiftR * blend).toInt().coerceIn(0, 255)
-                val g = ((c ushr 8 and 0xFF) + shiftG * blend).toInt().coerceIn(0, 255)
-                val b = ((c and 0xFF) + shiftB * blend).toInt().coerceIn(0, 255)
+                val origR = (c ushr 16) and 0xFF
+                val origG = (c ushr 8) and 0xFF
+                val origB = c and 0xFF
+
+                val eyeProt = computeEyeAndBrowProtectionWeight(x.toFloat(), y.toFloat(), geom512)
+                val lum = 0.299f * origR + 0.587f * origG + 0.114f * origB
+                // Protect only very dark pupil/lash cores so dark irises never turn grey
+                val darkIrisProt = if (eyeProt > 0.2f && lum < 55f) eyeProt * 0.80f else 0f
+                val blend = strength * (1.0f - darkIrisProt)
+
+                val matchedR = ((origR - sRMean) * scaleR + goalRMean).toFloat()
+                val matchedG = ((origG - sGMean) * scaleG + goalGMean).toFloat()
+                val matchedB = ((origB - sBMean) * scaleB + goalBMean).toFloat()
+
+                val r = (origR * (1f - blend) + matchedR * blend).toInt().coerceIn(0, 255)
+                val g = (origG * (1f - blend) + matchedG * blend).toInt().coerceIn(0, 255)
+                val b = (origB * (1f - blend) + matchedB * blend).toInt().coerceIn(0, 255)
                 swapPx512[idx] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
             }
         }
@@ -1787,10 +1873,10 @@ object FaceBlender {
 
     /**
      * Creates a landmark-fitted 512x512 Biometric Inner-Face Mask that:
-     *  - Covers 100% of the eyebrows, eyes, nose, lips, and inner cheeks (`innerCoreRatio = 0.65f`)
-     *  - Tapers smoothly along the outer cheek, forehead, and jawline contour
-     *  - Applies foreground hair/glasses occlusion protection strictly on the outer perimeter (`r > 0.58f`)
-     *    so the inner swapped face is never suppressed
+     *  - Covers 100% of the eyebrows, eyes, nose, lips, and inner cheeks (`innerCoreRatio = 0.56f`)
+     *  - Tapers smoothly along the outer cheek, forehead, and jawline contour (`radiusX = 1.12 * eyeDist`, `radiusY = 1.24 * eyeDist`)
+     *  - Applies foreground hair/glasses occlusion protection strictly on the outer perimeter (`r > 0.54f`)
+     *    so the inner swapped face is never suppressed and the swap box border never leaks onto hair/ears/neck.
      */
     private fun createBiometricFaceMask512(
         geom512: WarpedFaceGeometry,
@@ -1809,10 +1895,10 @@ object FaceBlender {
         val centerX = (eyeMidX * 0.45f + geom512.nose.x * 0.30f + mouthMidX * 0.25f)
         val centerY = (eyeMidY * 0.42f + geom512.nose.y * 0.28f + mouthMidY * 0.30f)
 
-        val radiusX = (geom512.eyeDist * 1.36f).coerceIn(150f, 214f)
-        val radiusY = (geom512.eyeDist * 1.56f).coerceIn(172f, 228f)
-        val innerCoreRatio = if (skinToneMode == SkinToneSourceMode.SOURCE_IDENTITY) 0.58f else 0.65f
-        val borderMargin = 20
+        val radiusX = (geom512.eyeDist * 1.12f).coerceIn(136f, 174f)
+        val radiusY = (geom512.eyeDist * 1.24f).coerceIn(152f, 194f)
+        val innerCoreRatio = if (skinToneMode == SkinToneSourceMode.SOURCE_IDENTITY) 0.52f else 0.56f
+        val borderMargin = 24
 
         for (y in 0 until HD_SIZE) {
             val row = y * HD_SIZE
@@ -1842,8 +1928,8 @@ object FaceBlender {
                 }
 
                 val idx = row + x
-                if (enableOcclusionProtection && r > 0.58f && alpha > 0.01f) {
-                    val perimWeight = ((r - 0.58f) / 0.42f).coerceIn(0f, 1f)
+                if (enableOcclusionProtection && r > 0.54f && alpha > 0.01f) {
+                    val perimWeight = ((r - 0.54f) / 0.46f).coerceIn(0f, 1f)
                     if (neuralOcclusionGate512 != null) {
                         val segGate = neuralOcclusionGate512[idx].coerceIn(0f, 1f)
                         val gateFactor = 1.0f - perimWeight * (1.0f - (0.35f + 0.65f * segGate))
@@ -1854,8 +1940,8 @@ object FaceBlender {
                     val sc = swapPx512[idx]
                     val tLum = 0.299f * (tc ushr 16 and 0xFF) + 0.587f * (tc ushr 8 and 0xFF) + 0.114f * (tc and 0xFF)
                     val sLum = 0.299f * (sc ushr 16 and 0xFF) + 0.587f * (sc ushr 8 and 0xFF) + 0.114f * (sc and 0xFF)
-                    if (tLum < 52f && sLum > tLum + 28f) {
-                        val hairKeep = (((52f - tLum) / 45f) * perimWeight).coerceIn(0f, 0.80f)
+                    if (tLum < 56f && sLum > tLum + 24f) {
+                        val hairKeep = (((56f - tLum) / 45f) * perimWeight).coerceIn(0f, 0.85f)
                         alpha *= (1.0f - hairKeep)
                     }
                 }

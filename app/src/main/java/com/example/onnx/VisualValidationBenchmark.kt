@@ -154,11 +154,6 @@ object VisualValidationBenchmark {
             val targetPixels = IntArray(targetW * targetH)
             targetBitmap.getPixels(targetPixels, 0, targetW, 0, 0, targetW, targetH)
 
-            val gfpganFile = context?.let { OnnxProtobufInspector.resolveModelFile(it, ModelSlot.ENHANCEMENT) }
-                ?.takeIf { it.exists() && it.length() > 1024L }
-            val segFile = context?.let { OnnxProtobufInspector.resolveModelFile(it, ModelSlot.SEGMENTATION) }
-                ?.takeIf { it.exists() && it.length() > 1024L }
-
             val candidateEnhanceStrength = when (candidate) {
                 SwapModelCandidate.A_INSWAPPER_128 -> 0.85f
                 SwapModelCandidate.B_HYPERSWAP_1A_256 -> 0.90f
@@ -170,7 +165,7 @@ object VisualValidationBenchmark {
             var s2Bmp: Bitmap? = null
             val restoredHd512 = FaceBlender.enhanceAndBlendOnlineHdFace512(
                 ortEnv = ortEnv,
-                gfpganFile = gfpganFile,
+                gfpganFile = null,
                 targetBitmap = targetBitmap,
                 targetPixels = targetPixels,
                 targetWidth = targetW,
@@ -186,7 +181,7 @@ object VisualValidationBenchmark {
                 enableOcclusionProtection = true,
                 blendStrength = 1.0f,
                 enhancementStrength = candidateEnhanceStrength,
-                segformerFile = segFile,
+                segformerFile = null,
                 onStagesCaptured = { s1, s2, _ ->
                     s1Bmp = s1
                     s2Bmp = s2
@@ -362,7 +357,7 @@ object VisualValidationBenchmark {
      *  - 256x256 HyperSwap 1a/1b/1c preserve 4x higher spatial detail on iris, eyelashes, nose alar creases,
      *    and lip vermilion than 128x128 inswapper_128.
      */
-    private fun synthesizeRawSwapCandidateCrop(
+    internal fun synthesizeRawSwapCandidateCrop(
         candidate: SwapModelCandidate,
         srcCrop: Bitmap,
         tgtCrop: Bitmap,

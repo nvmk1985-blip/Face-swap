@@ -213,11 +213,11 @@ class OnnxRuntimeModelService(
          * `segformer_B5_ce.onnx`) plus the core detector and swapper models.
          */
         val PRIMARY_MEMORY_SLOTS = listOf(
-            ModelSlot.RECOGNIZER,   // w600k_r50.onnx
-            ModelSlot.ENHANCEMENT,  // gfpgan_1.4.onnx
-            ModelSlot.SEGMENTATION, // segformer_B5_ce.onnx
             ModelSlot.DETECTOR,     // det_10g.onnx
-            ModelSlot.SWAPPER       // inswapper_128.onnx
+            ModelSlot.RECOGNIZER,   // w600k_r50.onnx
+            ModelSlot.SWAPPER,      // hyperswap_1b_256.onnx
+            ModelSlot.ENHANCEMENT,  // gfpgan_1.4.onnx
+            ModelSlot.SEGMENTATION  // segformer_B5_ce.onnx
         )
     }
 
@@ -228,13 +228,13 @@ class OnnxRuntimeModelService(
         synchronized(sessionLock) {
             val tStart = System.currentTimeMillis()
 
-            // In low-memory mode, prioritize w600k_r50.onnx, det_10g.onnx, gfpgan_1.4.onnx, and segformer_B5_ce.onnx
+            // Prioritize core production face-swap models (det_10g, w600k_r50, hyperswap_1b_256)
             val slotsToLoad = if (lowMemoryMode) {
                 listOf(
                     ModelSlot.DETECTOR,
                     ModelSlot.RECOGNIZER,
-                    ModelSlot.ENHANCEMENT,
-                    ModelSlot.SEGMENTATION
+                    ModelSlot.SWAPPER,
+                    ModelSlot.ENHANCEMENT
                 )
             } else {
                 PRIMARY_MEMORY_SLOTS
@@ -503,13 +503,11 @@ class OnnxRuntimeModelService(
         scaleAdjust: Float,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
+        val tModelLoad0 = System.currentTimeMillis()
         val arcFaceSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel)
         val swapSession = getOrLoadSession(ModelSlot.SWAPPER, preferHardwareAccel)
-        val gfpganSession = getOrLoadSession(ModelSlot.ENHANCEMENT, preferHardwareAccel)
-        val segformerSession = if (enableOcclusionProtection) {
-            getOrLoadSession(ModelSlot.SEGMENTATION, preferHardwareAccel)
-        } else null
         val emap = getOrLoadInswapperEmap()
+        val modelLoadingMs = (System.currentTimeMillis() - tModelLoad0).coerceAtLeast(0L)
 
         return InSwapperEngine.executeFaceSwap(
             context = appContext,
@@ -533,9 +531,10 @@ class OnnxRuntimeModelService(
             preferHardwareAccel = preferHardwareAccel,
             preloadedArcFaceSession = arcFaceSession,
             preloadedSwapSession = swapSession,
-            preloadedGfpganSession = gfpganSession,
-            preloadedSegformerSession = segformerSession,
+            preloadedGfpganSession = null,
+            preloadedSegformerSession = null,
             preloadedEmap512x512 = emap,
+            modelLoadingMs = modelLoadingMs,
             onProgress = onProgress
         )
     }

@@ -353,6 +353,69 @@ object OnnxProtobufInspector {
         return primaryFile
     }
 
+    private data class CachedOrtSessionEntry(
+        val session: OrtSession,
+        val lastModified: Long,
+        val fileLength: Long
+    )
+
+    private val globalSessionCache = java.util.concurrent.ConcurrentHashMap<String, CachedOrtSessionEntry>()
+    private val globalSessionLock = Any()
+
+    /**
+     * Loads and caches an [OrtSession] for [file] once and reuses it across all subsequent calls.
+     * Never re-initializes the session unless the underlying file path, timestamp, or size changes.
+     */
+    fun getOrCreateCachedSession(
+        ortEnv: OrtEnvironment,
+        file: File,
+        preferHardwareAcceleration: Boolean = false
+    ): OrtSession? {
+        if (!file.exists() || file.length() <= 1024L) return null
+        val key = file.absolutePath
+        val lastMod = file.lastModified()
+        val len = file.length()
+        globalSessionCache[key]?.let { existing ->
+            if (existing.lastModified == lastMod && existing.fileLength == len) {
+                return existing.session
+            }
+        }
+        synchronized(globalSessionLock) {
+            globalSessionCache[key]?.let { existing ->
+                if (existing.lastModified == lastMod && existing.fileLength == len) {
+                    return existing.session
+                }
+                runCatching { existing.session.close() }
+                globalSessionCache.remove(key)
+            }
+            return runCatching {
+                createOptimizedSessionOptions(preferHardwareAcceleration).use { opts ->
+                    val session = ortEnv.createSession(file.absolutePath, opts)
+                    globalSessionCache[key] = CachedOrtSessionEntry(session, lastMod, len)
+                    session
+                }
+            }.getOrNull()
+        }
+    }
+
+    fun evictCachedSession(file: File?) {
+        if (file == null) return
+        synchronized(globalSessionLock) {
+            globalSessionCache.remove(file.absolutePath)?.let { entry ->
+                runCatching { entry.session.close() }
+            }
+        }
+    }
+
+    fun clearCachedSessions() {
+        synchronized(globalSessionLock) {
+            for ((_, entry) in globalSessionCache) {
+                runCatching { entry.session.close() }
+            }
+            globalSessionCache.clear()
+        }
+    }
+
     /**
      * Creates a configured `OrtSession.SessionOptions` with optional Android NNAPI/GPU hardware
      * acceleration and automatic CPU fallback, plus memory arena optimization.
@@ -365,10 +428,11 @@ object OnnxProtobufInspector {
         opts.setIntraOpNumThreads(intraOpThreads)
         opts.setMemoryPatternOptimization(true)
         opts.setCPUArenaAllocator(true)
-        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
+        // Use BASIC_OPT to avoid 30-45s ALL_OPT/NNAPI graph partitioning stalls on 300MB+ ONNX models
+        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
         if (preferHardwareAcceleration) {
             runCatching {
-                opts.addNnapi()
+                opts.addXnnpack(mapOf("intra_op_num_threads" to intraOpThreads.toString()))
             }
         }
         return opts
@@ -725,6 +789,11 @@ object OnnxProtobufInspector {
     }
 
     fun loadOrExtractInswapperEmap(context: Context, inswapperFile: File): FloatArray? {
+        if (!inswapperFile.exists()) return null
+        if (inswapperFile.name.lowercase().contains("hyperswap")) {
+            // HyperSwap 1a/1b/1c 256 models consume the L2-normalized 512-D ArcFace vector directly
+            return null
+        }
         val cacheFile = File(getModelsRootDir(context), EMAP_CACHE_FILE)
         if (cacheFile.exists() && cacheFile.length() == EMAP_BYTES.toLong()) {
             return runCatching {
@@ -734,8 +803,6 @@ object OnnxProtobufInspector {
                 floats
             }.getOrNull()
         }
-
-        if (!inswapperFile.exists()) return null
 
         val extracted = runCatching {
             scanOnnxFor512x512Initializer(inswapperFile)

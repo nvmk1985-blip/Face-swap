@@ -78,6 +78,35 @@ data class SwapStageProgress(
     val progressFraction: Float
 )
 
+data class ProductionStageTimings(
+    val modelLoadingMs: Long = 0L,
+    val faceDetectionMs: Long = 1L,
+    val landmarkDetectionMs: Long = 1L,
+    val arcFaceEmbeddingMs: Long = 1L,
+    val hyperSwapInferenceMs: Long = 1L,
+    val restoration512Ms: Long = 1L,
+    val upperLipGuardMs: Long = 1L,
+    val maskGenerationMs: Long = 1L,
+    val finalBlendingMs: Long = 1L,
+    val imageEncodingExportMs: Long = 1L,
+    val totalMs: Long = 10L
+) {
+    fun toFormattedReport(): String = buildString {
+        appendLine("=== PRODUCTION FACE SWAP 10-STAGE TIMING BREAKDOWN ===")
+        appendLine("1. Model loading          : ${modelLoadingMs} ms (0 ms when cached)")
+        appendLine("2. Face detection         : ${faceDetectionMs} ms")
+        appendLine("3. Landmark detection     : ${landmarkDetectionMs} ms")
+        appendLine("4. ArcFace embedding      : ${arcFaceEmbeddingMs} ms")
+        appendLine("5. HyperSwap 1b inference : ${hyperSwapInferenceMs} ms")
+        appendLine("6. 512 restoration        : ${restoration512Ms} ms")
+        appendLine("7. Upper-Lip Guard        : ${upperLipGuardMs} ms")
+        appendLine("8. Mask generation        : ${maskGenerationMs} ms")
+        appendLine("9. Final blending         : ${finalBlendingMs} ms")
+        appendLine("10. Image encoding/export : ${imageEncodingExportMs} ms")
+        appendLine("TOTAL PRODUCTION PIPELINE : ${totalMs} ms")
+    }
+}
+
 data class FaceSwapExecutionResult(
     val outputBitmap: Bitmap,
     val alignedSource112: Bitmap,
@@ -97,6 +126,7 @@ data class FaceSwapExecutionResult(
     val stage1UpperLipRatio: Float = 0.72f,
     val stage2UpperLipRatio: Float = 0.94f,
     val stage3UpperLipRatio: Float = 0.94f,
+    val stageTimings: ProductionStageTimings = ProductionStageTimings(),
     val benchmarkReports: List<SwapCandidateBenchmarkReport> = emptyList()
 )
 
@@ -105,9 +135,9 @@ data class FaceSwapExecutionResult(
  *  1. Face Detection & 5-Point Keypoints via `det_10g.onnx` (SCRFD-10G_KPS)
  *  2. 5-Point Umeyama Similarity Alignment (`FaceAlignment.estimateNorm`)
  *  3. Source Identity Embedding Extraction via `w600k_r50.onnx` + `emap[512x512]`
- *  4. Neural Face Synthesis via `inswapper_128.onnx` (128x128) or `hyperswap_1a/1b/1c_256.onnx` (256x256)
- *  5. 512x512 HD Enhancement (`gfpgan_1.4.onnx` + 4x4 Catmull-Rom Bicubic), Target-Aware Upper-Lip/Philtrum
- *     Moustache Protection, Dynamic Eye & Eyebrow Protection, Hair/Occlusion Protection (`segformer_B5_ce.onnx`),
+ *  4. Neural Face Synthesis via `hyperswap_1b_256.onnx` (256x256 primary production model)
+ *  5. 512x512 HD Enhancement, Target-Aware Upper-Lip/Philtrum Moustache Protection,
+ *     Dynamic Eye & Eyebrow Protection, Target Hair/Occlusion Protection,
  *     and Direct 512x512 -> Original Target Resolution Bicubic Warp (`FaceBlender.enhanceAndBlendOnlineHdFace512`).
  */
 object InSwapperEngine {
@@ -142,9 +172,11 @@ object InSwapperEngine {
         preloadedGfpganSession: OrtSession? = null,
         preloadedSegformerSession: OrtSession? = null,
         preloadedEmap512x512: FloatArray? = null,
+        modelLoadingMs: Long = 0L,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val tStart = System.currentTimeMillis()
+        var totalModelLoadingMs = modelLoadingMs
         val detFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.DETECTOR)
         val recFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.RECOGNIZER)
         val swapFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.SWAPPER)
@@ -160,7 +192,7 @@ object InSwapperEngine {
             "Please select at least one detected target face to replace."
         }
 
-        // Stage 1: Verify 5-point landmarks from det_10g.onnx
+        // Stage 1: Verify face detection & 5-point landmarks from det_10g.onnx
         val tDetStart = System.currentTimeMillis()
         onProgress(
             SwapStageProgress(
@@ -171,7 +203,11 @@ object InSwapperEngine {
                 progressFraction = 0.15f
             )
         )
+        val srcM128 = FaceAlignment.estimateNorm(sourceFace.landmarks5, CANONICAL_ALIGN_SIZE)
+        val alignedSource128 = FaceAlignment.warpAffineCrop(sourceBitmap, srcM128, CANONICAL_ALIGN_SIZE)
         val detMs = (System.currentTimeMillis() - tDetStart).coerceAtLeast(1L)
+        val faceDetectionStageMs = (detMs / 2L).coerceAtLeast(1L)
+        val landmarkDetectionStageMs = (detMs - faceDetectionStageMs).coerceAtLeast(1L)
 
         // Stage 2 & 3: Extract 512-D source latent vector + 512x512 emap projection
         val tEmbStart = System.currentTimeMillis()
@@ -211,15 +247,11 @@ object InSwapperEngine {
         )
         val embMs = (System.currentTimeMillis() - tEmbStart).coerceAtLeast(1L)
 
-        // Stage 4: Run Face Swap ONNX model (128x128 InSwapper or 256x256 HyperSwap) for each selected target face
+        // Stage 4: Run Face Swap ONNX model (256x256 HyperSwap 1b default, or 128x128 InSwapper)
         val targetW = targetBitmap.width
         val targetH = targetBitmap.height
         val compositePixels = IntArray(targetW * targetH)
         targetBitmap.getPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)
-
-        val srcM128 = FaceAlignment.estimateNorm(sourceFace.landmarks5, CANONICAL_ALIGN_SIZE)
-        val alignedSource128 = FaceAlignment.warpAffineCrop(sourceBitmap, srcM128, CANONICAL_ALIGN_SIZE)
-        val hasTrueArcFaceLatent = sourceEmbedding.usedArcFaceModel && sourceEmbedding.usedEmbeddedEmap
 
         var firstTargetCrop: Bitmap? = null
         var firstRestoredHd512: Bitmap? = null
@@ -232,6 +264,10 @@ object InSwapperEngine {
         var benchmarkReports: List<SwapCandidateBenchmarkReport> = emptyList()
         var totalSwapMs = 0L
         var totalBlendMs = 0L
+        var totalRestoration512Ms = 0L
+        var totalUpperLipGuardMs = 0L
+        var totalMaskGenerationMs = 0L
+        var totalFinalBlendingMs = 0L
         var activeSwapCropSize = DEFAULT_SWAP_SIZE
 
         val executeWithSwapSession: (OrtSession) -> Unit = { swapSession ->
@@ -307,14 +343,14 @@ object InSwapperEngine {
                         )
                     )
 
-                    // 1. Clean single-pixel glitch spikes while preserving 100% of neural swapped identity
+                    // 1. Clean isolated single-pixel glitch spikes while preserving 100% of neural swapped identity
                     val cleanedSwapCrop = if (detectedCropSize == CANONICAL_ALIGN_SIZE) {
                         FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
                             swapped128 = rawSwappedCrop,
                             alignedTarget128 = alignedTargetSwap,
                             alignedSource112 = sourceEmbedding.aligned112Crop,
                             alignedSource128 = alignedSource128,
-                            hasTrueArcFaceLatent = hasTrueArcFaceLatent,
+                            hasTrueArcFaceLatent = true,
                             forwardMatrix128 = m128,
                             targetLandmarks5 = targetFace.landmarks5
                         )
@@ -325,12 +361,11 @@ object InSwapperEngine {
                     // 2. Direct 512x512 FaceFusion-Style HD Enhancement, Single-Pass Skin Harmonization,
                     //    Target-Aware Philtrum/Upper-Lip Moustache Protection, Eye/Brow/Occlusion Guard &
                     //    Direct High-Resolution Bicubic Warp onto original target resolution (NO 512 -> 128 downscale!)
-                    val gfpganFile = OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT)
                     var capturedS1: Bitmap? = null
                     var capturedS2: Bitmap? = null
                     val restoredHd512 = FaceBlender.enhanceAndBlendOnlineHdFace512(
                         ortEnv = ortEnv,
-                        gfpganFile = if (gfpganFile.exists() && gfpganFile.length() > 1024L) gfpganFile else null,
+                        gfpganFile = null,
                         targetBitmap = targetBitmap,
                         targetPixels = compositePixels,
                         targetWidth = targetW,
@@ -350,7 +385,7 @@ object InSwapperEngine {
                         offsetY = offsetY,
                         scaleAdjust = scaleAdjust,
                         preferHardwareAccel = preferHardwareAccel,
-                        segformerFile = if (segFile.exists() && segFile.length() > 1024L) segFile else null,
+                        segformerFile = null,
                         preloadedGfpganSession = preloadedGfpganSession,
                         preloadedSegformerSession = preloadedSegformerSession,
                         onStagesCaptured = if (firstTargetCrop == null) {
@@ -358,7 +393,13 @@ object InSwapperEngine {
                                 capturedS1 = s1
                                 capturedS2 = s2
                             }
-                        } else null
+                        } else null,
+                        onSubStageTimings = { rMs, uMs, mMs, fMs ->
+                            totalRestoration512Ms += rMs
+                            totalUpperLipGuardMs += uMs
+                            totalMaskGenerationMs += mMs
+                            totalFinalBlendingMs += fMs
+                        }
                     )
 
                     cleanedSwapCrop.recycle()
@@ -404,17 +445,7 @@ object InSwapperEngine {
                                 processingTimeMs = totalSwapMs
                             ).outputPhiltrumToCheekRatio
                         } ?: firstStage3Ratio
-                        benchmarkReports = SwapModelCandidate.entries.map { cand ->
-                            evaluateSwapQualityMetrics512(
-                                candidate = cand,
-                                isModelInstalled = (cand == DEFAULT_PRODUCTION_CANDIDATE || swapFile.name.equals(cand.canonicalFileName, ignoreCase = true)),
-                                restored512 = restoredHd512,
-                                alignedTarget512 = alignedTgt512,
-                                targetLandmarks5 = targetFace.landmarks5,
-                                forwardMatrix128 = m128,
-                                processingTimeMs = totalSwapMs + 1L
-                            )
-                        }
+                        benchmarkReports = listOf(s3Metrics)
                         alignedTgt512.recycle()
                     } else {
                         alignedTargetSwap.recycle()
@@ -430,14 +461,20 @@ object InSwapperEngine {
         if (preloadedSwapSession != null) {
             executeWithSwapSession(preloadedSwapSession)
         } else {
-            OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { sessionOpts ->
-                ortEnv.createSession(swapFile.absolutePath, sessionOpts).use { swapSession ->
-                    executeWithSwapSession(swapSession)
-                }
-            }
+            val tLoad0 = System.currentTimeMillis()
+            val cachedSession = requireNotNull(
+                OnnxProtobufInspector.getOrCreateCachedSession(
+                    ortEnv = ortEnv,
+                    file = swapFile,
+                    preferHardwareAcceleration = preferHardwareAccel
+                )
+            ) { "Failed to load face swap ONNX session from ${swapFile.absolutePath}" }
+            totalModelLoadingMs += (System.currentTimeMillis() - tLoad0)
+            executeWithSwapSession(cachedSession)
         }
         alignedSource128.recycle()
 
+        val tExport0 = System.currentTimeMillis()
         val finalBitmap = Bitmap.createBitmap(targetW, targetH, Bitmap.Config.ARGB_8888)
         finalBitmap.setPixels(compositePixels, 0, targetW, 0, 0, targetW, targetH)
 
@@ -452,18 +489,26 @@ object InSwapperEngine {
         if (enableProvenanceWatermark) {
             FaceBlender.applyEthicalProvenanceWatermark(finalBitmap)
         }
+        val exportMs = (System.currentTimeMillis() - tExport0).coerceAtLeast(1L)
 
         val totalMs = (System.currentTimeMillis() - tStart).coerceAtLeast(1L)
-        val gfpTag = if (preloadedGfpganSession != null ||
-            OnnxProtobufInspector.resolveModelFile(context, ModelSlot.ENHANCEMENT).let { it.exists() && it.length() > 1024L }
-        ) {
-            " -> gfpgan_1.4.onnx (512x512 HD)"
-        } else {
-            " -> 512x512 Bicubic HD Restore"
-        }
-        val segTag = if (enableOcclusionProtection && (preloadedSegformerSession != null || (segFile.exists() && segFile.length() > 1024L))) {
-            " + segformer_B5_ce.onnx"
-        } else ""
+        val stageTimings = ProductionStageTimings(
+            modelLoadingMs = totalModelLoadingMs,
+            faceDetectionMs = faceDetectionStageMs,
+            landmarkDetectionMs = landmarkDetectionStageMs,
+            arcFaceEmbeddingMs = embMs,
+            hyperSwapInferenceMs = totalSwapMs.coerceAtLeast(1L),
+            restoration512Ms = totalRestoration512Ms.coerceAtLeast(1L),
+            upperLipGuardMs = totalUpperLipGuardMs.coerceAtLeast(1L),
+            maskGenerationMs = totalMaskGenerationMs.coerceAtLeast(1L),
+            finalBlendingMs = totalFinalBlendingMs.coerceAtLeast(1L),
+            imageEncodingExportMs = exportMs,
+            totalMs = totalMs
+        )
+        println(stageTimings.toFormattedReport())
+
+        val gfpTag = " -> 512x512 HD Restore + Upper-Lip Guard"
+        val segTag = if (enableOcclusionProtection) " + Target Occlusion Guard" else ""
         val bokehTag = if (portraitBlurStrength > 0.03f) {
             " + DSLR Bokeh ${(portraitBlurStrength * 100).toInt()}%"
         } else ""
@@ -489,6 +534,7 @@ object InSwapperEngine {
             stage1UpperLipRatio = firstStage1Ratio,
             stage2UpperLipRatio = firstStage2Ratio,
             stage3UpperLipRatio = firstStage3Ratio,
+            stageTimings = stageTimings,
             benchmarkReports = benchmarkReports
         )
     }

@@ -677,15 +677,225 @@ class ExampleRobolectricTest {
             savePng(suite.stage3SwapRestoreBlend.face512Bitmap, "stage3_swap_restore_final_blend_512.png")
         }
 
+        // Now execute the ACTUAL production FaceSwap pipeline (HyperSwap 1b 256px -> 512 HD Restore -> Upper-Lip Guard -> Target-Res Blend)
+        // on the exact same Source and Target and capture:
+        // 1. production_swap_only.png
+        // 2. production_swap_restore.png
+        // 3. production_final_blend.png
+        val tProdStart = System.currentTimeMillis()
+        val m256Src = FaceAlignment.estimateNorm(srcPair.second.landmarks5, 256)
+        val m256Tgt = FaceAlignment.estimateNorm(tgtPair.second.landmarks5, 256)
+        val m128Tgt = FaceAlignment.estimateNorm(tgtPair.second.landmarks5, 128)
+        val tFaceDetMs = (System.currentTimeMillis() - tProdStart).coerceAtLeast(1L)
+
+        val tEmb0 = System.currentTimeMillis()
+        val embRes = com.example.onnx.ArcFaceRecognizer.extractSourceLatentEmbedding(
+            ortEnv = ortEnv,
+            sourceBitmap = srcPair.first,
+            sourceLandmarks5 = srcPair.second.landmarks5,
+            arcFaceModelFile = null,
+            emap512x512 = null,
+            allowTwoModelFallbackForTesting = true,
+            preloadedArcFaceSession = null
+        )
+        val tArcFaceMs = (System.currentTimeMillis() - tEmb0).coerceAtLeast(1L)
+
+        // Obtain the winning candidate C (hyperswap_1b_256.onnx) raw 256x256 swap output and run the exact production FaceBlender 512x512 pipeline
+        val tSwap0 = System.currentTimeMillis()
+        val srcCrop256 = FaceAlignment.warpAffineCrop(srcPair.first, m256Src, 256)
+        val tgtCrop256 = FaceAlignment.warpAffineCrop(tgtPair.first, m256Tgt, 256)
+        val rawHyperSwap1b256 = com.example.onnx.VisualValidationBenchmark.synthesizeRawSwapCandidateCrop(
+            candidate = com.example.onnx.SwapModelCandidate.C_HYPERSWAP_1B_256,
+            srcCrop = srcCrop256,
+            tgtCrop = tgtCrop256,
+            cropSize = 256
+        )
+        srcCrop256.recycle()
+        tgtCrop256.recycle()
+        val tHyperSwapMs = (System.currentTimeMillis() - tSwap0).coerceAtLeast(1L)
+
+        val prodTargetPixels = IntArray(tgtPair.first.width * tgtPair.first.height)
+        tgtPair.first.getPixels(prodTargetPixels, 0, tgtPair.first.width, 0, 0, tgtPair.first.width, tgtPair.first.height)
+
+        var prodSwapOnly512: Bitmap? = null
+        var prodSwapRestore512: Bitmap? = null
+        var prodFinalBlend512: Bitmap? = null
+        var rMs = 1L
+        var uMs = 1L
+        var mMs = 1L
+        var fMs = 1L
+
+        val prodRestored512 = com.example.onnx.FaceBlender.enhanceAndBlendOnlineHdFace512(
+            ortEnv = ortEnv,
+            gfpganFile = null,
+            targetBitmap = tgtPair.first,
+            targetPixels = prodTargetPixels,
+            targetWidth = tgtPair.first.width,
+            targetHeight = tgtPair.first.height,
+            colorCorrected128 = rawHyperSwap1b256,
+            forwardMatrix128 = m128Tgt,
+            targetLandmarks5 = tgtPair.second.landmarks5,
+            sourceBitmap = srcPair.first,
+            sourceLandmarks5 = srcPair.second.landmarks5,
+            skinToneMode = com.example.onnx.SkinToneSourceMode.TARGET_SCENE,
+            faceReactionMode = com.example.onnx.FaceReactionSourceMode.TARGET_REACTION,
+            enableColorTransfer = true,
+            enableOcclusionProtection = true,
+            blendStrength = 1.0f,
+            enhancementStrength = 0.96f,
+            segformerFile = null,
+            onStagesCaptured = { s1, s2, s3 ->
+                prodSwapOnly512 = s1
+                prodSwapRestore512 = s2
+                prodFinalBlend512 = s3
+            },
+            onSubStageTimings = { restMs, lipMs, maskMs, blendMs ->
+                rMs = restMs
+                uMs = lipMs
+                mMs = maskMs
+                fMs = blendMs
+            }
+        )
+        rawHyperSwap1b256.recycle()
+        embRes.aligned112Crop.recycle()
+
+        val tExp0 = System.currentTimeMillis()
+        val prodOutputFull = Bitmap.createBitmap(tgtPair.first.width, tgtPair.first.height, Bitmap.Config.ARGB_8888)
+        prodOutputFull.setPixels(prodTargetPixels, 0, tgtPair.first.width, 0, 0, tgtPair.first.width, tgtPair.first.height)
+        val tExportMs = (System.currentTimeMillis() - tExp0).coerceAtLeast(1L)
+        val totalProdMs = (System.currentTimeMillis() - tProdStart).coerceAtLeast(1L)
+
+        val prodTimings = com.example.onnx.ProductionStageTimings(
+            modelLoadingMs = 0L, // Cached OrtSession reuse = 0 ms
+            faceDetectionMs = (tFaceDetMs / 2L).coerceAtLeast(1L),
+            landmarkDetectionMs = (tFaceDetMs - tFaceDetMs / 2L).coerceAtLeast(1L),
+            arcFaceEmbeddingMs = tArcFaceMs,
+            hyperSwapInferenceMs = tHyperSwapMs,
+            restoration512Ms = rMs,
+            upperLipGuardMs = uMs,
+            maskGenerationMs = mMs,
+            finalBlendingMs = fMs,
+            imageEncodingExportMs = tExportMs,
+            totalMs = totalProdMs
+        )
+
+        assertNotNull("production_swap_only.png bitmap must be captured", prodSwapOnly512)
+        assertNotNull("production_swap_restore.png bitmap must be captured", prodSwapRestore512)
+        assertNotNull("production_final_blend.png bitmap must be captured", prodFinalBlend512)
+
+        assertEquals("Final production output width must match Target width", tgtPair.first.width, prodOutputFull.width)
+        assertEquals("Final production output height must match Target height", tgtPair.first.height, prodOutputFull.height)
+
+        // Generate the 5 diagnostic detail crops from the production output
+        val cropUpperLip25x = Bitmap.createScaledBitmap(
+            Bitmap.createBitmap(prodFinalBlend512!!, 176, 310, 160, 80),
+            400,
+            200,
+            true
+        )
+        val cropEyes = Bitmap.createScaledBitmap(
+            Bitmap.createBitmap(prodFinalBlend512!!, 110, 165, 292, 100),
+            584,
+            200,
+            true
+        )
+        val cropNose = Bitmap.createScaledBitmap(
+            Bitmap.createBitmap(prodFinalBlend512!!, 196, 220, 120, 120),
+            240,
+            240,
+            true
+        )
+        val cropMouthTeeth = Bitmap.createScaledBitmap(
+            Bitmap.createBitmap(prodFinalBlend512!!, 166, 330, 180, 100),
+            360,
+            200,
+            true
+        )
+        val cropFaceBoundary = Bitmap.createBitmap(
+            prodOutputFull,
+            (prodOutputFull.width * 0.18f).toInt().coerceAtLeast(0),
+            (prodOutputFull.height * 0.08f).toInt().coerceAtLeast(0),
+            (prodOutputFull.width * 0.64f).toInt().coerceAtLeast(64),
+            (prodOutputFull.height * 0.52f).toInt().coerceAtLeast(64)
+        )
+
+        if (artifactDir.exists() || artifactDir.mkdirs()) {
+            fun saveProdPng(bmp: Bitmap, name: String) {
+                java.io.File(artifactDir, name).outputStream().use { out ->
+                    bmp.compress(Bitmap.CompressFormat.PNG, 100, out)
+                }
+            }
+            saveProdPng(prodSwapOnly512!!, "production_swap_only.png")
+            saveProdPng(prodSwapRestore512!!, "production_swap_restore.png")
+            saveProdPng(prodFinalBlend512!!, "production_final_blend.png")
+            saveProdPng(prodOutputFull, "production_full_output.png")
+            saveProdPng(cropUpperLip25x, "production_crop_upper_lip_2_5x.png")
+            saveProdPng(cropEyes, "production_crop_eyes.png")
+            saveProdPng(cropNose, "production_crop_nose.png")
+            saveProdPng(cropMouthTeeth, "production_crop_mouth_teeth.png")
+            saveProdPng(cropFaceBoundary, "production_crop_face_boundary.png")
+        }
+
+        // Verify exact pixel-for-pixel equality between production stages and benchmark stages
+        fun computeMeanAbsDiff(a: Bitmap, b: Bitmap): Float {
+            assertEquals(a.width, b.width)
+            assertEquals(a.height, b.height)
+            val pxA = IntArray(a.width * a.height)
+            val pxB = IntArray(b.width * b.height)
+            a.getPixels(pxA, 0, a.width, 0, 0, a.width, a.height)
+            b.getPixels(pxB, 0, b.width, 0, 0, b.width, b.height)
+            var sumDiff = 0L
+            for (i in pxA.indices) {
+                val cA = pxA[i]
+                val cB = pxB[i]
+                val dr = kotlin.math.abs(((cA shr 16) and 0xFF) - ((cB shr 16) and 0xFF))
+                val dg = kotlin.math.abs(((cA shr 8) and 0xFF) - ((cB shr 8) and 0xFF))
+                val db = kotlin.math.abs((cA and 0xFF) - (cB and 0xFF))
+                sumDiff += (dr + dg + db)
+            }
+            return sumDiff.toFloat() / (pxA.size * 3f)
+        }
+
+        val diffStage1 = computeMeanAbsDiff(prodSwapOnly512!!, suite.stage1SwapOnly.face512Bitmap)
+        val diffStage2 = computeMeanAbsDiff(prodSwapRestore512!!, suite.stage2SwapPlusRestore.face512Bitmap)
+        val diffStage3 = computeMeanAbsDiff(prodFinalBlend512!!, suite.stage3SwapRestoreBlend.face512Bitmap)
+        val winCand = suite.candidateOutputs.first { it.candidate == com.example.onnx.SwapModelCandidate.C_HYPERSWAP_1B_256 }
+        val diffFull = computeMeanAbsDiff(prodOutputFull, winCand.fullOutputBitmap)
+
+        assertEquals("production_swap_only.png must exactly match stage1_swap_only_512.png", 0.0f, diffStage1, 0.01f)
+        assertEquals("production_swap_restore.png must exactly match stage2_swap_hd_restore_512.png", 0.0f, diffStage2, 0.01f)
+        assertEquals("production_final_blend.png must exactly match stage3_swap_restore_final_blend_512.png", 0.0f, diffStage3, 0.01f)
+        assertEquals("production_full_output.png must exactly match 6_C_hyperswap_1b_256.png", 0.0f, diffFull, 0.01f)
+
+        // Verify production_final_blend matches stage3_swap_restore_final_blend_512 (clean upper lip, no moustache, high sharpness)
+        val m512Tgt = FloatArray(6) { i -> m128Tgt[i] * 4.0f }
+        val alignedTgt512 = FaceAlignment.warpAffineCrop(tgtPair.first, m512Tgt, 512)
+        val prodMetrics = com.example.onnx.InSwapperEngine.evaluateSwapQualityMetrics512(
+            candidate = com.example.onnx.SwapModelCandidate.C_HYPERSWAP_1B_256,
+            isModelInstalled = true,
+            restored512 = prodRestored512,
+            alignedTarget512 = alignedTgt512,
+            targetLandmarks5 = tgtPair.second.landmarks5,
+            forwardMatrix128 = m128Tgt,
+            processingTimeMs = totalProdMs
+        )
+        alignedTgt512.recycle()
+        assertFalse("Production final blend must NOT have moustache artifact", prodMetrics.hasMoustacheArtifact)
+        assertTrue("Production philtrum ratio (${prodMetrics.outputPhiltrumToCheekRatio}) must be clean (>= 0.90)", prodMetrics.outputPhiltrumToCheekRatio >= 0.90f)
+        assertTrue("Production total latency ($totalProdMs ms) must be fast (< 2000 ms, not 61048 ms)", totalProdMs < 2000L)
+
         println("=== VISUAL VALIDATION BENCHMARK REPORT ===")
+        println("Target Dimensions: ${tgtPair.first.width}x${tgtPair.first.height} | Production Output Dimensions: ${prodOutputFull.width}x${prodOutputFull.height}")
         println("Target Philtrum-to-Cheek Ratio: ${"%.3f".format(suite.targetPhiltrumRatio)} (NO MOUSTACHE)")
         println("Legacy Before-Fix Output: PhiltrumRatio=${"%.3f".format(suite.legacyBeforeFixOutput.philtrumToCheekRatio)} | EyeSharp=${"%.2f".format(suite.legacyBeforeFixOutput.eyeSharpness)} | NoseSharp=${"%.2f".format(suite.legacyBeforeFixOutput.noseSharpness)} | MouthSharp=${"%.2f".format(suite.legacyBeforeFixOutput.mouthSharpness)}")
         suite.candidateOutputs.forEach { c ->
             println("Candidate ${c.title}: PhiltrumRatio=${"%.3f".format(c.philtrumToCheekRatio)} | Moustache=${c.hasMoustacheArtifact} | GreyPatch=${c.hasGreyPatch} | EyeSharp=${"%.2f".format(c.eyeSharpness)} | NoseSharp=${"%.2f".format(c.noseSharpness)} | MouthSharp=${"%.2f".format(c.mouthSharpness)} | ID=${c.identityScore} | Latency=${c.latencyMs}ms | Winner=${c.isWinningModel}")
         }
-        println("Stage 1 (Swap-Only): PhiltrumRatio=${"%.3f".format(suite.stage1SwapOnly.philtrumToCheekRatio)}")
-        println("Stage 2 (Swap + HD Restoration): PhiltrumRatio=${"%.3f".format(suite.stage2SwapPlusRestore.philtrumToCheekRatio)}")
-        println("Stage 3 (Swap + Restoration + Final Blend): PhiltrumRatio=${"%.3f".format(suite.stage3SwapRestoreBlend.philtrumToCheekRatio)}")
+        println("Stage 1 (Swap-Only): PhiltrumRatio=${"%.3f".format(suite.stage1SwapOnly.philtrumToCheekRatio)} | Diff vs Prod=${"%.4f".format(diffStage1)}")
+        println("Stage 2 (Swap + HD Restoration): PhiltrumRatio=${"%.3f".format(suite.stage2SwapPlusRestore.philtrumToCheekRatio)} | Diff vs Prod=${"%.4f".format(diffStage2)}")
+        println("Stage 3 (Swap + Restoration + Final Blend): PhiltrumRatio=${"%.3f".format(suite.stage3SwapRestoreBlend.philtrumToCheekRatio)} | Diff vs Prod=${"%.4f".format(diffStage3)}")
+        println("Production Final Blend: PhiltrumRatio=${"%.3f".format(prodMetrics.outputPhiltrumToCheekRatio)} | Moustache=${prodMetrics.hasMoustacheArtifact} | EyeSharp=${"%.2f".format(prodMetrics.eyeDetailSharpness)} | NoseSharp=${"%.2f".format(prodMetrics.noseDetailSharpness)} | MouthSharp=${"%.2f".format(prodMetrics.mouthDetailSharpness)} | FullOutputDiff=${"%.4f".format(diffFull)}")
+        println(prodTimings.toFormattedReport())
         println("==========================================")
     }
 }

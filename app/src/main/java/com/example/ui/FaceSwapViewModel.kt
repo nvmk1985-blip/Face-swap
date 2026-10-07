@@ -45,7 +45,7 @@ enum class AppTab {
 }
 
 enum class StudioMode(val title: String, val badge: String) {
-    FACE_SWAP("FACE SWAP", "MODE 1 — InsightFace / InSwapper-128 & HyperSwap-256"),
+    FACE_SWAP("FACE SWAP", "MODE 1 — HyperSwap 1b (256px) Primary Production Engine"),
     HEAD_REPLACEMENT("FULL HEAD REPLACEMENT", "MODE 2 — GHOST 2.0 Android Full Head/Hair/Neck")
 }
 
@@ -178,7 +178,6 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     init {
         refreshModelInspections()
-        runVisualValidationSuite()
     }
 
     private fun detectDeviceRamProfile(
@@ -873,7 +872,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
             }
             if (!state.isSwapperReady) {
                 _uiState.update {
-                    it.copy(errorBannerMessage = "inswapper_128.onnx is missing. Please import it in the ONNX Models tab.")
+                    it.copy(errorBannerMessage = "hyperswap_1b_256.onnx is missing. Please import it in the ONNX Models tab.")
                 }
                 return
             }
@@ -988,27 +987,11 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                     )
                 )
 
-                val validationSuite = if (state.studioMode == StudioMode.FACE_SWAP) {
-                    withContext(Dispatchers.Default) {
-                        runCatching {
-                            VisualValidationBenchmark.runCompleteVisualValidation(
-                                context = getApplication(),
-                                ortEnv = ortEnv,
-                                sourceBitmap = srcBitmap,
-                                sourceFace = selectedSourceFace,
-                                targetBitmap = tgtBitmap,
-                                targetFace = targetsToSwap.first()
-                            )
-                        }.getOrNull()
-                    }
-                } else null
-
                 _uiState.update {
                     it.copy(
                         isSwapping = false,
                         swapProgress = null,
                         swapResult = execResult,
-                        visualValidationSuite = validationSuite ?: it.visualValidationSuite,
                         lastAuditLogId = logId,
                         memoryServiceState = modelService.getMemoryState(),
                         statusBannerMessage = "${state.studioMode.title} completed in ${execResult.totalMs} ms (${execResult.swappedFacesCount} target(s) replaced)."

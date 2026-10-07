@@ -38,7 +38,7 @@ object ArcFaceRecognizer {
     private const val EMBEDDING_DIM = 512
 
     fun extractSourceLatentEmbedding(
-        ortEnv: OrtEnvironment,
+        ortEnv: OrtEnvironment?,
         sourceBitmap: Bitmap,
         sourceLandmarks5: List<PointF>,
         arcFaceModelFile: File?,
@@ -53,10 +53,10 @@ object ArcFaceRecognizer {
         val rawEmbedding: FloatArray
         val usedArcFace: Boolean
 
-        if (preloadedArcFaceSession != null) {
+        if (ortEnv != null && preloadedArcFaceSession != null) {
             rawEmbedding = runArcFaceSession(ortEnv, preloadedArcFaceSession, aligned112)
             usedArcFace = true
-        } else if (arcFaceModelFile != null && arcFaceModelFile.exists() && arcFaceModelFile.length() > 1024L) {
+        } else if (ortEnv != null && arcFaceModelFile != null && arcFaceModelFile.exists() && arcFaceModelFile.length() > 1024L) {
             rawEmbedding = runArcFaceOnnx(ortEnv, arcFaceModelFile, aligned112)
             usedArcFace = true
         } else if (allowTwoModelFallbackForTesting) {
@@ -155,13 +155,14 @@ object ArcFaceRecognizer {
         arcFaceFile: File,
         aligned112: Bitmap
     ): FloatArray {
-        OrtSession.SessionOptions().use { opts ->
-            opts.setIntraOpNumThreads(4)
-            opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            ortEnv.createSession(arcFaceFile.absolutePath, opts).use { session ->
-                return runArcFaceSession(ortEnv, session, aligned112)
-            }
-        }
+        val session = requireNotNull(
+            OnnxProtobufInspector.getOrCreateCachedSession(
+                ortEnv = ortEnv,
+                file = arcFaceFile,
+                preferHardwareAcceleration = false
+            )
+        ) { "Failed to load ArcFace session from ${arcFaceFile.absolutePath}" }
+        return runArcFaceSession(ortEnv, session, aligned112)
     }
 
     /**

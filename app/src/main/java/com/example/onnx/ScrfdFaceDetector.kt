@@ -67,19 +67,20 @@ object ScrfdFaceDetector {
         require(detModelFile.exists() && detModelFile.length() > 1024L) {
             "det_10g.onnx not found at ${detModelFile.absolutePath}"
         }
-        OrtSession.SessionOptions().use { sessionOpts ->
-            sessionOpts.setIntraOpNumThreads(4)
-            sessionOpts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT)
-            ortEnv.createSession(detModelFile.absolutePath, sessionOpts).use { session ->
-                return detectFacesWithSession(
-                    ortEnv = ortEnv,
-                    session = session,
-                    bitmap = bitmap,
-                    confThreshold = confThreshold,
-                    nmsThreshold = nmsThreshold
-                )
-            }
-        }
+        val session = requireNotNull(
+            OnnxProtobufInspector.getOrCreateCachedSession(
+                ortEnv = ortEnv,
+                file = detModelFile,
+                preferHardwareAcceleration = false
+            )
+        ) { "Failed to load SCRFD detector session from ${detModelFile.absolutePath}" }
+        return detectFacesWithSession(
+            ortEnv = ortEnv,
+            session = session,
+            bitmap = bitmap,
+            confThreshold = confThreshold,
+            nmsThreshold = nmsThreshold
+        )
     }
 
     fun detectFacesWithSession(
