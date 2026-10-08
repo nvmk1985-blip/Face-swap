@@ -378,9 +378,9 @@ object VisualValidationBenchmark {
         }
 
         val cx = cropSize * 0.50f
-        val cy = cropSize * 0.52f
+        val cy = cropSize * 0.53f
         val rx = cropSize * 0.40f
-        val ry = cropSize * 0.44f
+        val ry = cropSize * 0.43f
 
         // Canonical 128-normalized coordinates scaled to cropSize
         val scale = cropSize / 128.0f
@@ -388,17 +388,42 @@ object VisualValidationBenchmark {
         val lEyeY = 51.6963f * scale
         val rEyeX = 81.5318f * scale
         val rEyeY = 51.5014f * scale
-        val eyeIrisRx = 7.2f * scale
-        val eyeIrisRy = 4.2f * scale
+        val eyeIrisRx = 6.8f * scale
+        val eyeIrisRy = 4.0f * scale
+        val lowPassStep = (cropSize / 18).coerceAtLeast(5)
+
+        fun sampleLowPassRGB(px: IntArray, x: Int, y: Int): FloatArray {
+            val xL = (x - lowPassStep).coerceIn(0, cropSize - 1)
+            val xR = (x + lowPassStep).coerceIn(0, cropSize - 1)
+            val yU = (y - lowPassStep).coerceIn(0, cropSize - 1)
+            val yD = (y + lowPassStep).coerceIn(0, cropSize - 1)
+            val c0 = px[y * cropSize + x]
+            val c1 = px[y * cropSize + xL]
+            val c2 = px[y * cropSize + xR]
+            val c3 = px[yU * cropSize + x]
+            val c4 = px[yD * cropSize + x]
+            val c5 = px[yU * cropSize + xL]
+            val c6 = px[yU * cropSize + xR]
+            val c7 = px[yD * cropSize + xL]
+            val c8 = px[yD * cropSize + xR]
+            val r = (((c0 ushr 16) and 0xFF) + ((c1 ushr 16) and 0xFF) + ((c2 ushr 16) and 0xFF) +
+                ((c3 ushr 16) and 0xFF) + ((c4 ushr 16) and 0xFF) + ((c5 ushr 16) and 0xFF) +
+                ((c6 ushr 16) and 0xFF) + ((c7 ushr 16) and 0xFF) + ((c8 ushr 16) and 0xFF)) / 9.0f
+            val g = (((c0 ushr 8) and 0xFF) + ((c1 ushr 8) and 0xFF) + ((c2 ushr 8) and 0xFF) +
+                ((c3 ushr 8) and 0xFF) + ((c4 ushr 8) and 0xFF) + ((c5 ushr 8) and 0xFF) +
+                ((c6 ushr 8) and 0xFF) + ((c7 ushr 8) and 0xFF) + ((c8 ushr 8) and 0xFF)) / 9.0f
+            val b = ((c0 and 0xFF) + (c1 and 0xFF) + (c2 and 0xFF) +
+                (c3 and 0xFF) + (c4 and 0xFF) + (c5 and 0xFF) +
+                (c6 and 0xFF) + (c7 and 0xFF) + (c8 and 0xFF)) / 9.0f
+            return floatArrayOf(r, g, b)
+        }
 
         for (y in 0 until cropSize) {
             val row = y * cropSize
             val yf = y.toFloat()
-            val yNorm = yf / cropSize.toFloat()
             for (x in 0 until cropSize) {
                 val idx = row + x
                 val xf = x.toFloat()
-                val xNorm = xf / cropSize.toFloat()
                 val dx = (xf - cx) / rx
                 val dy = (yf - cy) / ry
                 val r = sqrt(dx * dx + dy * dy)
@@ -406,10 +431,10 @@ object VisualValidationBenchmark {
                     outPx[idx] = tgtPx[idx]
                     continue
                 }
-                val mask = if (r <= 0.64f) {
+                val mask = if (r <= 0.62f) {
                     1.0f
                 } else {
-                    val t = (r - 0.64f) / 0.36f
+                    val t = (r - 0.62f) / 0.38f
                     (0.5f * (1.0f + cos(Math.PI * t))).toFloat()
                 }
 
@@ -422,40 +447,36 @@ object VisualValidationBenchmark {
                 val tG = (tc ushr 8) and 0xFF
                 val tB = tc and 0xFF
 
-                // 1. Forehead Bindi / Kumkum Ornament Guard (glabella & lower forehead center)
-                if (xNorm in 0.44f..0.56f && yNorm in 0.16f..0.37f) {
-                    val tLum = 0.299f * tR + 0.587f * tG + 0.114f * tB
-                    val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
-                    val isRedKumkum = (tR - tG) > 32 && tR > 75 && (sR - sG) < (tR - tG) - 12
-                    val isDarkBindi = tLum < 68f && sLum > tLum + 38f
-                    if (isRedKumkum || isDarkBindi) {
-                        outPx[idx] = tc
-                        continue
-                    }
-                }
-
-                // 2. Inner Ocular Iris/Sclera Gaze Protection (prevents double-pupil ghosting when gaze differs)
+                // Inner Ocular Iris/Sclera Gaze Protection (prevents double-pupil ghosting when gaze differs)
                 val lIrisD = ((xf - lEyeX) / eyeIrisRx) * ((xf - lEyeX) / eyeIrisRx) +
                     ((yf - lEyeY) / eyeIrisRy) * ((yf - lEyeY) / eyeIrisRy)
                 val rIrisD = ((xf - rEyeX) / eyeIrisRx) * ((xf - rEyeX) / eyeIrisRx) +
                     ((yf - rEyeY) / eyeIrisRy) * ((yf - rEyeY) / eyeIrisRy)
                 val minIrisD = min(lIrisD, rIrisD)
                 val irisKeepTarget = if (minIrisD < 1.0f) {
-                    0.55f * (1.0f - minIrisD)
+                    val t = sqrt(minIrisD)
+                    0.35f * (0.5f * (1.0f + cos(Math.PI * t)).toFloat())
                 } else 0f
 
-                // 3. Anatomical Zone Weight: Strongest on Source Eyebrows, Upper Eyelids, Under-Eye Malar Cheeks & Nose
-                val zoneBoost = when {
-                    yNorm in 0.24f..0.58f -> 1.12f // Eyebrows, eyelids, under-eye cheeks & nose bridge/tip
-                    else -> 1.0f
-                }
+                // Frequency-separated synthesis:
+                // Use 100% of Source's high-frequency anatomical structure (single nose, single eyebrows, single eyelids)
+                // combined with smooth low-frequency 3D pose shading so Target's high-frequency nose/eyes NEVER ghost!
+                val sLow = sampleLowPassRGB(srcPx, x, y)
+                val tLow = sampleLowPassRGB(tgtPx, x, y)
+                val sHighR = (sR - sLow[0]) * detailPreservation
+                val sHighG = (sG - sLow[1]) * detailPreservation
+                val sHighB = (sB - sLow[2]) * detailPreservation
 
-                val baseWeight = (0.76f * detailPreservation * zoneBoost * mask).coerceIn(0f, 0.90f)
-                val idWeight = (baseWeight * (1.0f - irisKeepTarget)).coerceIn(0f, 0.90f)
-                val invW = 1.0f - idWeight
-                val oR = (sR * idWeight + tR * invW).toInt().coerceIn(0, 255)
-                val oG = (sG * idWeight + tG * invW).toInt().coerceIn(0, 255)
-                val oB = (sB * idWeight + tB * invW).toInt().coerceIn(0, 255)
+                val shadeMix = 0.22f
+                val innerR = (sLow[0] * (1f - shadeMix) + tLow[0] * shadeMix + sHighR).coerceIn(0f, 255f)
+                val innerG = (sLow[1] * (1f - shadeMix) + tLow[1] * shadeMix + sHighG).coerceIn(0f, 255f)
+                val innerB = (sLow[2] * (1f - shadeMix) + tLow[2] * shadeMix + sHighB).coerceIn(0f, 255f)
+
+                val effectiveMask = (mask * (1.0f - irisKeepTarget)).coerceIn(0f, 1.0f)
+                val invMask = 1.0f - effectiveMask
+                val oR = (innerR * effectiveMask + tR * invMask).toInt().coerceIn(0, 255)
+                val oG = (innerG * effectiveMask + tG * invMask).toInt().coerceIn(0, 255)
+                val oB = (innerB * effectiveMask + tB * invMask).toInt().coerceIn(0, 255)
                 outPx[idx] = (0xFF shl 24) or (oR shl 16) or (oG shl 8) or oB
             }
         }

@@ -358,78 +358,123 @@ object ScrfdFaceDetector {
             }
         }
 
-        // Android FaceDetector works best on scaled images (max ~640px)
+        // Multi-scale & Multi-angle Android FaceDetector:
+        //  - Supports long-shot small faces (maxDim = 800, eyeDist down to 3% of image dimension)
+        //  - Supports tilted heads / head-angle changes via rotated canvas sweep (0°, -18°, +18°, -34°, +34°)
         val maxDim = maxOf(origW, origH)
-        val scale = if (maxDim > 640) 640f / maxDim.toFloat() else 1.0f
+        val scale = if (maxDim > 800) 800f / maxDim.toFloat() else 1.0f
         val scaledW = ((origW * scale).toInt().coerceAtLeast(16) / 2) * 2
         val scaledH = ((origH * scale).toInt().coerceAtLeast(16) / 2) * 2
-
-        val rgb565 = Bitmap.createBitmap(scaledW, scaledH, Bitmap.Config.RGB_565)
-        val canvas = Canvas(rgb565)
-        val srcRect = android.graphics.Rect(0, 0, origW, origH)
-        val dstRect = android.graphics.Rect(0, 0, scaledW, scaledH)
-        canvas.drawBitmap(bitmap, srcRect, dstRect, Paint(Paint.FILTER_BITMAP_FLAG))
-
-        val detector = android.media.FaceDetector(scaledW, scaledH, maxFaces)
-        val faces = arrayOfNulls<android.media.FaceDetector.Face>(maxFaces)
-        val found = runCatching { detector.findFaces(rgb565, faces) }.getOrDefault(0)
-        rgb565.recycle()
-
-        if (found <= 0) {
-            return listOf(createFullPortraitFaceEstimate(bitmap))
-        }
+        val minScaledSide = min(scaledW, scaledH).toFloat()
 
         val invScaleX = origW.toFloat() / scaledW.toFloat()
         val invScaleY = origH.toFloat() / scaledH.toFloat()
+        val avgInvScale = (invScaleX + invScaleY) * 0.5f
+
+        val candidateAngles = floatArrayOf(0f, -18f, 18f, -34f, 34f)
         val results = mutableListOf<DetectedFace>()
-        for (i in 0 until found) {
-            val f = faces[i] ?: continue
-            val mid = PointF()
-            f.getMidPoint(mid)
-            val eyeDist = f.eyesDistance()
-            // Support both medium shots and tight close-up selfies (eyeDist up to 0.62 * width)
-            if (eyeDist <= scaledW * 0.10f || eyeDist >= scaledW * 0.62f) continue
+        val paint = Paint(Paint.FILTER_BITMAP_FLAG)
+        val srcRect = android.graphics.Rect(0, 0, origW, origH)
+        val dstRect = android.graphics.Rect(0, 0, scaledW, scaledH)
+        val cxScaled = scaledW * 0.5f
+        val cyScaled = scaledH * 0.5f
 
-            val origMidX = mid.x * invScaleX
-            val origMidY = mid.y * invScaleY
-            val origEyeDist = eyeDist * ((invScaleX + invScaleY) * 0.5f)
-            val eulerZ = runCatching { f.pose(android.media.FaceDetector.Face.EULER_Z) }.getOrDefault(0f)
+        for (angleDeg in candidateAngles) {
+            val rgb565 = Bitmap.createBitmap(scaledW, scaledH, Bitmap.Config.RGB_565)
+            val canvas = Canvas(rgb565)
+            if (angleDeg != 0f) {
+                canvas.save()
+                canvas.rotate(-angleDeg, cxScaled, cyScaled)
+                canvas.drawBitmap(bitmap, srcRect, dstRect, paint)
+                canvas.restore()
+            } else {
+                canvas.drawBitmap(bitmap, srcRect, dstRect, paint)
+            }
 
-            val refined = refine5PointLandmarksFromPixels(
-                bitmap = bitmap,
-                coarseMidX = origMidX,
-                coarseMidY = origMidY,
-                coarseEyeDist = origEyeDist,
-                eulerZDegrees = eulerZ
-            )
+            val detector = android.media.FaceDetector(scaledW, scaledH, maxFaces)
+            val faces = arrayOfNulls<android.media.FaceDetector.Face>(maxFaces)
+            val found = runCatching { detector.findFaces(rgb565, faces) }.getOrDefault(0)
+            rgb565.recycle()
 
-            val halfW = origEyeDist * 1.28f
-            val top = (origMidY - origEyeDist * 1.22f).coerceAtLeast(0f)
-            val bottom = (origMidY + origEyeDist * 2.15f).coerceAtMost(origH.toFloat())
-            val left = (origMidX - halfW).coerceAtLeast(0f)
-            val right = (origMidX + halfW).coerceAtMost(origW.toFloat())
-            val box = RectF(left, top, right, bottom)
+            if (found <= 0) continue
 
-            results.add(
-                DetectedFace(
-                    index = i,
-                    boundingBox = box,
-                    score = f.confidence().coerceAtLeast(0.88f),
-                    landmarks5 = refined,
-                    detectorSource = "det_10g.onnx"
+            val rad = Math.toRadians(angleDeg.toDouble())
+            val cosR = kotlin.math.cos(rad).toFloat()
+            val sinR = kotlin.math.sin(rad).toFloat()
+
+            for (i in 0 until found) {
+                val f = faces[i] ?: continue
+                val conf = f.confidence()
+                if (conf < 0.30f) continue
+                val mid = PointF()
+                f.getMidPoint(mid)
+                val eyeDist = f.eyesDistance()
+                // Support long-shot small faces (0.03 * minSide) through tight close-ups (0.64 * scaledW)
+                if (eyeDist < minScaledSide * 0.03f || eyeDist >= scaledW * 0.64f) continue
+
+                // Map rotated (mid.x, mid.y) back to unrotated scaled coordinates
+                val dx = mid.x - cxScaled
+                val dy = mid.y - cyScaled
+                val unrotX = cxScaled + (dx * cosR - dy * sinR)
+                val unrotY = cyScaled + (dx * sinR + dy * cosR)
+                if (unrotX !in 0f..scaledW.toFloat() || unrotY !in 0f..scaledH.toFloat()) continue
+
+                val origMidX = unrotX * invScaleX
+                val origMidY = unrotY * invScaleY
+                val origEyeDist = eyeDist * avgInvScale
+                val poseZ = runCatching { f.pose(android.media.FaceDetector.Face.EULER_Z) }.getOrDefault(0f)
+                val totalRollDeg = -angleDeg + poseZ
+
+                val refined = refine5PointLandmarksFromPixels(
+                    bitmap = bitmap,
+                    coarseMidX = origMidX,
+                    coarseMidY = origMidY,
+                    coarseEyeDist = origEyeDist,
+                    eulerZDegrees = totalRollDeg
                 )
-            )
+
+                val lEye = refined[0]
+                val rEye = refined[1]
+                val trueMidX = (lEye.x + rEye.x) * 0.5f
+                val trueMidY = (lEye.y + rEye.y) * 0.5f
+                val trueEyeDist = kotlin.math.hypot(
+                    (rEye.x - lEye.x).toDouble(),
+                    (rEye.y - lEye.y).toDouble()
+                ).toFloat().coerceAtLeast(origEyeDist * 0.75f)
+
+                val halfW = trueEyeDist * 1.28f
+                val top = (trueMidY - trueEyeDist * 1.22f).coerceAtLeast(0f)
+                val bottom = (trueMidY + trueEyeDist * 2.15f).coerceAtMost(origH.toFloat())
+                val left = (trueMidX - halfW).coerceAtLeast(0f)
+                val right = (trueMidX + halfW).coerceAtMost(origW.toFloat())
+                val box = RectF(left, top, right, bottom)
+
+                results.add(
+                    DetectedFace(
+                        index = results.size,
+                        boundingBox = box,
+                        score = conf.coerceAtLeast(0.88f),
+                        landmarks5 = refined,
+                        detectorSource = "det_10g.onnx"
+                    )
+                )
+            }
+            // If upright pass (0°) found high-confidence face(s), no need to rotate further
+            if (angleDeg == 0f && results.isNotEmpty()) break
         }
-        return if (results.isNotEmpty()) {
-            results.sortedBy { it.boundingBox.centerX() }.mapIndexed { idx, face -> face.copy(index = idx) }
+
+        val deduped = nonMaximumSuppression(results, 0.35f)
+        return if (deduped.isNotEmpty()) {
+            deduped.sortedBy { it.boundingBox.centerX() }.mapIndexed { idx, face -> face.copy(index = idx) }
         } else {
             listOf(createFullPortraitFaceEstimate(bitmap))
         }
     }
 
     /**
-     * Locates face skin centroid and ocular/oral landmarks directly from pixel luminance & chrominance
-     * when Android FaceDetector cannot find a face (e.g. tight close-up crop or JVM test).
+     * Locates face cranial skin cluster (rejecting bare neck/shoulder/chest skin below the chin)
+     * and searches across head tilt angles (`-36°..+36°`) to locate exact 5-point landmarks
+     * when Android FaceDetector cannot find a face.
      */
     private fun estimateAnatomicalFaceFromPixels(bitmap: Bitmap): DetectedFace {
         val w = bitmap.width
@@ -437,49 +482,159 @@ object ScrfdFaceDetector {
         val wf = w.toFloat()
         val hf = h.toFloat()
 
-        // Find warm skin bounding region
-        var skinSumX = 0f
-        var skinSumY = 0f
-        var skinMinX = w
-        var skinMaxX = 0
-        var skinMinY = h
-        var skinMaxY = 0
-        var skinCount = 0
-        val step = (max(w, h) / 96).coerceAtLeast(1)
+        val stepX = (w / 96).coerceAtLeast(1)
+        val stepY = (h / 96).coerceAtLeast(1)
+        val rowMinX = IntArray(h) { w }
+        val rowMaxX = IntArray(h) { 0 }
+        val rowCount = IntArray(h) { 0 }
 
-        for (y in (h * 0.08f).toInt() until (h * 0.92f).toInt() step step) {
-            for (x in (w * 0.08f).toInt() until (w * 0.92f).toInt() step step) {
+        var firstSkinY = h
+        var lastSkinY = 0
+        var totalSkinCount = 0
+
+        for (y in (h * 0.05f).toInt() until (h * 0.94f).toInt() step stepY) {
+            for (x in (w * 0.06f).toInt() until (w * 0.94f).toInt() step stepX) {
                 val c = bitmap.getPixel(x, y)
                 val r = (c ushr 16) and 0xFF
                 val g = (c ushr 8) and 0xFF
                 val b = c and 0xFF
-                if (r > 75 && g > 40 && b > 25 && r > g && (r - b) > 18 && (r - g) in 6..95) {
-                    skinSumX += x
-                    skinSumY += y
-                    if (x < skinMinX) skinMinX = x
-                    if (x > skinMaxX) skinMaxX = x
-                    if (y < skinMinY) skinMinY = y
-                    if (y > skinMaxY) skinMaxY = y
-                    skinCount++
+                if (r > 70 && g > 38 && b > 22 && r > g && (r - b) > 15 && (r - g) in 5..100) {
+                    if (x < rowMinX[y]) rowMinX[y] = x
+                    if (x > rowMaxX[y]) rowMaxX[y] = x
+                    rowCount[y]++
+                    totalSkinCount++
+                }
+            }
+            if (rowCount[y] >= 3) {
+                if (y < firstSkinY) firstSkinY = y
+                if (y > lastSkinY) lastSkinY = y
+            }
+        }
+
+        // Isolate the CRANIAL / FACE oval and cut off bare shoulders/chest below the neck/chin!
+        var skinMinX = w
+        var skinMaxX = 0
+        val skinTopY = if (firstSkinY < lastSkinY) firstSkinY.toFloat() else hf * 0.14f
+        var maxHeadRowW = 0f
+        var maxHeadRowY = skinTopY.toInt()
+
+        if (totalSkinCount > 20 && firstSkinY < lastSkinY) {
+            val upperLimitY = (firstSkinY + (lastSkinY - firstSkinY) * 0.58f).toInt()
+            for (y in firstSkinY..upperLimitY step stepY) {
+                if (rowCount[y] >= 3) {
+                    val rw = (rowMaxX[y] - rowMinX[y]).toFloat()
+                    if (rw > maxHeadRowW) {
+                        maxHeadRowW = rw
+                        maxHeadRowY = y
+                    }
                 }
             }
         }
 
-        val faceCenterX = if (skinCount > 24) (skinSumX / skinCount).coerceIn(wf * 0.32f, wf * 0.68f) else wf * 0.50f
-        val skinSpanW = if (skinCount > 24) (skinMaxX - skinMinX).toFloat().coerceIn(wf * 0.35f, wf * 0.88f) else wf * 0.60f
-        val skinTopY = if (skinCount > 24) skinMinY.toFloat().coerceIn(hf * 0.04f, hf * 0.35f) else hf * 0.14f
-        val skinBotY = if (skinCount > 24) skinMaxY.toFloat().coerceIn(hf * 0.55f, hf * 0.96f) else hf * 0.84f
-        val faceSpanH = (skinBotY - skinTopY).coerceAtLeast(hf * 0.42f)
+        // Scan downward from maxHeadRowY to find neck constriction or shoulder flare
+        var chinCutoffY = lastSkinY
+        if (maxHeadRowW > wf * 0.10f) {
+            val maxAllowedHeadH = (maxHeadRowW * 1.42f).toInt()
+            var minNeckW = maxHeadRowW
+            for (y in maxHeadRowY..lastSkinY step stepY) {
+                if (rowCount[y] < 3) continue
+                val rw = (rowMaxX[y] - rowMinX[y]).toFloat()
+                if (rw < minNeckW) minNeckW = rw
+                // Stop if we hit shoulder flare (width jumps above head width or > 1.25 * neck width) or exceed head aspect ratio
+                if ((y - firstSkinY) > maxAllowedHeadH ||
+                    (y > maxHeadRowY + maxHeadRowW * 0.35f && (rw > maxHeadRowW * 1.12f || rw > minNeckW * 1.28f))
+                ) {
+                    chinCutoffY = y
+                    break
+                }
+            }
+        }
 
-        val coarseEyeY = (skinTopY + faceSpanH * 0.39f).coerceIn(hf * 0.24f, hf * 0.54f)
-        val coarseEyeDist = (skinSpanW * 0.44f).coerceIn(wf * 0.20f, wf * 0.46f)
+        var headSumX = 0f
+        var headRows = 0
+        for (y in firstSkinY..chinCutoffY step stepY) {
+            if (rowCount[y] >= 3) {
+                if (rowMinX[y] < skinMinX) skinMinX = rowMinX[y]
+                if (rowMaxX[y] > skinMaxX) skinMaxX = rowMaxX[y]
+                headSumX += (rowMinX[y] + rowMaxX[y]) * 0.5f
+                headRows++
+            }
+        }
+
+        val faceCenterX = if (headRows > 0) (headSumX / headRows).coerceIn(wf * 0.20f, wf * 0.80f) else wf * 0.50f
+        val skinSpanW = if (skinMaxX > skinMinX) {
+            (skinMaxX - skinMinX).toFloat().coerceIn(wf * 0.14f, wf * 0.86f)
+        } else wf * 0.55f
+        val skinBotY = if (chinCutoffY > firstSkinY) chinCutoffY.toFloat() else hf * 0.82f
+        val faceSpanH = (skinBotY - skinTopY).coerceIn(skinSpanW * 0.85f, skinSpanW * 1.50f)
+
+        val baseEyeY = (skinTopY + faceSpanH * 0.40f).coerceIn(hf * 0.14f, hf * 0.78f)
+        val coarseEyeDist = (skinSpanW * 0.43f).coerceIn(wf * 0.08f, wf * 0.46f)
+
+        // Search across candidate head roll angles (-36°..+36°) and slight vertical shifts to find the true ocular pair
+        var bestAngle = 0f
+        var bestMidY = baseEyeY
+        var bestOcularScore = -1e9f
+        val testAngles = floatArrayOf(0f, -14f, 14f, -26f, 26f, -36f, 36f)
+        val yOffsets = floatArrayOf(-coarseEyeDist * 0.16f, 0f, coarseEyeDist * 0.16f)
+
+        fun sampleBoxLum(cx: Float, cy: Float, r: Int): Float {
+            var sum = 0f
+            var cnt = 0
+            val x0 = (cx.toInt() - r).coerceIn(1, w - 2)
+            val x1 = (cx.toInt() + r).coerceIn(1, w - 2)
+            val y0 = (cy.toInt() - r).coerceIn(1, h - 2)
+            val y1 = (cy.toInt() + r).coerceIn(1, h - 2)
+            val s = max(1, r / 2)
+            for (y in y0..y1 step s) {
+                for (x in x0..x1 step s) {
+                    val c = bitmap.getPixel(x, y)
+                    sum += 0.299f * ((c ushr 16) and 0xFF) + 0.587f * ((c ushr 8) and 0xFF) + 0.114f * (c and 0xFF)
+                    cnt++
+                }
+            }
+            return if (cnt > 0) sum / cnt else 128f
+        }
+
+        val probeR = (coarseEyeDist * 0.12f).toInt().coerceAtLeast(3)
+        for (dy in yOffsets) {
+            val testY = (baseEyeY + dy).coerceIn(hf * 0.12f, hf * 0.82f)
+            for (ang in testAngles) {
+                val rad = Math.toRadians(-ang.toDouble())
+                val cosA = kotlin.math.cos(rad).toFloat()
+                val sinA = kotlin.math.sin(rad).toFloat()
+                val lx = faceCenterX - cosA * (coarseEyeDist * 0.5f)
+                val ly = testY - sinA * (coarseEyeDist * 0.5f)
+                val rx = faceCenterX + cosA * (coarseEyeDist * 0.5f)
+                val ry = testY + sinA * (coarseEyeDist * 0.5f)
+                val lLum = sampleBoxLum(lx, ly, probeR)
+                val rLum = sampleBoxLum(rx, ry, probeR)
+                val bridgeLum = sampleBoxLum(faceCenterX, testY, probeR)
+                // Below eyes (cheeks) should also be brighter than the dark eye sockets
+                val cheekX = faceCenterX - sinA * (coarseEyeDist * 0.45f)
+                val cheekY = testY + cosA * (coarseEyeDist * 0.45f)
+                val cheekLum = sampleBoxLum(cheekX, cheekY, probeR)
+
+                val eyeDarkness = 200f - (lLum + rLum) * 0.5f
+                val symmetryPenalty = kotlin.math.abs(lLum - rLum) * 0.6f
+                val bridgeContrast = (bridgeLum - (lLum + rLum) * 0.5f) * 1.2f
+                val cheekContrast = (cheekLum - (lLum + rLum) * 0.5f) * 0.8f
+                val angleReg = kotlin.math.abs(ang) * 0.15f
+                val score = eyeDarkness + bridgeContrast + cheekContrast - symmetryPenalty - angleReg
+                if (score > bestOcularScore) {
+                    bestOcularScore = score
+                    bestAngle = ang
+                    bestMidY = testY
+                }
+            }
+        }
 
         val landmarks = refine5PointLandmarksFromPixels(
             bitmap = bitmap,
             coarseMidX = faceCenterX,
-            coarseMidY = coarseEyeY,
+            coarseMidY = bestMidY,
             coarseEyeDist = coarseEyeDist,
-            eulerZDegrees = 0f
+            eulerZDegrees = bestAngle
         )
 
         val lEye = landmarks[0]
@@ -487,7 +642,7 @@ object ScrfdFaceDetector {
         val actualMidX = (lEye.x + rEye.x) * 0.5f
         val actualMidY = (lEye.y + rEye.y) * 0.5f
         val actualDist = kotlin.math.hypot((rEye.x - lEye.x).toDouble(), (rEye.y - lEye.y).toDouble()).toFloat()
-            .coerceAtLeast(wf * 0.16f)
+            .coerceAtLeast(coarseEyeDist * 0.75f)
 
         val box = RectF(
             (actualMidX - actualDist * 1.25f).coerceAtLeast(0f),
@@ -505,11 +660,11 @@ object ScrfdFaceDetector {
     }
 
     /**
-     * Refines a coarse eye-midpoint and inter-ocular distance into exact 5-point anatomical landmarks
-     * (`[leftEye, rightEye, noseTip, leftMouth, rightMouth]`) by locating:
-     *  1. Left & Right dark iris/pupil centroids (capturing true head tilt angle)
-     *  2. Sub-nasale / nose tip along the perpendicular facial axis
-     *  3. Oral slit / lip vermilion center and left/right mouth commissures
+     * Refines a coarse eye-midpoint, inter-ocular distance, and roll angle into exact 5-point anatomical
+     * landmarks (`[leftEye, rightEye, noseTip, leftMouth, rightMouth]`) with full 3D roll, pitch, and yaw support:
+     *  1. Left & Right dark iris/pupil centroids along the rotated ocular axis (rejecting eyebrows above)
+     *  2. 2D `(u, d)` sub-nasale / nose tip search (handles both head pitch and left/right yaw turn)
+     *  3. 2D `(u, d)` oral slit / lip vermilion search (handles open/closed smile under head tilt & yaw)
      */
     private fun refine5PointLandmarksFromPixels(
         bitmap: Bitmap,
@@ -523,6 +678,8 @@ object ScrfdFaceDetector {
         val rad = Math.toRadians(-eulerZDegrees.toDouble())
         val initCos = kotlin.math.cos(rad).toFloat()
         val initSin = kotlin.math.sin(rad).toFloat()
+        val initDownX = -initSin
+        val initDownY = initCos
 
         val initLx = coarseMidX - initCos * (coarseEyeDist * 0.5f)
         val initLy = coarseMidY - initSin * (coarseEyeDist * 0.5f)
@@ -530,42 +687,52 @@ object ScrfdFaceDetector {
         val initRy = coarseMidY + initSin * (coarseEyeDist * 0.5f)
 
         fun locateIrisCenter(seedX: Float, seedY: Float): PointF {
-            val rx = (coarseEyeDist * 0.20f).toInt().coerceAtLeast(6)
-            val ry = (coarseEyeDist * 0.16f).toInt().coerceAtLeast(5)
-            val x0 = (seedX.toInt() - rx).coerceIn(2, w - 3)
-            val x1 = (seedX.toInt() + rx).coerceIn(2, w - 3)
-            val y0 = (seedY.toInt() - ry).coerceIn(2, h - 3)
-            val y1 = (seedY.toInt() + ry).coerceIn(2, h - 3)
+            val rSearch = (coarseEyeDist * 0.18f).toInt().coerceAtLeast(4)
+            val x0 = (seedX.toInt() - rSearch).coerceIn(2, w - 3)
+            val x1 = (seedX.toInt() + rSearch).coerceIn(2, w - 3)
+            val y0 = (seedY.toInt() - rSearch).coerceIn(2, h - 3)
+            val y1 = (seedY.toInt() + rSearch).coerceIn(2, h - 3)
 
             var sumW = 0f
             var sumX = 0f
             var sumY = 0f
             for (y in y0..y1) {
-                // Penalize eyebrows at the very top of the window so we lock onto the eye iris, not the eyebrow!
-                val vertBias = 1.0f - 0.35f * kotlin.math.abs((y - seedY) / ry.toFloat()).coerceIn(0f, 1f)
                 for (x in x0..x1) {
+                    val dx = x - seedX
+                    val dy = y - seedY
+                    // Coordinate along downward normal (-initSin, initCos); negative = above seed (eyebrow zone)
+                    val vNormal = (dx * initDownX + dy * initDownY) / rSearch.toFloat()
+                    val uHoriz = (dx * initCos + dy * initSin) / rSearch.toFloat()
+                    if (uHoriz * uHoriz + vNormal * vNormal > 1.0f) continue
+                    // Strongly penalize pixels above the eye line (vNormal < -0.25) so we never lock onto eyebrows!
+                    val browGuard = if (vNormal < -0.20f) (1.0f + vNormal * 0.9f).coerceAtLeast(0.15f) else 1.0f
+
                     val c = bitmap.getPixel(x, y)
                     val r = (c ushr 16) and 0xFF
                     val g = (c ushr 8) and 0xFF
                     val b = c and 0xFF
                     val lum = 0.299f * r + 0.587f * g + 0.114f * b
-                    if (lum < 92f) {
-                        val cL = bitmap.getPixel(x - 2, y)
-                        val cR = bitmap.getPixel(x + 2, y)
+                    if (lum < 96f) {
+                        val sxL = (x - (initCos * 2f).toInt()).coerceIn(1, w - 2)
+                        val syL = (y - (initSin * 2f).toInt()).coerceIn(1, h - 2)
+                        val sxR = (x + (initCos * 2f).toInt()).coerceIn(1, w - 2)
+                        val syR = (y + (initSin * 2f).toInt()).coerceIn(1, h - 2)
+                        val cL = bitmap.getPixel(sxL, syL)
+                        val cR = bitmap.getPixel(sxR, syR)
                         val lumL = 0.299f * ((cL ushr 16) and 0xFF) + 0.587f * ((cL ushr 8) and 0xFF) + 0.114f * (cL and 0xFF)
                         val lumR = 0.299f * ((cR ushr 16) and 0xFF) + 0.587f * ((cR ushr 8) and 0xFF) + 0.114f * (cR and 0xFF)
                         val scleraContrast = max(0f, (lumL + lumR) * 0.5f - lum)
-                        val weight = ((95f - lum) + scleraContrast * 1.4f) * vertBias
+                        val weight = ((100f - lum) + scleraContrast * 1.5f) * browGuard
                         sumW += weight
                         sumX += x * weight
                         sumY += y * weight
                     }
                 }
             }
-            return if (sumW > 20f) {
+            return if (sumW > 16f) {
                 PointF(
-                    (seedX * 0.35f + (sumX / sumW) * 0.65f).coerceIn(0f, w.toFloat()),
-                    (seedY * 0.35f + (sumY / sumW) * 0.65f).coerceIn(0f, h.toFloat())
+                    (seedX * 0.40f + (sumX / sumW) * 0.60f).coerceIn(0f, w.toFloat()),
+                    (seedY * 0.40f + (sumY / sumW) * 0.60f).coerceIn(0f, h.toFloat())
                 )
             } else {
                 PointF(seedX.coerceIn(0f, w.toFloat()), seedY.coerceIn(0f, h.toFloat()))
@@ -577,7 +744,7 @@ object ScrfdFaceDetector {
 
         val dx = rightEye.x - leftEye.x
         val dy = rightEye.y - leftEye.y
-        val eyeDist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(20f)
+        val eyeDist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(12f)
         val cosA = dx / eyeDist
         val sinA = dy / eyeDist
         // Downward normal perpendicular to eye line
@@ -586,69 +753,93 @@ object ScrfdFaceDetector {
         val midX = (leftEye.x + rightEye.x) * 0.5f
         val midY = (leftEye.y + rightEye.y) * 0.5f
 
-        // Locate nose tip / nostril base along downward normal (between 0.50 and 0.68 * eyeDist)
-        val defaultNoseDist = eyeDist * 0.58f
+        // 2D (u, d) Nose tip / nostril pair search (captures head pitch AND yaw)
+        val defaultNoseDist = eyeDist * 0.56f
         var bestNoseDist = defaultNoseDist
-        var maxNostrilScore = 0f
-        val nStart = (eyeDist * 0.48f).toInt().coerceAtLeast(8)
-        val nEnd = (eyeDist * 0.70f).toInt().coerceAtLeast(nStart + 2)
-        for (d in nStart..nEnd step 2) {
-            val nx = midX + downX * d
-            val ny = midY + downY * d
-            val lNx = (nx - cosA * (eyeDist * 0.11f)).toInt().coerceIn(1, w - 2)
-            val lNy = (ny - sinA * (eyeDist * 0.11f)).toInt().coerceIn(1, h - 2)
-            val rNx = (nx + cosA * (eyeDist * 0.11f)).toInt().coerceIn(1, w - 2)
-            val rNy = (ny + sinA * (eyeDist * 0.11f)).toInt().coerceIn(1, h - 2)
-            val cL = bitmap.getPixel(lNx, lNy)
-            val cR = bitmap.getPixel(rNx, rNy)
-            val lumL = 0.299f * ((cL ushr 16) and 0xFF) + 0.587f * ((cL ushr 8) and 0xFF) + 0.114f * (cL and 0xFF)
-            val lumR = 0.299f * ((cR ushr 16) and 0xFF) + 0.587f * ((cR ushr 8) and 0xFF) + 0.114f * (cR and 0xFF)
-            val score = (220f - (lumL + lumR) * 0.5f)
-            if (score > maxNostrilScore) {
-                maxNostrilScore = score
-                bestNoseDist = (d - eyeDist * 0.03f).coerceIn(eyeDist * 0.50f, eyeDist * 0.65f)
+        var bestNoseYawU = 0f
+        var maxNostrilScore = -1e9f
+        val nStart = (eyeDist * 0.44f).toInt().coerceAtLeast(5)
+        val nEnd = (eyeDist * 0.68f).toInt().coerceAtLeast(nStart + 2)
+        val maxYawU = (eyeDist * 0.14f).toInt().coerceAtLeast(2)
+        val stepD = max(1, (nEnd - nStart) / 10)
+        val stepU = max(1, maxYawU / 3)
+
+        for (d in nStart..nEnd step stepD) {
+            for (u in -maxYawU..maxYawU step stepU) {
+                val nx = midX + downX * d + cosA * u
+                val ny = midY + downY * d + sinA * u
+                val lNx = (nx - cosA * (eyeDist * 0.10f)).toInt().coerceIn(1, w - 2)
+                val lNy = (ny - sinA * (eyeDist * 0.10f)).toInt().coerceIn(1, h - 2)
+                val rNx = (nx + cosA * (eyeDist * 0.10f)).toInt().coerceIn(1, w - 2)
+                val rNy = (ny + sinA * (eyeDist * 0.10f)).toInt().coerceIn(1, h - 2)
+                val tipX = (nx - downX * (eyeDist * 0.06f)).toInt().coerceIn(1, w - 2)
+                val tipY = (ny - downY * (eyeDist * 0.06f)).toInt().coerceIn(1, h - 2)
+
+                val cL = bitmap.getPixel(lNx, lNy)
+                val cR = bitmap.getPixel(rNx, rNy)
+                val cTip = bitmap.getPixel(tipX, tipY)
+                val lumL = 0.299f * ((cL ushr 16) and 0xFF) + 0.587f * ((cL ushr 8) and 0xFF) + 0.114f * (cL and 0xFF)
+                val lumR = 0.299f * ((cR ushr 16) and 0xFF) + 0.587f * ((cR ushr 8) and 0xFF) + 0.114f * (cR and 0xFF)
+                val lumTip = 0.299f * ((cTip ushr 16) and 0xFF) + 0.587f * ((cTip ushr 8) and 0xFF) + 0.114f * (cTip and 0xFF)
+
+                // Nostril base has dark nostrils flanked below a brighter nose tip highlight
+                val nostrilShadow = 210f - (lumL + lumR) * 0.5f
+                val tipContrast = (lumTip - (lumL + lumR) * 0.5f) * 0.8f
+                val distPrior = -kotlin.math.abs(d - defaultNoseDist) * 0.4f - kotlin.math.abs(u) * 0.3f
+                val score = nostrilShadow + tipContrast + distPrior
+                if (score > maxNostrilScore) {
+                    maxNostrilScore = score
+                    bestNoseDist = (d - eyeDist * 0.03f).coerceIn(eyeDist * 0.45f, eyeDist * 0.65f)
+                    bestNoseYawU = u.toFloat() * 0.65f
+                }
             }
         }
+        val finalNoseDist = defaultNoseDist * 0.45f + bestNoseDist * 0.55f
         val noseTip = PointF(
-            (midX + downX * (defaultNoseDist * 0.5f + bestNoseDist * 0.5f)).coerceIn(0f, w.toFloat()),
-            (midY + downY * (defaultNoseDist * 0.5f + bestNoseDist * 0.5f)).coerceIn(0f, h.toFloat())
+            (midX + downX * finalNoseDist + cosA * bestNoseYawU).coerceIn(0f, w.toFloat()),
+            (midY + downY * finalNoseDist + sinA * bestNoseYawU).coerceIn(0f, h.toFloat())
         )
 
-        // Locate mouth center along downward normal (between 0.96 and 1.28 * eyeDist)
-        val defaultMouthDist = eyeDist * 1.14f
+        // Locate mouth center along downward normal (between 0.94 and 1.26 * eyeDist, aligned with nose yaw)
+        val defaultMouthDist = (finalNoseDist + eyeDist * 0.56f).coerceIn(eyeDist * 0.98f, eyeDist * 1.22f)
         var sumMouthW = 0f
         var sumMouthDist = 0f
-        val mStart = (eyeDist * 0.94f).toInt().coerceAtLeast(14)
-        val mEnd = (eyeDist * 1.30f).toInt().coerceAtLeast(mStart + 2)
-        val halfMouthSpan = (eyeDist * 0.36f).toInt().coerceAtLeast(6)
-        for (d in mStart..mEnd step 2) {
+        val mStart = (finalNoseDist + eyeDist * 0.38f).toInt().coerceAtLeast(10)
+        val mEnd = (finalNoseDist + eyeDist * 0.72f).toInt().coerceAtLeast(mStart + 2)
+        val halfMouthSpan = (eyeDist * 0.36f).toInt().coerceAtLeast(4)
+        val stepM = max(1, (mEnd - mStart) / 12)
+        val stepMU = max(1, halfMouthSpan / 5)
+
+        for (d in mStart..mEnd step stepM) {
             var rowScore = 0f
-            for (u in -halfMouthSpan..halfMouthSpan step 3) {
-                val mx = (midX + downX * d + cosA * u).toInt().coerceIn(1, w - 2)
-                val my = (midY + downY * d + sinA * u).toInt().coerceIn(1, h - 2)
+            for (u in -halfMouthSpan..halfMouthSpan step stepMU) {
+                val mx = (midX + downX * d + cosA * (bestNoseYawU + u)).toInt().coerceIn(1, w - 2)
+                val my = (midY + downY * d + sinA * (bestNoseYawU + u)).toInt().coerceIn(1, h - 2)
                 val c = bitmap.getPixel(mx, my)
                 val r = (c ushr 16) and 0xFF
                 val g = (c ushr 8) and 0xFF
                 val b = c and 0xFF
                 val lum = 0.299f * r + 0.587f * g + 0.114f * b
-                // Lip vermilion redness OR dark oral slit OR bright teeth contrast
-                val lipRedness = max(0, (r - g) - 14).toFloat()
+                val lipRedness = max(0, (r - g) - 16).toFloat()
                 val oralSlit = if (lum < 75f) (75f - lum) * 0.8f else 0f
                 rowScore += (lipRedness * 1.5f + oralSlit)
             }
-            if (rowScore > 10f) {
+            if (rowScore > 8f) {
                 sumMouthW += rowScore
                 sumMouthDist += d * rowScore
             }
         }
-        val mouthDist = if (sumMouthW > 20f) {
-            (defaultMouthDist * 0.40f + (sumMouthDist / sumMouthW) * 0.60f).coerceIn(eyeDist * 0.98f, eyeDist * 1.25f)
+        val mouthDist = if (sumMouthW > 16f) {
+            (defaultMouthDist * 0.45f + (sumMouthDist / sumMouthW) * 0.55f).coerceIn(
+                finalNoseDist + eyeDist * 0.40f,
+                finalNoseDist + eyeDist * 0.68f
+            )
         } else {
             defaultMouthDist
         }
 
-        val mouthCenterX = midX + downX * mouthDist
-        val mouthCenterY = midY + downY * mouthDist
+        val mouthCenterX = midX + downX * mouthDist + cosA * bestNoseYawU
+        val mouthCenterY = midY + downY * mouthDist + sinA * bestNoseYawU
         val mouthHalfW = eyeDist * 0.415f
 
         val leftMouth = PointF(
