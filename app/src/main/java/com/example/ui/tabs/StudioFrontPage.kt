@@ -184,6 +184,8 @@ fun StudioFrontPage(
     onDownloadHd: () -> Unit,
     onSaveToGallery: () -> Unit,
     onInspectResultDetails: () -> Unit,
+    onSkinToneModeChanged: (com.example.onnx.SkinToneSourceMode) -> Unit = {},
+    onFaceReactionModeChanged: (com.example.onnx.FaceReactionSourceMode) -> Unit = {},
     modifier: Modifier = Modifier
 ) {
     val scrollState = rememberScrollState()
@@ -219,7 +221,7 @@ fun StudioFrontPage(
                 onSelectMode = onSelectStudioMode
             )
 
-            // 3. Main Workspace Card (1 Source Face, 2 Target Photo, 3 Quick Actions, Swap Face CTA)
+            // 3. Main Workspace Card (1 Source Face, 2 Target Photo, Skin Tone & Face Reaction Selector, Swap Face CTA)
             FrontMainWorkspaceCard(
                 uiState = uiState,
                 onPickSourcePhoto = onPickSourcePhoto,
@@ -227,7 +229,9 @@ fun StudioFrontPage(
                 onDetectFaces = onDetectFaces,
                 onPreviewAlignmentPage = onPreviewAlignmentPage,
                 onOpenSettingsPage = onOpenSettingsPage,
-                onRunSwap = onRunSwap
+                onRunSwap = onRunSwap,
+                onSkinToneModeChanged = onSkinToneModeChanged,
+                onFaceReactionModeChanged = onFaceReactionModeChanged
             )
 
             // 4. Result Card (Source -> Target + Result Preview + Download + Save to Gallery + Completed Footer)
@@ -591,7 +595,9 @@ private fun FrontMainWorkspaceCard(
     onDetectFaces: () -> Unit,
     onPreviewAlignmentPage: () -> Unit,
     onOpenSettingsPage: () -> Unit,
-    onRunSwap: () -> Unit
+    onRunSwap: () -> Unit,
+    onSkinToneModeChanged: (com.example.onnx.SkinToneSourceMode) -> Unit = {},
+    onFaceReactionModeChanged: (com.example.onnx.FaceReactionSourceMode) -> Unit = {}
 ) {
     val cardShape = RoundedCornerShape(20.dp)
     Surface(
@@ -654,6 +660,112 @@ private fun FrontMainWorkspaceCard(
                 onPickPhoto = onPickTargetPhoto
             )
 
+            HorizontalDivider(color = Color(0xFF182442), thickness = 1.dp)
+
+            // Direct User Selection: 1. Skin Tone (தோல் நிறம்) & 2. Face Reaction (முகபாவனை)
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(Color(0xFF0E1832))
+                    .border(1.dp, Color(0xFF22335C), RoundedCornerShape(14.dp))
+                    .padding(horizontal = 10.dp, vertical = 10.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                // 1. Skin Tone Selector
+                Text(
+                    text = "Skin Tone (தோல் நிறம்)",
+                    color = Color(0xFF93C5FD),
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 12.sp
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val skinModes = listOf(
+                        com.example.onnx.SkinToneSourceMode.SOURCE_IDENTITY to "1. Source Skin",
+                        com.example.onnx.SkinToneSourceMode.TARGET_SCENE to "2. Target Skin",
+                        com.example.onnx.SkinToneSourceMode.BALANCED_BLEND to "50/50 Blend"
+                    )
+                    skinModes.forEach { (mode, label) ->
+                        val selected = uiState.skinToneMode == mode
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (selected) Color(0xFF0C3B78) else Color(0xFF14203E)
+                                )
+                                .border(
+                                    width = if (selected) 1.4.dp else 1.dp,
+                                    color = if (selected) Color(0xFF00E5FF) else Color(0xFF2B3E6B),
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable { onSkinToneModeChanged(mode) }
+                                .padding(horizontal = 4.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = label,
+                                color = if (selected) Color.White else Color(0xFFB0C0E0),
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                fontSize = 11.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+
+                // 2. Face Reaction Selector
+                Text(
+                    text = "Face Reaction (முகபாவனை / சிரிப்பு)",
+                    color = Color(0xFFC4B5FD),
+                    fontWeight = FontWeight.SemiBold,
+                    fontSize = 12.sp
+                )
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(6.dp)
+                ) {
+                    val reactionModes = listOf(
+                        com.example.onnx.FaceReactionSourceMode.TARGET_REACTION to "2. Target Reaction",
+                        com.example.onnx.FaceReactionSourceMode.SOURCE_REACTION to "1. Source Reaction"
+                    )
+                    reactionModes.forEach { (mode, label) ->
+                        val selected = uiState.faceReactionMode == mode
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(36.dp)
+                                .clip(RoundedCornerShape(10.dp))
+                                .background(
+                                    if (selected) Color(0xFF3E1F7A) else Color(0xFF14203E)
+                                )
+                                .border(
+                                    width = if (selected) 1.4.dp else 1.dp,
+                                    color = if (selected) Color(0xFFA855F7) else Color(0xFF2B3E6B),
+                                    shape = RoundedCornerShape(10.dp)
+                                )
+                                .clickable { onFaceReactionModeChanged(mode) }
+                                .padding(horizontal = 6.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = label,
+                                color = if (selected) Color.White else Color(0xFFB0C0E0),
+                                fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                                fontSize = 11.5.sp,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        }
+                    }
+                }
+            }
+
             // Row 3: 3 Quick Action Buttons (Detect Faces | Preview Alignment | Skin Tone & Settings)
             Row(
                 modifier = Modifier
@@ -681,7 +793,7 @@ private fun FrontMainWorkspaceCard(
 
                 SecondaryActionPillButton(
                     icon = Icons.Default.Tune,
-                    label = "Skin Tone & Settings",
+                    label = "Skin Tone & Reaction",
                     onClick = onOpenSettingsPage,
                     modifier = Modifier
                         .weight(1f)

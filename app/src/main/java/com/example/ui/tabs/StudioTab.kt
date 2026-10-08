@@ -163,12 +163,14 @@ fun StudioTab(
             onInspectResultDetails = {
                 onSelectStudioSubPage(StudioSubPage.ALIGNMENT_PREVIEW)
             },
+            onSkinToneModeChanged = onSkinToneModeChanged,
+            onFaceReactionModeChanged = onFaceReactionModeChanged,
             modifier = modifier
         )
         return
     }
 
-    // Secondary Pages ("மற்றவற்றை வேறு page இல் வை"): Settings, Fine-Tuning, Alignment & Visual Validation
+    // Secondary Pages ("மற்றவற்றை வேறு page இல் வை"): Skin Tone & Face Reaction Selector / Alignment Preview
     BackHandler {
         onSelectStudioSubPage(StudioSubPage.FRONT_HOME)
     }
@@ -222,7 +224,7 @@ fun StudioTab(
                         }
 
                         Text(
-                            text = if (isSettingsPage) "Skin Tone & Settings" else "Alignment & Diagnostics",
+                            text = if (isSettingsPage) "Skin Tone & Reaction" else "Alignment & Diagnostics",
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.Bold,
                             color = ElectricCyan
@@ -236,7 +238,7 @@ fun StudioTab(
                         FilterChip(
                             selected = isSettingsPage,
                             onClick = { onSelectStudioSubPage(StudioSubPage.SETTINGS_AND_DIAGNOSTICS) },
-                            label = { Text("Skin Tone & Settings") },
+                            label = { Text("Skin Tone & Reaction") },
                             modifier = Modifier
                                 .weight(1f)
                                 .testTag("subpage_tab_settings")
@@ -254,49 +256,13 @@ fun StudioTab(
             }
 
             if (isSettingsPage) {
-                // Page A: Skin Tone, Face Reaction, Quality, Blending Sliders, Safeguards & Engine Status
+                // User selects ONLY Skin Tone and Face Reaction
                 SkinToneAndReactionSelectorCard(
                     skinToneMode = uiState.skinToneMode,
                     faceReactionMode = uiState.faceReactionMode,
                     onSkinToneModeChanged = onSkinToneModeChanged,
                     onFaceReactionModeChanged = onFaceReactionModeChanged
                 )
-
-                QualityAndFineTuneControlsCard(
-                    uiState = uiState,
-                    onQualityLevelChanged = onQualityLevelChanged,
-                    onOutputResolutionChanged = onOutputResolutionChanged,
-                    onBlendStrengthChanged = onBlendStrengthChanged,
-                    onEnhancementStrengthChanged = onEnhancementStrengthChanged,
-                    onOcclusionProtectionChanged = onOcclusionProtectionChanged,
-                    onPortraitBlurStrengthChanged = onPortraitBlurStrengthChanged,
-                    onFaceOffsetXChanged = onFaceOffsetXChanged,
-                    onFaceOffsetYChanged = onFaceOffsetYChanged,
-                    onFaceScaleChanged = onFaceScaleChanged,
-                    onResetAdjustments = onResetAdjustments
-                )
-
-                SafeguardsAndBlendingCard(
-                    uiState = uiState,
-                    onConsentChanged = onConsentChanged,
-                    onColorTransferChanged = onColorTransferChanged,
-                    onWatermarkChanged = onWatermarkChanged,
-                    onTwoModelFallbackChanged = onTwoModelFallbackChanged,
-                    onHardwareAccelChanged = onHardwareAccelChanged,
-                    onLowMemoryChanged = onLowMemoryChanged
-                )
-
-                HeroPipelineStatusCard(
-                    uiState = uiState,
-                    onOpenModelsTab = onOpenModelsTab
-                )
-
-                if (!uiState.canExecuteSwap && !uiState.isSwapping) {
-                    SwapRequirementsCard(
-                        uiState = uiState,
-                        onOpenModelsTab = onOpenModelsTab
-                    )
-                }
             } else {
                 // Page B: Alignment Preview, Multi-Face Selection, Interactive Before/After & Visual Validation
                 uiState.swapResult?.let {

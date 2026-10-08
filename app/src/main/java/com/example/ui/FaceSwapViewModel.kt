@@ -161,18 +161,12 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     private val initialRamConfig = detectDeviceRamProfile(application)
 
-    private val initialPortraits = VisualValidationBenchmark.createRealisticSourceAndTargetPortraits()
-
     private val _uiState = MutableStateFlow(
         FaceSwapUiState(
             lowMemoryMode = initialRamConfig.first,
             qualityLevel = initialRamConfig.second,
             deviceTotalRamGb = initialRamConfig.third.first,
-            deviceAvailRamMb = initialRamConfig.third.second,
-            sourceBitmap = initialPortraits.first.first,
-            sourceFaces = listOf(initialPortraits.first.second),
-            targetBitmap = initialPortraits.second.first,
-            targetFaces = listOf(initialPortraits.second.second)
+            deviceAvailRamMb = initialRamConfig.third.second
         )
     )
     val uiState: StateFlow<FaceSwapUiState> = _uiState.asStateFlow()
@@ -185,27 +179,6 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
 
     init {
         refreshModelInspections()
-        preloadDefaultValidationPortraits()
-    }
-
-    private fun preloadDefaultValidationPortraits() {
-        val (srcPair, tgtPair) = runCatching {
-            VisualValidationBenchmark.createRealisticSourceAndTargetPortraits()
-        }.getOrNull() ?: return
-        _uiState.update { state ->
-            if (state.sourceBitmap == null && state.targetBitmap == null) {
-                state.copy(
-                    sourceBitmap = srcPair.first,
-                    sourceFaces = listOf(srcPair.second),
-                    selectedSourceFaceIndex = 0,
-                    targetBitmap = tgtPair.first,
-                    targetFaces = listOf(tgtPair.second),
-                    selectedTargetFaceIndex = 0
-                )
-            } else {
-                state
-            }
-        }
     }
 
     fun loadSourceAndTargetBitmaps(

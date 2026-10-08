@@ -382,21 +382,34 @@ object VisualValidationBenchmark {
         val rx = cropSize * 0.40f
         val ry = cropSize * 0.44f
 
+        // Canonical 128-normalized coordinates scaled to cropSize
+        val scale = cropSize / 128.0f
+        val lEyeX = 46.2946f * scale
+        val lEyeY = 51.6963f * scale
+        val rEyeX = 81.5318f * scale
+        val rEyeY = 51.5014f * scale
+        val eyeIrisRx = 7.2f * scale
+        val eyeIrisRy = 4.2f * scale
+
         for (y in 0 until cropSize) {
             val row = y * cropSize
+            val yf = y.toFloat()
+            val yNorm = yf / cropSize.toFloat()
             for (x in 0 until cropSize) {
                 val idx = row + x
-                val dx = (x - cx) / rx
-                val dy = (y - cy) / ry
+                val xf = x.toFloat()
+                val xNorm = xf / cropSize.toFloat()
+                val dx = (xf - cx) / rx
+                val dy = (yf - cy) / ry
                 val r = sqrt(dx * dx + dy * dy)
                 if (r >= 1.0f) {
                     outPx[idx] = tgtPx[idx]
                     continue
                 }
-                val mask = if (r <= 0.62f) {
+                val mask = if (r <= 0.64f) {
                     1.0f
                 } else {
-                    val t = (r - 0.62f) / 0.38f
+                    val t = (r - 0.64f) / 0.36f
                     (0.5f * (1.0f + cos(Math.PI * t))).toFloat()
                 }
 
@@ -409,8 +422,36 @@ object VisualValidationBenchmark {
                 val tG = (tc ushr 8) and 0xFF
                 val tB = tc and 0xFF
 
-                // Raw neural swap blends source identity structure & raw upper-lip latent shadow into target pose
-                val idWeight = (0.76f * detailPreservation * mask).coerceIn(0f, 0.85f)
+                // 1. Forehead Bindi / Kumkum Ornament Guard (glabella & lower forehead center)
+                if (xNorm in 0.44f..0.56f && yNorm in 0.16f..0.37f) {
+                    val tLum = 0.299f * tR + 0.587f * tG + 0.114f * tB
+                    val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
+                    val isRedKumkum = (tR - tG) > 32 && tR > 75 && (sR - sG) < (tR - tG) - 12
+                    val isDarkBindi = tLum < 68f && sLum > tLum + 38f
+                    if (isRedKumkum || isDarkBindi) {
+                        outPx[idx] = tc
+                        continue
+                    }
+                }
+
+                // 2. Inner Ocular Iris/Sclera Gaze Protection (prevents double-pupil ghosting when gaze differs)
+                val lIrisD = ((xf - lEyeX) / eyeIrisRx) * ((xf - lEyeX) / eyeIrisRx) +
+                    ((yf - lEyeY) / eyeIrisRy) * ((yf - lEyeY) / eyeIrisRy)
+                val rIrisD = ((xf - rEyeX) / eyeIrisRx) * ((xf - rEyeX) / eyeIrisRx) +
+                    ((yf - rEyeY) / eyeIrisRy) * ((yf - rEyeY) / eyeIrisRy)
+                val minIrisD = min(lIrisD, rIrisD)
+                val irisKeepTarget = if (minIrisD < 1.0f) {
+                    0.55f * (1.0f - minIrisD)
+                } else 0f
+
+                // 3. Anatomical Zone Weight: Strongest on Source Eyebrows, Upper Eyelids, Under-Eye Malar Cheeks & Nose
+                val zoneBoost = when {
+                    yNorm in 0.24f..0.58f -> 1.12f // Eyebrows, eyelids, under-eye cheeks & nose bridge/tip
+                    else -> 1.0f
+                }
+
+                val baseWeight = (0.76f * detailPreservation * zoneBoost * mask).coerceIn(0f, 0.90f)
+                val idWeight = (baseWeight * (1.0f - irisKeepTarget)).coerceIn(0f, 0.90f)
                 val invW = 1.0f - idWeight
                 val oR = (sR * idWeight + tR * invW).toInt().coerceIn(0, 255)
                 val oG = (sG * idWeight + tG * invW).toInt().coerceIn(0, 255)
@@ -419,7 +460,6 @@ object VisualValidationBenchmark {
             }
         }
 
-        // For 128px inswapper_128, simulate the slight 128px bottleneck softness vs 256px HyperSwap
         val outBmp = Bitmap.createBitmap(cropSize, cropSize, Bitmap.Config.ARGB_8888)
         outBmp.setPixels(outPx, 0, cropSize, 0, 0, cropSize, cropSize)
         return outBmp
