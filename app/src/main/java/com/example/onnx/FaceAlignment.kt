@@ -247,6 +247,195 @@ object FaceAlignment {
     }
 
     /**
+     * Warps `sourceBitmap` into a `dstSize x dstSize` aligned crop whose 15 anatomical landmarks
+     * (Left/Right Eye, Left/Right Eyebrow, Glabella, Nasal Bridge, Nose Tip, Philtrum, Left/Right
+     * Mouth Corners, Oral Center, Left/Right Cheekbones, Forehead, and Chin) match the Target face's
+     * exact 3D head pose (`yaw`, `pitch`, `roll`) in crop space.
+     *
+     * Eliminates double-nose, double-eyebrow, and double-eye ghosting when swapping between
+     * a frontal face and a turned/tilted head (or between long-shot and close-up faces).
+     */
+    fun warpSourceToTargetPose(
+        sourceBitmap: Bitmap,
+        sourceLandmarks5: List<PointF>,
+        targetLandmarks5: List<PointF>,
+        dstSize: Int
+    ): Bitmap {
+        if (sourceLandmarks5.size < 5 || targetLandmarks5.size < 5) {
+            val mFallback = estimateNorm(sourceLandmarks5, dstSize)
+            return warpAffineCrop(sourceBitmap, mFallback, dstSize)
+        }
+
+        val mSrc = estimateNorm(sourceLandmarks5, dstSize)
+        val mTgt = estimateNorm(targetLandmarks5, dstSize)
+        val invSrc = invertAffine2x3(mSrc)
+
+        fun mapPt(m: FloatArray, p: PointF): PointF = PointF(
+            m[0] * p.x + m[1] * p.y + m[2],
+            m[3] * p.x + m[4] * p.y + m[5]
+        )
+
+        val srcPts5 = List(5) { i -> mapPt(mSrc, sourceLandmarks5[i]) }
+        val tgtPts5 = List(5) { i -> mapPt(mTgt, targetLandmarks5[i]) }
+
+        val srcMesh = buildAnatomicalControlMesh15(srcPts5)
+        val tgtMesh = buildAnatomicalControlMesh15(tgtPts5)
+        val numCtrl = srcMesh.size
+        val maxShift = dstSize * 0.22f
+        val dispX = FloatArray(numCtrl)
+        val dispY = FloatArray(numCtrl)
+        for (k in 0 until numCtrl) {
+            dispX[k] = (srcMesh[k].x - tgtMesh[k].x).coerceIn(-maxShift, maxShift)
+            dispY[k] = (srcMesh[k].y - tgtMesh[k].y).coerceIn(-maxShift, maxShift)
+        }
+
+        // Evaluate smooth inverse-distance / Gaussian Radial-Basis displacement on a 32x32 control grid
+        val gridDiv = 32
+        val gridSize = gridDiv + 1
+        val step = dstSize.toFloat() / gridDiv.toFloat()
+        val sigmaSq = (dstSize * 0.14f) * (dstSize * 0.14f)
+        val epsSq = (dstSize * 0.018f) * (dstSize * 0.018f)
+        val gridSrcX = FloatArray(gridSize * gridSize)
+        val gridSrcY = FloatArray(gridSize * gridSize)
+        val halfS = dstSize * 0.5f
+
+        for (gy in 0..gridDiv) {
+            val yf = gy * step
+            val rowOff = gy * gridSize
+            for (gx in 0..gridDiv) {
+                val xf = gx * step
+                // Smoothly taper pose deformation near the outer border of the crop
+                val borderNorm = kotlin.math.max(
+                    kotlin.math.abs(xf - halfS) / halfS,
+                    kotlin.math.abs(yf - halfS) / halfS
+                )
+                val borderTaper = if (borderNorm <= 0.72f) {
+                    1.0f
+                } else if (borderNorm >= 0.98f) {
+                    0.0f
+                } else {
+                    val t = (borderNorm - 0.72f) / 0.26f
+                    (0.5f * (1.0 + cos(Math.PI * t))).toFloat()
+                }
+
+                var sumW = 0f
+                var sumDx = 0f
+                var sumDy = 0f
+                for (k in 0 until numCtrl) {
+                    val ddx = xf - tgtMesh[k].x
+                    val ddy = yf - tgtMesh[k].y
+                    val d2 = ddx * ddx + ddy * ddy
+                    val w = (1.0f / (d2 + epsSq)) * kotlin.math.exp((-d2 / (2.0f * sigmaSq)).toDouble()).toFloat()
+                    sumW += w
+                    sumDx += w * dispX[k]
+                    sumDy += w * dispY[k]
+                }
+
+                val dx = if (sumW > 1e-7f) (sumDx / sumW) * borderTaper else 0f
+                val dy = if (sumW > 1e-7f) (sumDy / sumW) * borderTaper else 0f
+                val srcCropX = xf + dx
+                val srcCropY = yf + dy
+
+                // Map directly through invSrc into original sourceBitmap pixel coordinates
+                gridSrcX[rowOff + gx] = invSrc[0] * srcCropX + invSrc[1] * srcCropY + invSrc[2]
+                gridSrcY[rowOff + gx] = invSrc[3] * srcCropX + invSrc[4] * srcCropY + invSrc[5]
+            }
+        }
+
+        val srcW = sourceBitmap.width
+        val srcH = sourceBitmap.height
+        val srcPixels = IntArray(srcW * srcH)
+        sourceBitmap.getPixels(srcPixels, 0, srcW, 0, 0, srcW, srcH)
+        val dstPixels = IntArray(dstSize * dstSize)
+        val invStep = 1.0f / step
+
+        for (dy in 0 until dstSize) {
+            val gyFloat = (dy * invStep).coerceIn(0f, (gridDiv - 0.0001f))
+            val gy0 = gyFloat.toInt()
+            val gy1 = (gy0 + 1).coerceAtMost(gridDiv)
+            val fy = gyFloat - gy0
+            val oneMinusFy = 1.0f - fy
+            val gRow0 = gy0 * gridSize
+            val gRow1 = gy1 * gridSize
+            val dstRow = dy * dstSize
+
+            for (dx in 0 until dstSize) {
+                val gxFloat = (dx * invStep).coerceIn(0f, (gridDiv - 0.0001f))
+                val gx0 = gxFloat.toInt()
+                val gx1 = (gx0 + 1).coerceAtMost(gridDiv)
+                val fx = gxFloat - gx0
+                val oneMinusFx = 1.0f - fx
+
+                val w00 = oneMinusFx * oneMinusFy
+                val w10 = fx * oneMinusFy
+                val w01 = oneMinusFx * fy
+                val w11 = fx * fy
+
+                val sx = w00 * gridSrcX[gRow0 + gx0] +
+                    w10 * gridSrcX[gRow0 + gx1] +
+                    w01 * gridSrcX[gRow1 + gx0] +
+                    w11 * gridSrcX[gRow1 + gx1]
+
+                val sy = w00 * gridSrcY[gRow0 + gx0] +
+                    w10 * gridSrcY[gRow0 + gx1] +
+                    w01 * gridSrcY[gRow1 + gx0] +
+                    w11 * gridSrcY[gRow1 + gx1]
+
+                dstPixels[dstRow + dx] = sampleBilinearClamped(srcPixels, srcW, srcH, sx, sy)
+            }
+        }
+
+        val out = Bitmap.createBitmap(dstSize, dstSize, Bitmap.Config.ARGB_8888)
+        out.setPixels(dstPixels, 0, dstSize, 0, 0, dstSize, dstSize)
+        return out
+    }
+
+    private fun buildAnatomicalControlMesh15(pts5: List<PointF>): Array<PointF> {
+        val lEye = pts5[0]
+        val rEye = pts5[1]
+        val nose = pts5[2]
+        val lMouth = pts5[3]
+        val rMouth = pts5[4]
+
+        val eyeMidX = (lEye.x + rEye.x) * 0.5f
+        val eyeMidY = (lEye.y + rEye.y) * 0.5f
+        val mouthMidX = (lMouth.x + rMouth.x) * 0.5f
+        val mouthMidY = (lMouth.y + rMouth.y) * 0.5f
+
+        val dx = rEye.x - lEye.x
+        val dy = rEye.y - lEye.y
+        val eyeDist = hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(12f)
+        val ux = dx / eyeDist
+        val uy = dy / eyeDist
+        val vx = -uy
+        val vy = ux
+
+        return arrayOf(
+            lEye,                                                                                       // 0: Left Eye
+            rEye,                                                                                       // 1: Right Eye
+            nose,                                                                                       // 2: Nose Tip
+            lMouth,                                                                                     // 3: Left Mouth
+            rMouth,                                                                                     // 4: Right Mouth
+            PointF(eyeMidX, eyeMidY),                                                                   // 5: Glabella
+            PointF((eyeMidX + nose.x) * 0.5f, (eyeMidY + nose.y) * 0.5f),                               // 6: Nasal Bridge
+            PointF(mouthMidX, mouthMidY),                                                               // 7: Mouth Center
+            PointF(nose.x * 0.42f + mouthMidX * 0.58f, nose.y * 0.42f + mouthMidY * 0.58f),             // 8: Philtrum Center
+            PointF(lEye.x - vx * (eyeDist * 0.32f), lEye.y - vy * (eyeDist * 0.32f)),                   // 9: Left Eyebrow
+            PointF(rEye.x - vx * (eyeDist * 0.32f), rEye.y - vy * (eyeDist * 0.32f)),                   // 10: Right Eyebrow
+            PointF(eyeMidX - vx * (eyeDist * 0.65f), eyeMidY - vy * (eyeDist * 0.65f)),                 // 11: Forehead Center
+            PointF(mouthMidX + (mouthMidX - nose.x) * 0.78f, mouthMidY + (mouthMidY - nose.y) * 0.78f), // 12: Chin Tip
+            PointF(
+                lEye.x * 0.52f + lMouth.x * 0.48f - ux * (eyeDist * 0.34f),
+                lEye.y * 0.52f + lMouth.y * 0.48f - uy * (eyeDist * 0.34f)
+            ),                                                                                          // 13: Left Cheek
+            PointF(
+                rEye.x * 0.52f + rMouth.x * 0.48f + ux * (eyeDist * 0.34f),
+                rEye.y * 0.52f + rMouth.y * 0.48f + uy * (eyeDist * 0.34f)
+            )                                                                                           // 14: Right Cheek
+        )
+    }
+
+    /**
      * 4x4 Catmull-Rom Bicubic interpolation sampler for high-resolution 512x512 -> Target warping,
      * preserving crisp iris, eyelash, nostril, and lip vermilion micro-contrast without bilinear blur.
      */

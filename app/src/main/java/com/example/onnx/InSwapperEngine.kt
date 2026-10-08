@@ -330,12 +330,20 @@ object InSwapperEngine {
                             sourceTensor = sourceTensor
                         )
                     } else {
-                        VisualValidationBenchmark.synthesizeRawSwapCandidateCrop(
+                        val poseAlignedSource256 = FaceAlignment.warpSourceToTargetPose(
+                            sourceBitmap = sourceBitmap,
+                            sourceLandmarks5 = sourceFace.landmarks5,
+                            targetLandmarks5 = targetFace.landmarks5,
+                            dstSize = DEFAULT_SWAP_SIZE
+                        )
+                        val synthesized = VisualValidationBenchmark.synthesizeRawSwapCandidateCrop(
                             candidate = DEFAULT_PRODUCTION_CANDIDATE,
-                            srcCrop = alignedSource256,
+                            srcCrop = poseAlignedSource256,
                             tgtCrop = alignedTarget256,
                             cropSize = DEFAULT_SWAP_SIZE
                         )
+                        poseAlignedSource256.recycle()
+                        synthesized
                     }
                     totalSwapMs += (System.currentTimeMillis() - tFaceSwap0).coerceAtLeast(1L)
 

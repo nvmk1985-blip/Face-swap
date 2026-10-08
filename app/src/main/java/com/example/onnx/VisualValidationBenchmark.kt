@@ -458,6 +458,20 @@ object VisualValidationBenchmark {
                     0.35f * (0.5f * (1.0f + cos(Math.PI * t)).toFloat())
                 } else 0f
 
+                // Source Foreign-Pixel / Clothing / Outer-Hair Gate:
+                // Outside the eyes/eyebrows (y in 28..58*scale), reject non-skin foreign colors (e.g. green blouse
+                // where sG > sR, blue background where sB > sR + 6, or outer Source hair on the cheek perimeter)
+                val isOcularOrBrowZone = yf in (26f * scale)..(60f * scale) && xf in (26f * scale)..(102f * scale)
+                val isForeignNonSkin = !isOcularOrBrowZone && (sG > sR + 2 || sB > sR + 8)
+                val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
+                val tLum = 0.299f * tR + 0.587f * tG + 0.114f * tB
+                val isOuterSourceHair = !isOcularOrBrowZone && r > 0.44f && sLum < 52f && tLum > sLum + 24f
+                val sourceValidityGate = when {
+                    isForeignNonSkin -> 0.0f
+                    isOuterSourceHair -> (1.0f - ((52f - sLum) / 38f) * ((r - 0.44f) / 0.56f)).coerceIn(0.10f, 1.0f)
+                    else -> 1.0f
+                }
+
                 // Frequency-separated synthesis:
                 // Use 100% of Source's high-frequency anatomical structure (single nose, single eyebrows, single eyelids)
                 // combined with smooth low-frequency 3D pose shading so Target's high-frequency nose/eyes NEVER ghost!
@@ -472,7 +486,7 @@ object VisualValidationBenchmark {
                 val innerG = (sLow[1] * (1f - shadeMix) + tLow[1] * shadeMix + sHighG).coerceIn(0f, 255f)
                 val innerB = (sLow[2] * (1f - shadeMix) + tLow[2] * shadeMix + sHighB).coerceIn(0f, 255f)
 
-                val effectiveMask = (mask * (1.0f - irisKeepTarget)).coerceIn(0f, 1.0f)
+                val effectiveMask = (mask * (1.0f - irisKeepTarget) * sourceValidityGate).coerceIn(0f, 1.0f)
                 val invMask = 1.0f - effectiveMask
                 val oR = (innerR * effectiveMask + tR * invMask).toInt().coerceIn(0, 255)
                 val oG = (innerG * effectiveMask + tG * invMask).toInt().coerceIn(0, 255)

@@ -914,16 +914,15 @@ object FaceBlender {
         } else null
         var maskGenMs = (System.currentTimeMillis() - tMask0).coerceAtLeast(0L)
 
-        val mSrc128 = if (sourceBitmap != null && sourceLandmarks5 != null && sourceLandmarks5.size >= 5) {
-            FaceAlignment.estimateNorm(sourceLandmarks5, 128)
+        val alignedSource512 = if (sourceBitmap != null && sourceLandmarks5 != null && sourceLandmarks5.size >= 5) {
+            FaceAlignment.warpSourceToTargetPose(
+                sourceBitmap = sourceBitmap,
+                sourceLandmarks5 = sourceLandmarks5,
+                targetLandmarks5 = targetLandmarks5,
+                dstSize = HD_SIZE
+            )
         } else null
-        val alignedSource512 = if (sourceBitmap != null && mSrc128 != null) {
-            val mSrc512 = FloatArray(6) { i -> mSrc128[i] * 4.0f }
-            FaceAlignment.warpAffineCrop(sourceBitmap, mSrc512, HD_SIZE)
-        } else null
-        val srcGeom512 = if (mSrc128 != null && sourceLandmarks5 != null) {
-            computeWarpedGeometry(mSrc128, sourceLandmarks5, scale = 4.0f)
-        } else null
+        val srcGeom512 = if (alignedSource512 != null) geom512 else null
 
         val clampedEnhance = enhancementStrength.coerceIn(0f, 1f)
         val tRestore0 = System.currentTimeMillis()
@@ -2007,8 +2006,22 @@ object FaceBlender {
                 }
 
                 val idx = row + x
-                if (enableOcclusionProtection && r > 0.54f && alpha > 0.01f) {
-                    val perimWeight = ((r - 0.54f) / 0.46f).coerceIn(0f, 1f)
+                val sc = swapPx512[idx]
+                val sR = (sc ushr 16) and 0xFF
+                val sG = (sc ushr 8) and 0xFF
+                val sB = sc and 0xFF
+
+                // Reject foreign non-skin Source clothing/background colors (e.g., green blouse where sG > sR)
+                // outside the ocular/brow zone so clothing can never bleed onto the Target cheek/jawline
+                if (r > 0.36f && (sG > sR + 3 || sB > sR + 8)) {
+                    val eyeBrowW = computeEyeAndBrowProtectionWeight(x.toFloat(), y.toFloat(), geom512)
+                    if (eyeBrowW < 0.10f) {
+                        alpha = 0f
+                    }
+                }
+
+                if (enableOcclusionProtection && r > 0.50f && alpha > 0.01f) {
+                    val perimWeight = ((r - 0.50f) / 0.50f).coerceIn(0f, 1f)
                     if (neuralOcclusionGate512 != null) {
                         val segGate = neuralOcclusionGate512[idx].coerceIn(0f, 1f)
                         val gateFactor = 1.0f - perimWeight * (1.0f - (0.35f + 0.65f * segGate))
@@ -2016,12 +2029,17 @@ object FaceBlender {
                     }
 
                     val tc = tgtPx512[idx]
-                    val sc = swapPx512[idx]
                     val tLum = 0.299f * (tc ushr 16 and 0xFF) + 0.587f * (tc ushr 8 and 0xFF) + 0.114f * (tc and 0xFF)
-                    val sLum = 0.299f * (sc ushr 16 and 0xFF) + 0.587f * (sc ushr 8 and 0xFF) + 0.114f * (sc and 0xFF)
+                    val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
+                    // Protect Target hair overlapping outer cheek/forehead
                     if (tLum < 56f && sLum > tLum + 24f) {
                         val hairKeep = (((56f - tLum) / 45f) * perimWeight).coerceIn(0f, 0.85f)
                         alpha *= (1.0f - hairKeep)
+                    }
+                    // Prevent outer Source hair/dark background from pasting over Target cheek skin
+                    if (sLum < 54f && tLum > sLum + 24f) {
+                        val srcHairSuppress = (((54f - sLum) / 42f) * perimWeight).coerceIn(0f, 0.88f)
+                        alpha *= (1.0f - srcHairSuppress)
                     }
                 }
 
