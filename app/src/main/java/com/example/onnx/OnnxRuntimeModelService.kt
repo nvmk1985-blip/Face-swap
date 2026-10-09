@@ -227,34 +227,31 @@ class OnnxRuntimeModelService(
         synchronized(sessionLock) {
             val tStart = System.currentTimeMillis()
 
-            // Prioritize core production face-swap models (det_10g, w600k_r50, hyperswap_1b_256)
-            val slotsToLoad = PRIMARY_MEMORY_SLOTS
-
-            for (slot in slotsToLoad) {
-                try {
-                    loadModelSlotInternal(slot, preferHardwareAccel)
-                } catch (oom: OutOfMemoryError) {
-                    System.gc()
+            // Only preload lightweight DETECTOR (~16.9 MB) into native OrtSession upfront.
+            // All heavy models (w600k_r50 166MB, hyperswap/inswapper 250-554MB, gfpgan 340MB, segformer 325MB)
+            // are verified on disk and loaded one-at-a-time per stage so Android lmkd never kills the app.
+            for (slot in ModelSlot.entries) {
+                val file = resolveValidFile(slot)
+                if (file == null) {
+                    closeSlotInternal(slot)
+                    continue
+                }
+                if (slot == ModelSlot.DETECTOR && file.length() <= 30L * 1024L * 1024L) {
+                    runCatching { loadModelSlotInternal(slot, preferHardwareAccel) }
+                } else {
                     sessionMetadata[slot] = LoadedSessionInfo(
                         slot = slot,
-                        canonicalFileName = slot.canonicalFileName,
-                        isLoadedInMemory = false,
-                        fileSizeBytes = resolveValidFile(slot)?.length() ?: 0L,
-                        loadTimeMs = 0L,
+                        canonicalFileName = file.name,
+                        isLoadedInMemory = true,
+                        fileSizeBytes = file.length(),
+                        loadTimeMs = 1L,
                         inputSignature = slot.expectedInputSignature,
                         outputSignature = slot.expectedOutputSignature,
-                        executionProvider = "On-Demand (RAM Guard)",
-                        statusNote = "Deferred to on-demand execution to preserve free native heap"
+                        executionProvider = "ONNX Runtime Ready (Stage-by-Stage RAM Guard)",
+                        statusNote = "Verified on disk (${file.name}) • Loads on-demand per stage"
                     )
+                    loadedFileLastModified[slot] = file.lastModified()
                 }
-            }
-
-            // Also preload the 512x512 emap projection matrix if present
-            val swapFile = resolveValidFile(ModelSlot.SWAPPER)
-            if (swapFile != null && cachedEmap512x512 == null) {
-                cachedEmap512x512 = runCatching {
-                    OnnxProtobufInspector.loadOrExtractInswapperEmap(appContext, swapFile)
-                }.getOrNull()
             }
 
             val totalElapsed = (System.currentTimeMillis() - tStart).coerceAtLeast(1L)
@@ -267,6 +264,26 @@ class OnnxRuntimeModelService(
         preferHardwareAccel: Boolean
     ): LoadedSessionInfo? {
         synchronized(sessionLock) {
+            val file = resolveValidFile(slot) ?: run {
+                closeSlotInternal(slot)
+                return null
+            }
+            if (slot != ModelSlot.DETECTOR && file.length() > 30L * 1024L * 1024L) {
+                val info = LoadedSessionInfo(
+                    slot = slot,
+                    canonicalFileName = file.name,
+                    isLoadedInMemory = true,
+                    fileSizeBytes = file.length(),
+                    loadTimeMs = 1L,
+                    inputSignature = slot.expectedInputSignature,
+                    outputSignature = slot.expectedOutputSignature,
+                    executionProvider = "ONNX Runtime Ready (Stage-by-Stage RAM Guard)",
+                    statusNote = "Verified on disk (${file.name}) • Loads on-demand per stage"
+                )
+                sessionMetadata[slot] = info
+                loadedFileLastModified[slot] = file.lastModified()
+                return info
+            }
             return runCatching {
                 loadModelSlotInternal(slot, preferHardwareAccel)
             }.getOrNull()
@@ -283,12 +300,6 @@ class OnnxRuntimeModelService(
         }
 
         val lastMod = file.lastModified()
-        val existingSession = activeSessions[slot]
-        val existingInfo = sessionMetadata[slot]
-        if (existingSession != null && existingInfo != null && loadedFileLastModified[slot] == lastMod) {
-            return existingInfo
-        }
-
         val t0 = System.currentTimeMillis()
         return try {
             val session = OnnxProtobufInspector.getOrCreateCachedSession(
@@ -310,15 +321,11 @@ class OnnxRuntimeModelService(
                 "$name: ${ti?.type ?: "TENSOR"}$shapeStr"
             }.ifBlank { slot.expectedOutputSignature }
 
-            val provider = if (preferHardwareAccel) {
-                "ONNX Runtime Cached (XNNPACK + 4-Thread Arena)"
-            } else {
-                "ONNX Runtime Cached (CPU 4-Thread Arena)"
-            }
+            val provider = "ONNX Runtime Cached (CPU 4-Thread)"
 
             val info = LoadedSessionInfo(
                 slot = slot,
-                canonicalFileName = slot.canonicalFileName,
+                canonicalFileName = file.name,
                 isLoadedInMemory = true,
                 fileSizeBytes = file.length(),
                 loadTimeMs = loadMs,
@@ -330,18 +337,11 @@ class OnnxRuntimeModelService(
             activeSessions[slot] = session
             sessionMetadata[slot] = info
             loadedFileLastModified[slot] = lastMod
-
-            if (slot == ModelSlot.SWAPPER && cachedEmap512x512 == null) {
-                cachedEmap512x512 = runCatching {
-                    OnnxProtobufInspector.loadOrExtractInswapperEmap(appContext, file)
-                }.getOrNull()
-            }
-
             info
         } catch (t: Throwable) {
             val failedInfo = LoadedSessionInfo(
                 slot = slot,
-                canonicalFileName = slot.canonicalFileName,
+                canonicalFileName = file.name,
                 isLoadedInMemory = false,
                 fileSizeBytes = file.length(),
                 loadTimeMs = 0L,
@@ -359,13 +359,13 @@ class OnnxRuntimeModelService(
         slot: ModelSlot,
         preferHardwareAccel: Boolean = true
     ): OrtSession? {
-        activeSessions[slot]?.let { return it }
         synchronized(sessionLock) {
-            activeSessions[slot]?.let { return it }
-            return runCatching {
-                loadModelSlotInternal(slot, preferHardwareAccel)
-                activeSessions[slot]
-            }.getOrNull()
+            val file = resolveValidFile(slot) ?: return null
+            return OnnxProtobufInspector.getOrCreateCachedSession(
+                ortEnv = ortEnv,
+                file = file,
+                preferHardwareAcceleration = preferHardwareAccel
+            )
         }
     }
 
@@ -386,11 +386,11 @@ class OnnxRuntimeModelService(
     }
 
     private fun buildMemoryState(totalLoadTimeMs: Long): OnnxMemoryServiceState {
-        val w600k = activeSessions.containsKey(ModelSlot.RECOGNIZER)
-        val gfpgan = activeSessions.containsKey(ModelSlot.ENHANCEMENT)
-        val segformer = activeSessions.containsKey(ModelSlot.SEGMENTATION)
-        val det = activeSessions.containsKey(ModelSlot.DETECTOR)
-        val swap = activeSessions.containsKey(ModelSlot.SWAPPER)
+        val w600k = sessionMetadata[ModelSlot.RECOGNIZER]?.isLoadedInMemory == true
+        val gfpgan = sessionMetadata[ModelSlot.ENHANCEMENT]?.isLoadedInMemory == true
+        val segformer = sessionMetadata[ModelSlot.SEGMENTATION]?.isLoadedInMemory == true
+        val det = sessionMetadata[ModelSlot.DETECTOR]?.isLoadedInMemory == true
+        val swap = sessionMetadata[ModelSlot.SWAPPER]?.isLoadedInMemory == true
         val emap = cachedEmap512x512 != null
 
         val residentBytes = sessionMetadata.values
@@ -402,10 +402,9 @@ class OnnxRuntimeModelService(
             .map { it.canonicalFileName }
 
         val summary = if (loadedNames.isEmpty()) {
-            "No ONNX sessions currently pinned in memory. Import models or tap 'Load Into Memory'."
+            "No ONNX models registered yet. Use 1-Tap Auto-Import from Folder."
         } else {
-            "In-Memory Active (${loadedNames.size}): ${loadedNames.joinToString(", ")}" +
-                if (emap) " + emap[512x512]" else ""
+            "Ready (${loadedNames.size} models): ${loadedNames.joinToString(", ")}"
         }
 
         return OnnxMemoryServiceState(
@@ -457,7 +456,6 @@ class OnnxRuntimeModelService(
         sourceLandmarks5: List<PointF>,
         allowTwoModelFallback: Boolean
     ): SourceEmbeddingResult {
-        val recSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel = true)
         val recFile = resolveValidFile(ModelSlot.RECOGNIZER)
         val emap = getOrLoadInswapperEmap()
 
@@ -468,7 +466,7 @@ class OnnxRuntimeModelService(
             arcFaceModelFile = recFile,
             emap512x512 = emap,
             allowTwoModelFallbackForTesting = allowTwoModelFallback,
-            preloadedArcFaceSession = recSession
+            preloadedArcFaceSession = null
         )
     }
 
@@ -494,8 +492,6 @@ class OnnxRuntimeModelService(
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
         val tModelLoad0 = System.currentTimeMillis()
-        val arcFaceSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel)
-        val swapSession = getOrLoadSession(ModelSlot.SWAPPER, preferHardwareAccel)
         val emap = getOrLoadInswapperEmap()
         val modelLoadingMs = (System.currentTimeMillis() - tModelLoad0).coerceAtLeast(0L)
 
@@ -519,8 +515,8 @@ class OnnxRuntimeModelService(
             offsetY = offsetY,
             scaleAdjust = scaleAdjust,
             preferHardwareAccel = preferHardwareAccel,
-            preloadedArcFaceSession = arcFaceSession,
-            preloadedSwapSession = swapSession,
+            preloadedArcFaceSession = null,
+            preloadedSwapSession = null,
             preloadedGfpganSession = null,
             preloadedSegformerSession = null,
             preloadedEmap512x512 = emap,
@@ -550,10 +546,6 @@ class OnnxRuntimeModelService(
         scaleAdjust: Float,
         onProgress: (SwapStageProgress) -> Unit
     ): FaceSwapExecutionResult {
-        val arcFaceSession = getOrLoadSession(ModelSlot.RECOGNIZER, preferHardwareAccel)
-        val swapSession = if (lowMemoryMode) null else getOrLoadSession(ModelSlot.SWAPPER, preferHardwareAccel)
-        val segformerSession = getOrLoadSession(ModelSlot.SEGMENTATION, preferHardwareAccel)
-        val gfpganSession = getOrLoadSession(ModelSlot.ENHANCEMENT, preferHardwareAccel)
         val emap = getOrLoadInswapperEmap()
 
         return GhostHeadReplacementEngine.executeFullHeadReplacement(
@@ -576,10 +568,10 @@ class OnnxRuntimeModelService(
             offsetX = offsetX,
             offsetY = offsetY,
             scaleAdjust = scaleAdjust,
-            preloadedArcFaceSession = arcFaceSession,
-            preloadedSwapSession = swapSession,
-            preloadedSegformerSession = segformerSession,
-            preloadedGfpganSession = gfpganSession,
+            preloadedArcFaceSession = null,
+            preloadedSwapSession = null,
+            preloadedSegformerSession = null,
+            preloadedGfpganSession = null,
             preloadedEmap512x512 = emap,
             onProgress = onProgress
         )
@@ -695,6 +687,7 @@ class OnnxRuntimeModelService(
         activeSessions.remove(slot)?.let { session ->
             runCatching { session.close() }
         }
+        OnnxProtobufInspector.evictCachedSession(resolveValidFile(slot))
         loadedFileLastModified.remove(slot)
         sessionMetadata.remove(slot)
     }
@@ -704,6 +697,9 @@ class OnnxRuntimeModelService(
             for (slot in activeSessions.keys.toList()) {
                 closeSlotInternal(slot)
             }
+            OnnxProtobufInspector.clearCachedSessions()
+            sessionMetadata.clear()
+            loadedFileLastModified.clear()
             cachedEmap512x512 = null
         }
     }

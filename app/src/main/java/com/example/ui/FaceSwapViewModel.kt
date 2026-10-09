@@ -526,7 +526,7 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                 it.copy(
                     isInspectingModels = true,
                     memoryServiceState = it.memoryServiceState.copy(isLoading = true),
-                    statusBannerMessage = "Scanning folder & auto-importing all .onnx models into memory...",
+                    statusBannerMessage = "Scanning folder & auto-importing .onnx models...",
                     errorBannerMessage = null
                 )
             }
@@ -534,7 +534,12 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                 OnnxProtobufInspector.importAllModelsFromTreeUri(
                     context = getApplication(),
                     treeUri = treeUri,
-                    onlyMissing = false
+                    onlyMissing = false,
+                    onProgress = { progressMsg ->
+                        _uiState.update { s ->
+                            s.copy(statusBannerMessage = progressMsg)
+                        }
+                    }
                 )
             }
             result.fold(
@@ -553,14 +558,16 @@ class FaceSwapViewModel(application: Application) : AndroidViewModel(application
                             memoryServiceState = memState,
                             isInspectingModels = false,
                             statusBannerMessage = if (importedSlots.isNotEmpty()) {
-                                "Auto-imported & loaded ${importedSlots.size} model(s): ${
-                                    importedSlots.joinToString { s -> s.canonicalFileName }
+                                "Auto-imported & verified ${importedSlots.size} model(s): ${
+                                    importedSlots.joinToString { s ->
+                                        OnnxProtobufInspector.resolveModelFile(getApplication(), s).name
+                                    }
                                 }."
                             } else {
                                 null
                             },
                             errorBannerMessage = if (importedSlots.isEmpty()) {
-                                "No matching .onnx files (det_10g, w600k_r50, inswapper_128, segformer, modnet, lama, gfpgan) found in selected folder."
+                                "No matching .onnx files (det_10g, w600k_r50, hyperswap_1b_256/inswapper_128, segformer, modnet, lama, gfpgan) found in selected folder."
                             } else {
                                 null
                             }
