@@ -30,13 +30,22 @@ data class DetectedFace(
     val landmarks5: List<PointF>, // [leftEye, rightEye, noseTip, leftMouth, rightMouth]
     val detectorSource: String,
     val faceContourPoints: List<PointF> = emptyList(), // 36-point 3D biometric face oval contour
-    val eulerX: Float = 0f, // 3D Pitch (up/down head nod in degrees)
-    val eulerY: Float = 0f, // 3D Yaw (left/right head turn in degrees)
-    val eulerZ: Float = 0f  // 3D Roll (in-plane head tilt in degrees)
+    val eulerX: Float = Face3DReconstruction.estimate3DHeadPose(landmarks5).pitchDeg, // 3D Pitch (up/down head nod in degrees)
+    val eulerY: Float = Face3DReconstruction.estimate3DHeadPose(landmarks5).yawDeg,   // 3D Yaw (left/right head turn in degrees)
+    val eulerZ: Float = Face3DReconstruction.estimate3DHeadPose(landmarks5).rollDeg,  // 3D Roll (in-plane head tilt in degrees)
+    val reconstructed3D: ReconstructedFace3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(
+        landmarks5 = landmarks5,
+        eulerX = eulerX,
+        eulerY = eulerY,
+        eulerZ = eulerZ,
+        existingContourPoints = faceContourPoints
+    ),
+    val landmarks106: List<PointF> = reconstructed3D.landmarks106 // 106-point dense 3D-projected landmarks
 ) {
     val width: Float get() = boundingBox.width()
     val height: Float get() = boundingBox.height()
     val area: Float get() = width * height
+    val headPose3D: HeadPose3D get() = reconstructed3D.headPose
 }
 
 /**
@@ -268,13 +277,36 @@ object ScrfdFaceDetector {
                                     }
 
                                     if (x2 - x1 > 12f && y2 - y1 > 12f) {
+                                        val pose3D = Face3DReconstruction.estimate3DHeadPose(landmarks)
+                                        val contour36 = build3DBiometricFaceOvalContour(
+                                            landmarks5 = landmarks,
+                                            eulerX = pose3D.pitchDeg,
+                                            eulerY = pose3D.yawDeg,
+                                            eulerZ = pose3D.rollDeg,
+                                            imgW = origW,
+                                            imgH = origH
+                                        )
+                                        val recon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(
+                                            landmarks5 = landmarks,
+                                            eulerX = pose3D.pitchDeg,
+                                            eulerY = pose3D.yawDeg,
+                                            eulerZ = pose3D.rollDeg,
+                                            existingContourPoints = contour36,
+                                            bitmap = bitmap
+                                        )
                                         rawCandidates.add(
                                             DetectedFace(
                                                 index = 0,
                                                 boundingBox = RectF(x1, y1, x2, y2),
                                                 score = score,
                                                 landmarks5 = landmarks,
-                                                detectorSource = "det_10g.onnx (SCRFD-10G_KPS)"
+                                                detectorSource = "det_10g.onnx + 106-Pt 3DMM",
+                                                faceContourPoints = contour36,
+                                                eulerX = recon3D.headPose.pitchDeg,
+                                                eulerY = recon3D.headPose.yawDeg,
+                                                eulerZ = recon3D.headPose.rollDeg,
+                                                reconstructed3D = recon3D,
+                                                landmarks106 = recon3D.landmarks106
                                             )
                                         )
                                     }
@@ -486,7 +518,28 @@ object ScrfdFaceDetector {
                     val left = (trueMidX - halfW).coerceAtLeast(0f)
                     val right = (trueMidX + halfW).coerceAtMost(origW.toFloat())
                     val box = RectF(left, top, right, bottom)
-                    val contour36 = build3DBiometricFaceOvalContour(refined, poseX, poseY, totalRollDeg, origW, origH)
+                    val pose3D = Face3DReconstruction.estimate3DHeadPose(
+                        landmarks5 = refined,
+                        hintPitch = poseX,
+                        hintYaw = poseY,
+                        hintRoll = totalRollDeg
+                    )
+                    val contour36 = build3DBiometricFaceOvalContour(
+                        landmarks5 = refined,
+                        eulerX = pose3D.pitchDeg,
+                        eulerY = pose3D.yawDeg,
+                        eulerZ = pose3D.rollDeg,
+                        imgW = origW,
+                        imgH = origH
+                    )
+                    val recon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(
+                        landmarks5 = refined,
+                        eulerX = pose3D.pitchDeg,
+                        eulerY = pose3D.yawDeg,
+                        eulerZ = pose3D.rollDeg,
+                        existingContourPoints = contour36,
+                        bitmap = bitmap
+                    )
 
                     results.add(
                         DetectedFace(
@@ -494,11 +547,13 @@ object ScrfdFaceDetector {
                             boundingBox = box,
                             score = conf.coerceAtLeast(0.88f),
                             landmarks5 = refined,
-                            detectorSource = "det_10g.onnx",
+                            detectorSource = "det_10g.onnx + 106-Pt 3DMM",
                             faceContourPoints = contour36,
-                            eulerX = poseX,
-                            eulerY = poseY,
-                            eulerZ = totalRollDeg
+                            eulerX = recon3D.headPose.pitchDeg,
+                            eulerY = recon3D.headPose.yawDeg,
+                            eulerZ = recon3D.headPose.rollDeg,
+                            reconstructed3D = recon3D,
+                            landmarks106 = recon3D.landmarks106
                         )
                     )
                 }
@@ -621,17 +676,27 @@ object ScrfdFaceDetector {
                             (offsetX + b.right * invScale).coerceAtMost(origW.toFloat()),
                             (offsetY + b.bottom * invScale).coerceAtMost(origH.toFloat())
                         )
+                        val recon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(
+                            landmarks5 = landmarks5,
+                            eulerX = face.headEulerAngleX,
+                            eulerY = face.headEulerAngleY,
+                            eulerZ = face.headEulerAngleZ,
+                            existingContourPoints = contourPoints,
+                            bitmap = bitmap
+                        )
                         detectedResults.add(
                             DetectedFace(
                                 index = detectedResults.size,
                                 boundingBox = rect,
                                 score = 0.98f,
                                 landmarks5 = landmarks5,
-                                detectorSource = "det_10g.onnx",
+                                detectorSource = "det_10g.onnx + 106-Pt 3DMM",
                                 faceContourPoints = contourPoints,
-                                eulerX = face.headEulerAngleX,
-                                eulerY = face.headEulerAngleY,
-                                eulerZ = face.headEulerAngleZ
+                                eulerX = recon3D.headPose.pitchDeg,
+                                eulerY = recon3D.headPose.yawDeg,
+                                eulerZ = recon3D.headPose.rollDeg,
+                                reconstructed3D = recon3D,
+                                landmarks106 = recon3D.landmarks106
                             )
                         )
                     }
@@ -1182,17 +1247,28 @@ object ScrfdFaceDetector {
             (actualMidX + actualDist * 1.25f).coerceAtMost(wf),
             (actualMidY + actualDist * 2.05f).coerceAtMost(hf)
         )
-        val contour36 = build3DBiometricFaceOvalContour(landmarks, 0f, 0f, bestAngle, w, h)
+        val pose3D = Face3DReconstruction.estimate3DHeadPose(landmarks, hintRoll = bestAngle)
+        val contour36 = build3DBiometricFaceOvalContour(landmarks, pose3D.pitchDeg, pose3D.yawDeg, pose3D.rollDeg, w, h)
+        val recon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(
+            landmarks5 = landmarks,
+            eulerX = pose3D.pitchDeg,
+            eulerY = pose3D.yawDeg,
+            eulerZ = pose3D.rollDeg,
+            existingContourPoints = contour36,
+            bitmap = bitmap
+        )
         return DetectedFace(
             index = 0,
             boundingBox = box,
             score = 0.96f,
             landmarks5 = landmarks,
-            detectorSource = "det_10g.onnx",
+            detectorSource = "det_10g.onnx + 106-Pt 3DMM",
             faceContourPoints = contour36,
-            eulerX = 0f,
-            eulerY = 0f,
-            eulerZ = bestAngle
+            eulerX = recon3D.headPose.pitchDeg,
+            eulerY = recon3D.headPose.yawDeg,
+            eulerZ = recon3D.headPose.rollDeg,
+            reconstructed3D = recon3D,
+            landmarks106 = recon3D.landmarks106
         )
     }
 

@@ -949,4 +949,47 @@ class ExampleRobolectricTest {
         println("Production Final Blend: PhiltrumRatio=${"%.3f".format(prodMetrics.outputPhiltrumToCheekRatio)} | Moustache=${prodMetrics.hasMoustacheArtifact} | EyeSharp=${"%.2f".format(prodMetrics.eyeDetailSharpness)} | NoseSharp=${"%.2f".format(prodMetrics.noseDetailSharpness)} | MouthSharp=${"%.2f".format(prodMetrics.mouthDetailSharpness)}")
         println("==================================================")
     }
+
+    @Test
+    fun `test16 106 point landmarks 3D head pose 3D face reconstruction and pose robust swap`() {
+        val (srcPair, tgtPair) = com.example.onnx.VisualValidationBenchmark.createRealisticSourceAndTargetPortraits()
+        val srcFace = srcPair.second
+        val tgtFace = tgtPair.second
+
+        // 1. Verify 106-Point Dense Landmarks on both Source and Target faces
+        assertEquals(106, srcFace.landmarks106.size)
+        assertEquals(106, tgtFace.landmarks106.size)
+
+        // 2. Verify 3D Face Reconstruction produces 106 3D vertices with positive nose protrusion relative to temples
+        val recon = srcFace.reconstructed3D
+        assertEquals(106, recon.vertices3D.size)
+        val leftTempleZ = recon.vertices3D[0].z
+        val noseTipZ = recon.vertices3D[76].z
+        val rightTempleZ = recon.vertices3D[32].z
+        assertTrue("Nose tip Z ($noseTipZ) must protrude forward relative to left temple ($leftTempleZ)", noseTipZ > leftTempleZ)
+        assertTrue("Nose tip Z ($noseTipZ) must protrude forward relative to right temple ($rightTempleZ)", noseTipZ > rightTempleZ)
+
+        // 3. Verify 3D Head-Pose detection on a slightly side-turned face (Yaw & Roll)
+        val sideViewPts5 = listOf(
+            android.graphics.PointF(175f, 238f), // leftEye
+            android.graphics.PointF(295f, 248f), // rightEye (slightly tilted roll)
+            android.graphics.PointF(262f, 315f), // nose shifted right -> right-turned yaw
+            android.graphics.PointF(195f, 384f), // leftMouth
+            android.graphics.PointF(286f, 390f)  // rightMouth
+        )
+        val sidePose = com.example.onnx.Face3DReconstruction.estimate3DHeadPose(sideViewPts5)
+        assertTrue("Expected positive Yaw for right-turned nose (${sidePose.yawDeg})", sidePose.yawDeg > 4f)
+        assertTrue("Expected right cheek foreshortening under right-turn Yaw", sidePose.rightSideVisibility < sidePose.leftSideVisibility)
+
+        // 4. Verify Pose-Robust 106-Point 3D Warping from Source to Side-View Target at 512x512 HD
+        val warped512 = FaceAlignment.warpSourceToTargetPose(
+            sourceBitmap = srcPair.first,
+            sourceLandmarks5 = srcFace.landmarks5,
+            targetLandmarks5 = sideViewPts5,
+            dstSize = 512
+        )
+        assertEquals(512, warped512.width)
+        assertEquals(512, warped512.height)
+        warped512.recycle()
+    }
 }

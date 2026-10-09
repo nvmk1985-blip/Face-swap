@@ -172,11 +172,15 @@ fun FaceDetectionCanvas(
                     style = Stroke(width = strokePx)
                 )
 
-                // Draw numbered person badge (#1, #2, #3...) so user can easily identify each person in multi-person photos
-                val badgeLabel = if (isSelected) "✓ #${face.index + 1}" else "#${face.index + 1}"
+                val pose3D = face.headPose3D
+                val badgeLabel = if (isSelected) {
+                    "✓ #${face.index + 1} • 106-Pt 3D (Y:${"%.0f".format(pose3D.yawDeg)}° P:${"%.0f".format(pose3D.pitchDeg)}° R:${"%.0f".format(pose3D.rollDeg)}°)"
+                } else {
+                    "#${face.index + 1} • 106-Pt"
+                }
                 val textPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
                     color = if (isSelected) android.graphics.Color.rgb(11, 16, 33) else android.graphics.Color.WHITE
-                    textSize = 11.dp.toPx()
+                    textSize = 10.5.dp.toPx()
                     isFakeBoldText = true
                 }
                 val textW = textPaint.measureText(badgeLabel)
@@ -199,57 +203,68 @@ fun FaceDetectionCanvas(
                     textPaint
                 )
 
-                // Render 36-point 3D Biometric Face Contour Mesh (or synthesize from 3D pose if empty)
-                val contourPts = if (face.faceContourPoints.size >= 8) {
-                    face.faceContourPoints
-                } else {
-                    com.example.onnx.ScrfdFaceDetector.build3DBiometricFaceOvalContour(
-                        landmarks5 = face.landmarks5,
-                        eulerX = face.eulerX,
-                        eulerY = face.eulerY,
-                        eulerZ = face.eulerZ,
-                        imgW = bitmap.width,
-                        imgH = bitmap.height
-                    )
-                }
-                if (contourPts.size >= 8) {
-                    val contourPath = androidx.compose.ui.graphics.Path()
-                    contourPts.forEachIndexed { idx, pt ->
-                        val cx = offsetX + pt.x * scale
-                        val cy = offsetY + pt.y * scale
-                        if (idx == 0) contourPath.moveTo(cx, cy) else contourPath.lineTo(cx, cy)
-                    }
-                    contourPath.close()
-                    drawPath(
-                        path = contourPath,
-                        color = if (isSelected) NeonEmerald.copy(alpha = 0.78f) else ElectricCyan.copy(alpha = 0.45f),
-                        style = Stroke(
-                            width = if (isSelected) 1.8.dp.toPx() else 1.2.dp.toPx(),
-                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 5f), 0f)
+                // Render 106-Point Dense 3D Reconstructed Facial Contours & Landmarks
+                val pts106 = face.landmarks106
+                if (pts106.size >= 106) {
+                    fun drawPolyline106(indices: IntRange, closed: Boolean, lineColor: Color, strokeWidthPx: Float) {
+                        val path = androidx.compose.ui.graphics.Path()
+                        var first = true
+                        for (idx in indices) {
+                            val pt = pts106[idx]
+                            val cx = offsetX + pt.x * scale
+                            val cy = offsetY + pt.y * scale
+                            if (first) {
+                                path.moveTo(cx, cy)
+                                first = false
+                            } else {
+                                path.lineTo(cx, cy)
+                            }
+                        }
+                        if (closed) path.close()
+                        drawPath(
+                            path = path,
+                            color = lineColor,
+                            style = Stroke(width = strokeWidthPx)
                         )
-                    )
+                    }
+
+                    val strokeW = if (isSelected) 1.5.dp.toPx() else 1.0.dp.toPx()
+                    // 0..32: 33-point 3D Jawline Contour
+                    drawPolyline106(0..32, closed = false, lineColor = NeonEmerald.copy(alpha = if (isSelected) 0.85f else 0.45f), strokeWidthPx = strokeW)
+                    // 33..42 & 43..52: Left & Right 10-point Eyebrow Contours
+                    drawPolyline106(33..42, closed = true, lineColor = AmberWarning.copy(alpha = if (isSelected) 0.80f else 0.40f), strokeWidthPx = strokeW)
+                    drawPolyline106(43..52, closed = true, lineColor = AmberWarning.copy(alpha = if (isSelected) 0.80f else 0.40f), strokeWidthPx = strokeW)
+                    // 53..60 & 63..70: Left & Right 8-point Eyelid Contours
+                    drawPolyline106(53..60, closed = true, lineColor = ElectricCyan.copy(alpha = if (isSelected) 0.85f else 0.45f), strokeWidthPx = strokeW)
+                    drawPolyline106(63..70, closed = true, lineColor = ElectricCyan.copy(alpha = if (isSelected) 0.85f else 0.45f), strokeWidthPx = strokeW)
+                    // 73..76 & 77..85: Nose Bridge (4 pts) & Alar Nostril Wings (9 pts)
+                    drawPolyline106(73..76, closed = false, lineColor = ElectricCyan.copy(alpha = if (isSelected) 0.80f else 0.40f), strokeWidthPx = strokeW)
+                    drawPolyline106(77..85, closed = false, lineColor = ElectricCyan.copy(alpha = if (isSelected) 0.80f else 0.40f), strokeWidthPx = strokeW)
+                    // 86..97 & 98..105: Outer Lip Vermilion (12 pts) & Inner Oral Aperture (8 pts)
+                    drawPolyline106(86..97, closed = true, lineColor = Color(0xFFFF80AB).copy(alpha = if (isSelected) 0.85f else 0.45f), strokeWidthPx = strokeW)
+                    drawPolyline106(98..105, closed = true, lineColor = Color(0xFFFFD54F).copy(alpha = if (isSelected) 0.80f else 0.40f), strokeWidthPx = strokeW)
+
+                    // Draw all 106 dense landmark dots
+                    val dotRadius = if (isSelected) 1.5.dp.toPx() else 1.1.dp.toPx()
+                    pts106.forEachIndexed { idx, pt ->
+                        val px = offsetX + pt.x * scale
+                        val py = offsetY + pt.y * scale
+                        val dotColor = when (idx) {
+                            in 0..32 -> NeonEmerald
+                            in 33..52 -> AmberWarning
+                            in 53..72 -> ElectricCyan
+                            in 73..85 -> Color(0xFF80D8FF)
+                            else -> Color(0xFFFF80AB)
+                        }
+                        drawCircle(
+                            color = dotColor,
+                            radius = dotRadius,
+                            center = Offset(px, py)
+                        )
+                    }
                 }
 
-                // Draw connected 3D biometric feature mesh (Eyes -> Nose -> Mouth wireframe)
-                if (face.landmarks5.size >= 5) {
-                    val lEye = Offset(offsetX + face.landmarks5[0].x * scale, offsetY + face.landmarks5[0].y * scale)
-                    val rEye = Offset(offsetX + face.landmarks5[1].x * scale, offsetY + face.landmarks5[1].y * scale)
-                    val nose = Offset(offsetX + face.landmarks5[2].x * scale, offsetY + face.landmarks5[2].y * scale)
-                    val lMouth = Offset(offsetX + face.landmarks5[3].x * scale, offsetY + face.landmarks5[3].y * scale)
-                    val rMouth = Offset(offsetX + face.landmarks5[4].x * scale, offsetY + face.landmarks5[4].y * scale)
-                    val meshColor = ElectricCyan.copy(alpha = if (isSelected) 0.55f else 0.32f)
-                    val meshStroke = 1.1.dp.toPx()
-
-                    drawLine(color = meshColor, start = lEye, end = rEye, strokeWidth = meshStroke)
-                    drawLine(color = meshColor, start = lEye, end = nose, strokeWidth = meshStroke)
-                    drawLine(color = meshColor, start = rEye, end = nose, strokeWidth = meshStroke)
-                    drawLine(color = meshColor, start = nose, end = lMouth, strokeWidth = meshStroke)
-                    drawLine(color = meshColor, start = nose, end = rMouth, strokeWidth = meshStroke)
-                    drawLine(color = meshColor, start = lMouth, end = rMouth, strokeWidth = meshStroke)
-                    drawLine(color = meshColor, start = lEye, end = lMouth, strokeWidth = meshStroke)
-                    drawLine(color = meshColor, start = rEye, end = rMouth, strokeWidth = meshStroke)
-                }
-
+                // Highlight the 5 primary anchor keypoints (Iris Centers, Nose Tip, Mouth Corners)
                 face.landmarks5.forEachIndexed { ptIdx, pt ->
                     val px = offsetX + pt.x * scale
                     val py = offsetY + pt.y * scale
@@ -260,12 +275,12 @@ fun FaceDetectionCanvas(
                     }
                     drawCircle(
                         color = ObsidianBg,
-                        radius = 3.2.dp.toPx(),
+                        radius = 3.0.dp.toPx(),
                         center = Offset(px, py)
                     )
                     drawCircle(
                         color = kpColor,
-                        radius = 2.1.dp.toPx(),
+                        radius = 2.0.dp.toPx(),
                         center = Offset(px, py)
                     )
                 }

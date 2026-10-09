@@ -390,8 +390,8 @@ object GhostHeadReplacementEngine {
     }
 
     /**
-     * Runs `inswapper_128.onnx` on the target face and gently blends the reenacted inner eyes/mouth
-     * expression (at 35% weight) into the aligned source head so gaze & expression align with the target driver.
+     * Runs the active swap model (`hyperswap_1b_256.onnx` 256x256 or `inswapper_128.onnx` 128x128)
+     * on the target face and blends the reenacted inner facial expression cleanly into the aligned source head.
      */
     private fun fuseInswapperInnerExpressionIntoSourceHead(
         ortEnv: OrtEnvironment,
@@ -407,80 +407,128 @@ object GhostHeadReplacementEngine {
     ) {
         val m128 = FaceAlignment.estimateNorm(targetFace.landmarks5, 128)
         val targetCrop128 = FaceAlignment.warpAffineCrop(targetBitmap, m128, 128)
-        val hw = 128 * 128
-        val pixels128 = IntArray(hw)
-        targetCrop128.getPixels(pixels128, 0, 128, 0, 0, 128, 128)
 
-        val targetBuf = java.nio.FloatBuffer.allocate(3 * hw)
-        for (i in 0 until hw) {
-            val c = pixels128[i]
-            targetBuf.put(i, ((c ushr 16) and 0xFF) / 255.0f)
-            targetBuf.put(hw + i, ((c ushr 8) and 0xFF) / 255.0f)
-            targetBuf.put(2 * hw + i, (c and 0xFF) / 255.0f)
-        }
-        targetBuf.rewind()
-
-        val rawSwappedPixels128 = IntArray(hw)
+        var rawSwapped128: Bitmap? = null
         val runWithSession: (OrtSession) -> Unit = { session ->
             var targetName = "target"
             var sourceName = "source"
+            var cropSize = 128
             for ((name, nodeInfo) in session.inputInfo) {
                 val tInfo = nodeInfo.info as? ai.onnxruntime.TensorInfo ?: continue
-                if (tInfo.shape.size == 4) targetName = name
+                if (tInfo.shape.size == 4) {
+                    targetName = name
+                    val hDim = tInfo.shape[2].toInt()
+                    if (hDim == 256 || hDim == 128) cropSize = hDim
+                }
                 if (tInfo.shape.size == 2) sourceName = name
             }
-            val srcBuf = java.nio.FloatBuffer.wrap(sourceEmbedding.latentSourceVector512)
-            OnnxTensor.createTensor(ortEnv, targetBuf, longArrayOf(1L, 3L, 128L, 128L)).use { tTensor ->
+            val isHyperSwap256 = (cropSize == 256)
+            val mCrop = if (cropSize == 128) m128 else FaceAlignment.estimateNorm(targetFace.landmarks5, cropSize)
+            val alignedCrop = if (cropSize == 128) targetCrop128 else FaceAlignment.warpAffineCrop(targetBitmap, mCrop, cropSize)
+            val hw = cropSize * cropSize
+            val pixels = IntArray(hw)
+            alignedCrop.getPixels(pixels, 0, cropSize, 0, 0, cropSize, cropSize)
+
+            val targetBuf = java.nio.FloatBuffer.allocate(3 * hw)
+            if (isHyperSwap256) {
+                for (i in 0 until hw) {
+                    val c = pixels[i]
+                    targetBuf.put(i, (((c ushr 16) and 0xFF) - 127.5f) / 127.5f)
+                    targetBuf.put(hw + i, (((c ushr 8) and 0xFF) - 127.5f) / 127.5f)
+                    targetBuf.put(2 * hw + i, ((c and 0xFF) - 127.5f) / 127.5f)
+                }
+            } else {
+                for (i in 0 until hw) {
+                    val c = pixels[i]
+                    targetBuf.put(i, ((c ushr 16) and 0xFF) / 255.0f)
+                    targetBuf.put(hw + i, ((c ushr 8) and 0xFF) / 255.0f)
+                    targetBuf.put(2 * hw + i, (c and 0xFF) / 255.0f)
+                }
+            }
+            targetBuf.rewind()
+
+            val srcVec = if (isHyperSwap256 && !sourceEmbedding.usedEmbeddedEmap) {
+                sourceEmbedding.rawNormedEmbedding512
+            } else {
+                sourceEmbedding.latentSourceVector512
+            }
+            val srcBuf = java.nio.FloatBuffer.wrap(srcVec)
+            val outPixels = IntArray(hw)
+            OnnxTensor.createTensor(ortEnv, targetBuf, longArrayOf(1L, 3L, cropSize.toLong(), cropSize.toLong())).use { tTensor ->
                 OnnxTensor.createTensor(ortEnv, srcBuf, longArrayOf(1L, 512L)).use { sTensor ->
                     session.run(mapOf(targetName to tTensor, sourceName to sTensor)).use { res ->
                         val outT = res[0] as OnnxTensor
                         val outFloats = FloatArray(3 * hw)
                         outT.floatBuffer.get(outFloats)
-                        for (i in 0 until hw) {
-                            val r = (outFloats[i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
-                            val g = (outFloats[hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
-                            val b = (outFloats[2 * hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
-                            rawSwappedPixels128[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                        var minVal = 0f
+                        for (i in 0 until min(outFloats.size, 512)) {
+                            if (outFloats[i] < minVal) minVal = outFloats[i]
+                        }
+                        val isSigned = isHyperSwap256 && minVal < -0.05f
+                        if (isSigned) {
+                            for (i in 0 until hw) {
+                                val r = ((outFloats[i] * 0.5f + 0.5f) * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                                val g = ((outFloats[hw + i] * 255.0f + 0.5f) * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                                val b = ((outFloats[2 * hw + i] * 0.5f + 0.5f) * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                                outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                            }
+                        } else {
+                            for (i in 0 until hw) {
+                                val r = (outFloats[i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                                val g = (outFloats[hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                                val b = (outFloats[2 * hw + i] * 255.0f + 0.5f).toInt().coerceIn(0, 255)
+                                outPixels[i] = (0xFF shl 24) or (r shl 16) or (g shl 8) or b
+                            }
                         }
                     }
                 }
+            }
+            if (alignedCrop !== targetCrop128) alignedCrop.recycle()
+            val outBmp = Bitmap.createBitmap(cropSize, cropSize, Bitmap.Config.ARGB_8888)
+            outBmp.setPixels(outPixels, 0, cropSize, 0, 0, cropSize, cropSize)
+            rawSwapped128 = if (cropSize == 128) {
+                outBmp
+            } else {
+                val scaled128 = Bitmap.createScaledBitmap(outBmp, 128, 128, true)
+                outBmp.recycle()
+                scaled128
             }
         }
         if (preloadedSwapSession != null) {
             runWithSession(preloadedSwapSession)
         } else {
-            OnnxProtobufInspector.createOptimizedSessionOptions(preferHardwareAccel).use { opts ->
-                ortEnv.createSession(swapFile.absolutePath, opts).use { session ->
-                    runWithSession(session)
-                }
-            }
+            val cached = OnnxProtobufInspector.getOrCreateCachedSession(ortEnv, swapFile, preferHardwareAccel)
+            if (cached != null) runWithSession(cached)
         }
 
-        val hasTrueArcFaceLatent = sourceEmbedding.usedArcFaceModel && sourceEmbedding.usedEmbeddedEmap
-        val rawSwappedBmp = Bitmap.createBitmap(128, 128, Bitmap.Config.ARGB_8888)
-        rawSwappedBmp.setPixels(rawSwappedPixels128, 0, 128, 0, 0, 128, 128)
+        val activeSwapBmp = rawSwapped128 ?: run {
+            targetCrop128.recycle()
+            return
+        }
+        val hasTrueArcFaceLatent = sourceEmbedding.usedArcFaceModel
         val eyeRestoredBmp = FaceBlender.restoreEyesAndEliminateNegativeArtifacts128(
-            swapped128 = rawSwappedBmp,
+            swapped128 = activeSwapBmp,
             alignedTarget128 = targetCrop128,
             alignedSource112 = sourceEmbedding.aligned112Crop,
             hasTrueArcFaceLatent = hasTrueArcFaceLatent,
             forwardMatrix128 = m128,
             targetLandmarks5 = targetFace.landmarks5
         )
-        rawSwappedBmp.recycle()
+        activeSwapBmp.recycle()
         targetCrop128.recycle()
 
-        val swappedPixels128 = IntArray(hw)
+        val swappedPixels128 = IntArray(128 * 128)
         eyeRestoredBmp.getPixels(swappedPixels128, 0, 128, 0, 0, 128, 128)
         eyeRestoredBmp.recycle()
 
-        // Map canonical head keypoints (with matching srcYawRatio) to 128x128 InSwapper coordinates
+        // Map canonical head keypoints (with matching srcYawRatio) to 128x128 coordinates
         val headPts = HeadSegmentationAndInpainting.getCanonicalHeadTemplate(headCropSize, srcYawRatio).toList()
         val headTo128 = FaceAlignment.estimateNorm(headPts, 128)
         val featheredMask128 = FaceBlender.createFeatheredFaceMask128()
         val headPixels = IntArray(headCropSize * headCropSize)
         synthesizedHeadCrop.getPixels(headPixels, 0, headCropSize, 0, 0, headCropSize, headCropSize)
-        val expressionBlendScale = if (hasTrueArcFaceLatent) 0.45f else 0.15f
+        // Use high core weight (0.88f) when neural ArcFace is present so inner mouth/eyes NEVER double-ghost
+        val expressionBlendScale = if (hasTrueArcFaceLatent) 0.88f else 0.25f
 
         for (y in 0 until headCropSize) {
             for (x in 0 until headCropSize) {
@@ -491,7 +539,7 @@ object GhostHeadReplacementEngine {
                     val v0 = v.toInt().coerceIn(0, 126)
                     val w = featheredMask128[v0 * 128 + u0] * expressionBlendScale
                     if (w > 0.005f) {
-                        val swapC = FaceAlignment.sampleBilinearClamped(swappedPixels128, 128, 128, u, v)
+                        val swapC = FaceAlignment.sampleBicubicClamped(swappedPixels128, 128, 128, u, v)
                         val srcC = headPixels[y * headCropSize + x]
                         val r = ((srcC ushr 16 and 0xFF) * (1f - w) + (swapC ushr 16 and 0xFF) * w).toInt().coerceIn(0, 255)
                         val g = ((srcC ushr 8 and 0xFF) * (1f - w) + (swapC ushr 8 and 0xFF) * w).toInt().coerceIn(0, 255)

@@ -278,23 +278,50 @@ object FaceAlignment {
         val srcPts5 = List(5) { i -> mapPt(mSrc, sourceLandmarks5[i]) }
         val tgtPts5 = List(5) { i -> mapPt(mTgt, targetLandmarks5[i]) }
 
-        val srcMesh = buildAnatomicalControlMesh15(srcPts5)
-        val tgtMesh = buildAnatomicalControlMesh15(tgtPts5)
-        val numCtrl = srcMesh.size
+        // Reconstruct 106-point dense 3D meshes and 3D Head-Poses in canonical crop space
+        val srcRecon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(srcPts5)
+        val tgtRecon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(tgtPts5)
+        val srcPts106 = srcRecon3D.landmarks106
+        val tgtPts106 = tgtRecon3D.landmarks106
+        val tgtVerts3D = tgtRecon3D.vertices3D
+
+        // Select 36 evenly distributed 3D-pose-aware control points from the 106-point topology
+        // (jawline/chin, eyebrows, eye canthi/iris, nose bridge/alar wings, outer/inner lips)
+        val sampledIndices = intArrayOf(
+            0, 4, 8, 12, 16, 20, 24, 28, 32,   // 9 Jawline & Chin Contour points
+            33, 35, 37, 43, 45, 47,            // 6 Left & Right Eyebrow Arch points
+            53, 55, 57, 59, 61,                // 5 Left Eye Canthi, Lids & Iris Center
+            63, 65, 67, 69, 71,                // 5 Right Eye Canthi, Lids & Iris Center
+            73, 76, 77, 81, 85,                // 5 Nose Nasion, Tip, Left/Right Alar Wings & Subnasale
+            86, 89, 92, 95, 100, 104           // 6 Mouth Corners, Cupid's Bow, Lower Lip & Inner Oral Center
+        )
+        val numCtrl = sampledIndices.size
         val maxShift = dstSize * 0.22f
+        val ctrlTgtX = FloatArray(numCtrl)
+        val ctrlTgtY = FloatArray(numCtrl)
+        val ctrlWeight = FloatArray(numCtrl)
         val dispX = FloatArray(numCtrl)
         val dispY = FloatArray(numCtrl)
-        for (k in 0 until numCtrl) {
-            dispX[k] = (srcMesh[k].x - tgtMesh[k].x).coerceIn(-maxShift, maxShift)
-            dispY[k] = (srcMesh[k].y - tgtMesh[k].y).coerceIn(-maxShift, maxShift)
+
+        for (i in 0 until numCtrl) {
+            val idx106 = sampledIndices[i]
+            val sPt = srcPts106[idx106]
+            val tPt = tgtPts106[idx106]
+            val tVert = tgtVerts3D[idx106]
+            ctrlTgtX[i] = tPt.x
+            ctrlTgtY[i] = tPt.y
+            // Weight each 106-point anchor by its 3D surface normal visibility (nz) so foreshortened side-view edges never over-stretch
+            ctrlWeight[i] = tVert.nz.coerceIn(0.35f, 1.0f)
+            dispX[i] = ((sPt.x - tPt.x) * ctrlWeight[i]).coerceIn(-maxShift, maxShift)
+            dispY[i] = ((sPt.y - tPt.y) * ctrlWeight[i]).coerceIn(-maxShift, maxShift)
         }
 
-        // Evaluate smooth inverse-distance / Gaussian Radial-Basis displacement on a 32x32 control grid
+        // Evaluate smooth 3D-pose-weighted Radial-Basis displacement on a 32x32 control grid
         val gridDiv = 32
         val gridSize = gridDiv + 1
         val step = dstSize.toFloat() / gridDiv.toFloat()
-        val sigmaSq = (dstSize * 0.14f) * (dstSize * 0.14f)
-        val epsSq = (dstSize * 0.018f) * (dstSize * 0.018f)
+        val sigmaSq = (dstSize * 0.13f) * (dstSize * 0.13f)
+        val epsSq = (dstSize * 0.016f) * (dstSize * 0.016f)
         val gridSrcX = FloatArray(gridSize * gridSize)
         val gridSrcY = FloatArray(gridSize * gridSize)
         val halfS = dstSize * 0.5f
@@ -304,7 +331,6 @@ object FaceAlignment {
             val rowOff = gy * gridSize
             for (gx in 0..gridDiv) {
                 val xf = gx * step
-                // Smoothly taper pose deformation near the outer border of the crop
                 val borderNorm = kotlin.math.max(
                     kotlin.math.abs(xf - halfS) / halfS,
                     kotlin.math.abs(yf - halfS) / halfS
@@ -322,10 +348,10 @@ object FaceAlignment {
                 var sumDx = 0f
                 var sumDy = 0f
                 for (k in 0 until numCtrl) {
-                    val ddx = xf - tgtMesh[k].x
-                    val ddy = yf - tgtMesh[k].y
+                    val ddx = xf - ctrlTgtX[k]
+                    val ddy = yf - ctrlTgtY[k]
                     val d2 = ddx * ddx + ddy * ddy
-                    val w = (1.0f / (d2 + epsSq)) * kotlin.math.exp((-d2 / (2.0f * sigmaSq)).toDouble()).toFloat()
+                    val w = ctrlWeight[k] * (1.0f / (d2 + epsSq)) * kotlin.math.exp((-d2 / (2.0f * sigmaSq)).toDouble()).toFloat()
                     sumW += w
                     sumDx += w * dispX[k]
                     sumDy += w * dispY[k]
@@ -388,51 +414,6 @@ object FaceAlignment {
         val out = Bitmap.createBitmap(dstSize, dstSize, Bitmap.Config.ARGB_8888)
         out.setPixels(dstPixels, 0, dstSize, 0, 0, dstSize, dstSize)
         return out
-    }
-
-    private fun buildAnatomicalControlMesh15(pts5: List<PointF>): Array<PointF> {
-        val lEye = pts5[0]
-        val rEye = pts5[1]
-        val nose = pts5[2]
-        val lMouth = pts5[3]
-        val rMouth = pts5[4]
-
-        val eyeMidX = (lEye.x + rEye.x) * 0.5f
-        val eyeMidY = (lEye.y + rEye.y) * 0.5f
-        val mouthMidX = (lMouth.x + rMouth.x) * 0.5f
-        val mouthMidY = (lMouth.y + rMouth.y) * 0.5f
-
-        val dx = rEye.x - lEye.x
-        val dy = rEye.y - lEye.y
-        val eyeDist = hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(12f)
-        val ux = dx / eyeDist
-        val uy = dy / eyeDist
-        val vx = -uy
-        val vy = ux
-
-        return arrayOf(
-            lEye,                                                                                       // 0: Left Eye
-            rEye,                                                                                       // 1: Right Eye
-            nose,                                                                                       // 2: Nose Tip
-            lMouth,                                                                                     // 3: Left Mouth
-            rMouth,                                                                                     // 4: Right Mouth
-            PointF(eyeMidX, eyeMidY),                                                                   // 5: Glabella
-            PointF((eyeMidX + nose.x) * 0.5f, (eyeMidY + nose.y) * 0.5f),                               // 6: Nasal Bridge
-            PointF(mouthMidX, mouthMidY),                                                               // 7: Mouth Center
-            PointF(nose.x * 0.42f + mouthMidX * 0.58f, nose.y * 0.42f + mouthMidY * 0.58f),             // 8: Philtrum Center
-            PointF(lEye.x - vx * (eyeDist * 0.32f), lEye.y - vy * (eyeDist * 0.32f)),                   // 9: Left Eyebrow
-            PointF(rEye.x - vx * (eyeDist * 0.32f), rEye.y - vy * (eyeDist * 0.32f)),                   // 10: Right Eyebrow
-            PointF(eyeMidX - vx * (eyeDist * 0.65f), eyeMidY - vy * (eyeDist * 0.65f)),                 // 11: Forehead Center
-            PointF(mouthMidX + (mouthMidX - nose.x) * 0.78f, mouthMidY + (mouthMidY - nose.y) * 0.78f), // 12: Chin Tip
-            PointF(
-                lEye.x * 0.52f + lMouth.x * 0.48f - ux * (eyeDist * 0.34f),
-                lEye.y * 0.52f + lMouth.y * 0.48f - uy * (eyeDist * 0.34f)
-            ),                                                                                          // 13: Left Cheek
-            PointF(
-                rEye.x * 0.52f + rMouth.x * 0.48f + ux * (eyeDist * 0.34f),
-                rEye.y * 0.52f + rMouth.y * 0.48f + uy * (eyeDist * 0.34f)
-            )                                                                                           // 14: Right Cheek
-        )
     }
 
     /**

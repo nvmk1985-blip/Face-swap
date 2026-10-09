@@ -906,7 +906,7 @@ private fun PhotoSelectionCard(
                         CircularProgressIndicator(color = ElectricCyan)
                         Spacer(modifier = Modifier.height(8.dp))
                         Text(
-                            text = "Detecting Face, 5-Point Keypoints & Cranial Volume...",
+                            text = "Detecting Face, 106-Point 3D Landmarks & 3D Head-Pose...",
                             style = MaterialTheme.typography.bodyMedium
                         )
                     }
@@ -936,11 +936,21 @@ private fun PhotoSelectionCard(
                     )
                     faces.firstOrNull()?.let { first ->
                         Text(
-                            text = first.detectorSource,
+                            text = "${first.landmarks106.size}-Pt 3DMM • ${first.detectorSource}",
                             style = MaterialTheme.typography.labelMedium,
                             color = MaterialTheme.colorScheme.onSurfaceVariant
                         )
                     }
+                }
+
+                val activeFace = faces.getOrNull(selectedFaceIndex) ?: faces.firstOrNull()
+                if (activeFace != null) {
+                    val pose = activeFace.headPose3D
+                    Text(
+                        text = "3D Head-Pose: ${pose.poseSummaryLabel} • 3D Vis L:${(pose.leftSideVisibility * 100).toInt()}% R:${(pose.rightSideVisibility * 100).toInt()}%",
+                        style = MaterialTheme.typography.labelSmall,
+                        color = ElectricCyan
+                    )
                 }
 
                 if (faces.size > 1) {
