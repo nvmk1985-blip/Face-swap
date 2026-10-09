@@ -273,23 +273,29 @@ fun FaceSwapStudioApp(
 
                     Spacer(modifier = Modifier.width(4.dp))
 
-                    // Settings gear icon button -> opens/toggles the Secondary Settings & Diagnostics page
+                    // Settings gear icon button (⚙️) -> opens/closes Settings containing Models, History & Safety
+                    val isInsideSettings = uiState.currentTab != AppTab.STUDIO ||
+                        uiState.studioSubPage == StudioSubPage.SETTINGS_AND_DIAGNOSTICS
                     IconButton(
                         onClick = {
-                            if (uiState.currentTab == AppTab.STUDIO &&
-                                uiState.studioSubPage == StudioSubPage.SETTINGS_AND_DIAGNOSTICS
-                            ) {
+                            if (isInsideSettings) {
                                 viewModel.selectStudioSubPage(StudioSubPage.FRONT_HOME)
+                                viewModel.selectTab(AppTab.STUDIO)
                             } else {
-                                viewModel.selectStudioSubPage(StudioSubPage.SETTINGS_AND_DIAGNOSTICS)
+                                viewModel.selectTab(AppTab.MODELS)
                             }
                         },
-                        modifier = Modifier.testTag("top_settings_button")
+                        modifier = Modifier
+                            .clip(CircleShape)
+                            .background(
+                                if (isInsideSettings) Color(0xFF1C163B) else Color.Transparent
+                            )
+                            .testTag("top_settings_button")
                     ) {
                         Icon(
                             imageVector = Icons.Default.Settings,
-                            contentDescription = "Settings & Advanced Tools",
-                            tint = Color(0xFF9FB0D0),
+                            contentDescription = "Settings (Models, History, Safety)",
+                            tint = if (isInsideSettings) ElectricCyan else Color(0xFF9FB0D0),
                             modifier = Modifier.size(22.dp)
                         )
                     }
@@ -299,79 +305,137 @@ fun FaceSwapStudioApp(
                     titleContentColor = Color.White
                 )
             )
-        },
-        bottomBar = {
-            NavigationBar(
-                containerColor = Color(0xFF090F20)
-            ) {
-                val navItemColors = NavigationBarItemDefaults.colors(
-                    selectedIconColor = Color(0xFFA855F7),
-                    selectedTextColor = Color(0xFFA855F7),
-                    indicatorColor = Color(0xFF1C163B),
-                    unselectedIconColor = Color(0xFF7D90B8),
-                    unselectedTextColor = Color(0xFF7D90B8)
-                )
-                NavigationBarItem(
-                    selected = uiState.currentTab == AppTab.STUDIO,
-                    onClick = { viewModel.selectTab(AppTab.STUDIO) },
-                    icon = {
-                        Icon(
-                            imageVector = Icons.Default.AutoFixHigh,
-                            contentDescription = stringResource(R.string.tab_studio)
-                        )
-                    },
-                    label = { Text(stringResource(R.string.tab_studio)) },
-                    colors = navItemColors,
-                    modifier = Modifier.testTag("nav_tab_studio")
-                )
-                NavigationBarItem(
-                    selected = uiState.currentTab == AppTab.MODELS,
-                    onClick = { viewModel.selectTab(AppTab.MODELS) },
-                    icon = {
-                        Icon(
-                            imageVector = Icons.Default.Memory,
-                            contentDescription = stringResource(R.string.tab_models)
-                        )
-                    },
-                    label = { Text(stringResource(R.string.tab_models)) },
-                    colors = navItemColors,
-                    modifier = Modifier.testTag("nav_tab_models")
-                )
-                NavigationBarItem(
-                    selected = uiState.currentTab == AppTab.HISTORY,
-                    onClick = { viewModel.selectTab(AppTab.HISTORY) },
-                    icon = {
-                        Icon(
-                            imageVector = Icons.Default.History,
-                            contentDescription = stringResource(R.string.tab_history)
-                        )
-                    },
-                    label = { Text(stringResource(R.string.tab_history)) },
-                    colors = navItemColors,
-                    modifier = Modifier.testTag("nav_tab_history")
-                )
-                NavigationBarItem(
-                    selected = uiState.currentTab == AppTab.ETHICS,
-                    onClick = { viewModel.selectTab(AppTab.ETHICS) },
-                    icon = {
-                        Icon(
-                            imageVector = Icons.Default.Shield,
-                            contentDescription = stringResource(R.string.tab_ethics)
-                        )
-                    },
-                    label = { Text(stringResource(R.string.tab_ethics)) },
-                    colors = navItemColors,
-                    modifier = Modifier.testTag("nav_tab_ethics")
-                )
-            }
         }
     ) { innerPadding ->
+        val isInsideSettings = uiState.currentTab != AppTab.STUDIO ||
+            uiState.studioSubPage == StudioSubPage.SETTINGS_AND_DIAGNOSTICS
+
         Column(
             modifier = Modifier
                 .fillMaxSize()
                 .background(Color(0xFF070C1A))
                 .padding(innerPadding)
         ) {
+            // Settings Hub Header & Switcher (Models, History, Safety) shown ONLY when ⚙️ Settings is opened
+            AnimatedVisibility(visible = isInsideSettings) {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .background(Color(0xFF0B1328))
+                        .padding(horizontal = 14.dp, vertical = 10.dp),
+                    verticalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.SpaceBetween
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .clip(RoundedCornerShape(50))
+                                .background(Color(0xFF132042))
+                                .border(1.dp, Color(0xFF284078), RoundedCornerShape(50))
+                                .clickable {
+                                    viewModel.selectStudioSubPage(StudioSubPage.FRONT_HOME)
+                                    viewModel.selectTab(AppTab.STUDIO)
+                                }
+                                .padding(horizontal = 12.dp, vertical = 6.dp)
+                                .testTag("nav_tab_studio"),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.AutoFixHigh,
+                                contentDescription = stringResource(R.string.tab_studio),
+                                tint = ElectricCyan,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = "← Back to Swap",
+                                color = Color.White,
+                                fontWeight = FontWeight.SemiBold,
+                                fontSize = 12.5.sp
+                            )
+                        }
+
+                        Row(
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(6.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Settings,
+                                contentDescription = null,
+                                tint = ElectricCyan,
+                                modifier = Modifier.size(16.dp)
+                            )
+                            Text(
+                                text = "Settings",
+                                color = ElectricCyan,
+                                fontWeight = FontWeight.Bold,
+                                fontSize = 14.sp
+                            )
+                        }
+                    }
+
+                    NavigationBar(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(16.dp))
+                            .border(1.dp, Color(0xFF1E2D52), RoundedCornerShape(16.dp)),
+                        containerColor = Color(0xFF090F20),
+                        tonalElevation = 0.dp
+                    ) {
+                        val navItemColors = NavigationBarItemDefaults.colors(
+                            selectedIconColor = Color(0xFFA855F7),
+                            selectedTextColor = Color(0xFFA855F7),
+                            indicatorColor = Color(0xFF1C163B),
+                            unselectedIconColor = Color(0xFF7D90B8),
+                            unselectedTextColor = Color(0xFF7D90B8)
+                        )
+                        NavigationBarItem(
+                            selected = uiState.currentTab == AppTab.MODELS ||
+                                uiState.currentTab == AppTab.STUDIO,
+                            onClick = { viewModel.selectTab(AppTab.MODELS) },
+                            icon = {
+                                Icon(
+                                    imageVector = Icons.Default.Memory,
+                                    contentDescription = stringResource(R.string.tab_models)
+                                )
+                            },
+                            label = { Text(stringResource(R.string.tab_models)) },
+                            colors = navItemColors,
+                            modifier = Modifier.testTag("nav_tab_models")
+                        )
+                        NavigationBarItem(
+                            selected = uiState.currentTab == AppTab.HISTORY,
+                            onClick = { viewModel.selectTab(AppTab.HISTORY) },
+                            icon = {
+                                Icon(
+                                    imageVector = Icons.Default.History,
+                                    contentDescription = stringResource(R.string.tab_history)
+                                )
+                            },
+                            label = { Text(stringResource(R.string.tab_history)) },
+                            colors = navItemColors,
+                            modifier = Modifier.testTag("nav_tab_history")
+                        )
+                        NavigationBarItem(
+                            selected = uiState.currentTab == AppTab.ETHICS,
+                            onClick = { viewModel.selectTab(AppTab.ETHICS) },
+                            icon = {
+                                Icon(
+                                    imageVector = Icons.Default.Shield,
+                                    contentDescription = stringResource(R.string.tab_ethics)
+                                )
+                            },
+                            label = { Text(stringResource(R.string.tab_ethics)) },
+                            colors = navItemColors,
+                            modifier = Modifier.testTag("nav_tab_ethics")
+                        )
+                    }
+                }
+            }
+
             AnimatedVisibility(
                 visible = uiState.errorBannerMessage != null || uiState.statusBannerMessage != null
             ) {
@@ -462,6 +526,9 @@ fun FaceSwapStudioApp(
                     onResetAdjustments = viewModel::resetPositionAdjustments,
                     onToggleCompareOriginal = viewModel::toggleComparisonMode,
                     onOpenModelsTab = { viewModel.selectTab(AppTab.MODELS) },
+                    onImportAllFromFolder = {
+                        onnxFolderTreePicker.launch(null)
+                    },
                     onRunVisualValidation = viewModel::runVisualValidationSuite,
                     onSaveValidationSheet = viewModel::saveVisualValidationSheetToGallery,
                     onSelectStudioSubPage = viewModel::selectStudioSubPage

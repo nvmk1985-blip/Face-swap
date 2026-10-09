@@ -32,10 +32,12 @@ import androidx.compose.material.icons.filled.CheckCircle
 import androidx.compose.material.icons.filled.CropFree
 import androidx.compose.material.icons.filled.Download
 import androidx.compose.material.icons.filled.Face
+import androidx.compose.material.icons.filled.Folder
 import androidx.compose.material.icons.filled.Lock
 import androidx.compose.material.icons.filled.People
 import androidx.compose.material.icons.filled.Person
 import androidx.compose.material.icons.filled.PhotoLibrary
+import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Schedule
 import androidx.compose.material.icons.filled.SwapHoriz
 import androidx.compose.material.icons.filled.Tune
@@ -184,6 +186,7 @@ fun StudioFrontPage(
     onDownloadHd: () -> Unit,
     onSaveToGallery: () -> Unit,
     onInspectResultDetails: () -> Unit,
+    onImportAllFromFolder: () -> Unit = {},
     onSkinToneModeChanged: (com.example.onnx.SkinToneSourceMode) -> Unit = {},
     onFaceReactionModeChanged: (com.example.onnx.FaceReactionSourceMode) -> Unit = {},
     modifier: Modifier = Modifier
@@ -215,10 +218,11 @@ fun StudioFrontPage(
             // 1. Hero Story Banner ("Swap Faces / Create New Stories" + "Your Photos / Your Creativity / 100% Private")
             FrontHeroStoryBanner()
 
-            // 2. Choose Mode Section ("Face Swap" vs "Full Head Replacement")
+            // 2. Choose Mode Section ("Face Swap" vs "Full Head Replacement") + 1-Tap Auto-Import All .onnx from Folder pill
             FrontChooseModeSection(
                 selectedMode = uiState.studioMode,
-                onSelectMode = onSelectStudioMode
+                onSelectMode = onSelectStudioMode,
+                onImportAllFromFolder = onImportAllFromFolder
             )
 
             // 3. Main Workspace Card (1 Source Face, 2 Target Photo, Skin Tone & Face Reaction Selector, Swap Face CTA)
@@ -396,16 +400,72 @@ private fun FrontHeroStoryBanner() {
 @Composable
 private fun FrontChooseModeSection(
     selectedMode: StudioMode,
-    onSelectMode: (StudioMode) -> Unit
+    onSelectMode: (StudioMode) -> Unit,
+    onImportAllFromFolder: () -> Unit
 ) {
     Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        Text(
-            text = "Choose Mode",
-            style = MaterialTheme.typography.titleMedium,
-            fontWeight = FontWeight.Bold,
-            color = Color.White,
-            fontSize = 16.sp
-        )
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.SpaceBetween
+        ) {
+            Text(
+                text = "Choose Mode",
+                style = MaterialTheme.typography.titleMedium,
+                fontWeight = FontWeight.Bold,
+                color = Color.White,
+                fontSize = 18.sp
+            )
+
+            // 1-Tap Auto-Import All .onnx from Folder pill button at the red arrow position
+            Row(
+                modifier = Modifier
+                    .clip(RoundedCornerShape(50))
+                    .background(
+                        Brush.horizontalGradient(
+                            colors = listOf(
+                                Color(0xFF0B2246),
+                                Color(0xFF091B3A)
+                            )
+                        )
+                    )
+                    .border(
+                        width = 1.2.dp,
+                        brush = Brush.horizontalGradient(
+                            colors = listOf(
+                                Color(0xFF1E88E5),
+                                Color(0xFF00B4FF)
+                            )
+                        ),
+                        shape = RoundedCornerShape(50)
+                    )
+                    .clickable(onClick = onImportAllFromFolder)
+                    .padding(horizontal = 11.dp, vertical = 6.dp)
+                    .testTag("front_auto_import_folder_btn"),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(7.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Folder,
+                    contentDescription = "Auto-Import ONNX Folder",
+                    tint = Color(0xFF18C8FF),
+                    modifier = Modifier.size(17.dp)
+                )
+                Text(
+                    text = "1-Tap Auto-Import All .onnx\nfrom Folder",
+                    color = Color(0xFF18C8FF),
+                    fontSize = 10.5.sp,
+                    lineHeight = 12.5.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Icon(
+                    imageVector = Icons.Default.Refresh,
+                    contentDescription = "Sync ONNX Models from Folder",
+                    tint = Color(0xFF64B5F6),
+                    modifier = Modifier.size(16.dp)
+                )
+            }
+        }
 
         Row(
             modifier = Modifier.fillMaxWidth(),

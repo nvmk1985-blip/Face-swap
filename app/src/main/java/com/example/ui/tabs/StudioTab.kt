@@ -131,6 +131,7 @@ fun StudioTab(
     onResetAdjustments: () -> Unit = {},
     onToggleCompareOriginal: (Boolean) -> Unit,
     onOpenModelsTab: () -> Unit,
+    onImportAllFromFolder: () -> Unit = {},
     onSkinToneModeChanged: (SkinToneSourceMode) -> Unit = {},
     onFaceReactionModeChanged: (FaceReactionSourceMode) -> Unit = {},
     onBrowseSourceFile: () -> Unit = onPickSourcePhoto,
@@ -155,7 +156,7 @@ fun StudioTab(
                 onSelectStudioSubPage(StudioSubPage.ALIGNMENT_PREVIEW)
             },
             onOpenSettingsPage = {
-                onSelectStudioSubPage(StudioSubPage.SETTINGS_AND_DIAGNOSTICS)
+                onOpenModelsTab()
             },
             onRunSwap = onRunSwap,
             onDownloadHd = onSaveHdToGallery,
@@ -163,6 +164,7 @@ fun StudioTab(
             onInspectResultDetails = {
                 onSelectStudioSubPage(StudioSubPage.ALIGNMENT_PREVIEW)
             },
+            onImportAllFromFolder = onImportAllFromFolder,
             onSkinToneModeChanged = onSkinToneModeChanged,
             onFaceReactionModeChanged = onFaceReactionModeChanged,
             modifier = modifier
