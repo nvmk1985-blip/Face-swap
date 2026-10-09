@@ -204,7 +204,16 @@ object FaceBlender {
             x, y, rBrowX, rBrowY, browRx, browRy, geom.cosA, geom.sinA
         )
 
-        val minDistSq = min(min(lDistSq, rDistSq), min(lbDistSq, rbDistSq))
+        // Central Glabella / Forehead Bindi (பொட்டு / புள்ளி) Protection Zone between the eyebrows
+        val glabellaX = (lBrowX + rBrowX) * 0.5f
+        val glabellaY = (lBrowY + rBrowY) * 0.5f
+        val glabellaRx = geom.eyeDist * 0.24f
+        val glabellaRy = geom.eyeDist * 0.22f
+        val glabellaDistSq = orientedEllipseDistSq(
+            x, y, glabellaX, glabellaY, glabellaRx, glabellaRy, geom.cosA, geom.sinA
+        )
+
+        val minDistSq = min(min(min(lDistSq, rDistSq), min(lbDistSq, rbDistSq)), glabellaDistSq)
         return when {
             minDistSq <= 0.48f -> 1.0f
             minDistSq >= 1.0f -> 0.0f
@@ -1427,14 +1436,14 @@ object FaceBlender {
         val residualG = sCheekG - tCheekG
         val residualB = sCheekB - tCheekB
 
-        val halfSpanU = max(mouthW * 0.56f, geom512.eyeDist * 0.44f)
+        val halfSpanU = max(mouthW * 0.62f, geom512.eyeDist * 0.48f)
         val boundMinX = (min(geom512.nose.x, mouthMidX) - halfSpanU - 14f).toInt().coerceIn(14, HD_SIZE - 15)
         val boundMaxX = (max(geom512.nose.x, mouthMidX) + halfSpanU + 14f).toInt().coerceIn(14, HD_SIZE - 15)
         val boundMinY = (min(geom512.nose.y, mouthMidY) - 10f).toInt().coerceIn(14, HD_SIZE - 15)
-        val boundMaxY = (max(geom512.nose.y, mouthMidY) + noseToMouthDist * 0.12f).toInt().coerceIn(14, HD_SIZE - 15)
+        val boundMaxY = (max(geom512.nose.y, mouthMidY) + noseToMouthDist * 0.14f).toInt().coerceIn(14, HD_SIZE - 15)
 
-        val nostrilRx = geom512.eyeDist * 0.22f
-        val nostrilRy = geom512.eyeDist * 0.10f
+        val nostrilRx = geom512.eyeDist * 0.20f
+        val nostrilRy = geom512.eyeDist * 0.09f
         val origSwapCopy = swapPx512.copyOf()
 
         for (y in boundMinY..boundMaxY) {
@@ -1452,8 +1461,8 @@ object FaceBlender {
                 if (uNorm >= 1.0f) continue
 
                 val vFrac = v / noseToMouthDist
-                val vTop = 0.18f
-                val vBottom = 0.82f
+                val vTop = 0.12f
+                val vBottom = 0.88f
                 if (vFrac <= vTop || vFrac >= vBottom) continue
 
                 val dNostrilSq = orientedEllipseDistSq(
@@ -1473,7 +1482,7 @@ object FaceBlender {
                 val tG = (tc ushr 8) and 0xFF
 
                 // Chromatic lip-vermilion guard: never overwrite actual red/pink lip vermilion pixels
-                if (vFrac > 0.68f && (tR - tG) > 48) continue
+                if (vFrac > 0.72f && (tR - tG) > 52) continue
 
                 val sc = origSwapCopy[idx]
                 val sR = (sc ushr 16) and 0xFF
@@ -1484,22 +1493,28 @@ object FaceBlender {
                 // Use low-frequency smoothed Target shading + cheek residual so NO high-frequency Target nose/lip edge is ever stamped
                 val tLow = compute5PointLowPassRGB512(tgtPx512, x, y, 8)
                 val sLow = compute5PointLowPassRGB512(origSwapCopy, x, y, 8)
-                val cleanSkinR = (0.72f * (tLow[0] + residualR) + 0.28f * sCheekR + (sR - sLow[0]) * 0.25f).coerceIn(0f, 255f)
-                val cleanSkinG = (0.72f * (tLow[1] + residualG) + 0.28f * sCheekG + (sG - sLow[1]) * 0.25f).coerceIn(0f, 255f)
-                val cleanSkinB = (0.72f * (tLow[2] + residualB) + 0.28f * sCheekB + (sB - sLow[2]) * 0.25f).coerceIn(0f, 255f)
+                val cleanSkinR = (0.76f * (tLow[0] + residualR) + 0.24f * sCheekR + (sR - sLow[0]) * 0.20f).coerceIn(0f, 255f)
+                val cleanSkinG = (0.76f * (tLow[1] + residualG) + 0.24f * sCheekG + (sG - sLow[1]) * 0.20f).coerceIn(0f, 255f)
+                val cleanSkinB = (0.76f * (tLow[2] + residualB) + 0.24f * sCheekB + (sB - sLow[2]) * 0.20f).coerceIn(0f, 255f)
                 val expectedCleanLum = 0.299f * cleanSkinR + 0.587f * cleanSkinG + 0.114f * cleanSkinB
 
-                // Pure radial cosine dome (zero flat rectangular plateau)
-                val zoneEnv = (0.5f * (1.0f + cos(Math.PI * sqrt(radialSq)))).toFloat()
+                // Smooth radial cosine dome with inner philtrum core (zero rectangular edges)
+                val rDist = sqrt(radialSq)
+                val zoneEnv = if (rDist <= 0.56f) {
+                    1.0f
+                } else {
+                    val t = ((rDist - 0.56f) / 0.44f).coerceIn(0f, 1f)
+                    (0.5f * (1.0f + cos(Math.PI * t))).toFloat()
+                }
 
                 val shadowDeficit = expectedCleanLum - sLum
                 val cleanWarmth = cleanSkinR - cleanSkinB
                 val swapWarmth = (sR - sB).toFloat()
                 val greyCastDeficit = cleanWarmth - swapWarmth
 
-                if (shadowDeficit > 3.5f || greyCastDeficit > 4.5f) {
-                    val severity = max((shadowDeficit - 3.5f) / 16.0f, (greyCastDeficit - 4.5f) / 16.0f).coerceIn(0f, 1f)
-                    val replaceWeight = (0.94f * zoneEnv * severity).coerceIn(0f, 0.94f)
+                if (shadowDeficit > 2.5f || greyCastDeficit > 3.5f) {
+                    val severity = max((shadowDeficit - 2.5f) / 12.0f, (greyCastDeficit - 3.5f) / 12.0f).coerceIn(0f, 1f)
+                    val replaceWeight = (0.97f * zoneEnv * severity).coerceIn(0f, 0.97f)
                     val outR = (sR * (1f - replaceWeight) + cleanSkinR * replaceWeight).toInt().coerceIn(0, 255)
                     val outG = (sG * (1f - replaceWeight) + cleanSkinG * replaceWeight).toInt().coerceIn(0, 255)
                     val outB = (sB * (1f - replaceWeight) + cleanSkinB * replaceWeight).toInt().coerceIn(0, 255)

@@ -8,10 +8,16 @@
         android:maxSdkVersion="28" />
 
     <!--
-      No android.permission.INTERNET is declared.
+      No android.permission.INTERNET is declared, and any transitive library permission is stripped.
       This enforces at the OS level that all ONNX inference and image processing
       run 100% offline on-device and user photos can never be uploaded anywhere.
     -->
+    <uses-permission
+        android:name="android.permission.INTERNET"
+        tools:node="remove" />
+    <uses-permission
+        android:name="android.permission.ACCESS_NETWORK_STATE"
+        tools:node="remove" />
     <application
         android:allowBackup="true"
         android:dataExtractionRules="@xml/data_extraction_rules"

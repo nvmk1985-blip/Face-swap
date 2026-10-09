@@ -199,6 +199,57 @@ fun FaceDetectionCanvas(
                     textPaint
                 )
 
+                // Render 36-point 3D Biometric Face Contour Mesh (or synthesize from 3D pose if empty)
+                val contourPts = if (face.faceContourPoints.size >= 8) {
+                    face.faceContourPoints
+                } else {
+                    com.example.onnx.ScrfdFaceDetector.build3DBiometricFaceOvalContour(
+                        landmarks5 = face.landmarks5,
+                        eulerX = face.eulerX,
+                        eulerY = face.eulerY,
+                        eulerZ = face.eulerZ,
+                        imgW = bitmap.width,
+                        imgH = bitmap.height
+                    )
+                }
+                if (contourPts.size >= 8) {
+                    val contourPath = androidx.compose.ui.graphics.Path()
+                    contourPts.forEachIndexed { idx, pt ->
+                        val cx = offsetX + pt.x * scale
+                        val cy = offsetY + pt.y * scale
+                        if (idx == 0) contourPath.moveTo(cx, cy) else contourPath.lineTo(cx, cy)
+                    }
+                    contourPath.close()
+                    drawPath(
+                        path = contourPath,
+                        color = if (isSelected) NeonEmerald.copy(alpha = 0.78f) else ElectricCyan.copy(alpha = 0.45f),
+                        style = Stroke(
+                            width = if (isSelected) 1.8.dp.toPx() else 1.2.dp.toPx(),
+                            pathEffect = PathEffect.dashPathEffect(floatArrayOf(8f, 5f), 0f)
+                        )
+                    )
+                }
+
+                // Draw connected 3D biometric feature mesh (Eyes -> Nose -> Mouth wireframe)
+                if (face.landmarks5.size >= 5) {
+                    val lEye = Offset(offsetX + face.landmarks5[0].x * scale, offsetY + face.landmarks5[0].y * scale)
+                    val rEye = Offset(offsetX + face.landmarks5[1].x * scale, offsetY + face.landmarks5[1].y * scale)
+                    val nose = Offset(offsetX + face.landmarks5[2].x * scale, offsetY + face.landmarks5[2].y * scale)
+                    val lMouth = Offset(offsetX + face.landmarks5[3].x * scale, offsetY + face.landmarks5[3].y * scale)
+                    val rMouth = Offset(offsetX + face.landmarks5[4].x * scale, offsetY + face.landmarks5[4].y * scale)
+                    val meshColor = ElectricCyan.copy(alpha = if (isSelected) 0.55f else 0.32f)
+                    val meshStroke = 1.1.dp.toPx()
+
+                    drawLine(color = meshColor, start = lEye, end = rEye, strokeWidth = meshStroke)
+                    drawLine(color = meshColor, start = lEye, end = nose, strokeWidth = meshStroke)
+                    drawLine(color = meshColor, start = rEye, end = nose, strokeWidth = meshStroke)
+                    drawLine(color = meshColor, start = nose, end = lMouth, strokeWidth = meshStroke)
+                    drawLine(color = meshColor, start = nose, end = rMouth, strokeWidth = meshStroke)
+                    drawLine(color = meshColor, start = lMouth, end = rMouth, strokeWidth = meshStroke)
+                    drawLine(color = meshColor, start = lEye, end = lMouth, strokeWidth = meshStroke)
+                    drawLine(color = meshColor, start = rEye, end = rMouth, strokeWidth = meshStroke)
+                }
+
                 face.landmarks5.forEachIndexed { ptIdx, pt ->
                     val px = offsetX + pt.x * scale
                     val py = offsetY + pt.y * scale
@@ -209,12 +260,12 @@ fun FaceDetectionCanvas(
                     }
                     drawCircle(
                         color = ObsidianBg,
-                        radius = 4.5.dp.toPx(),
+                        radius = 3.2.dp.toPx(),
                         center = Offset(px, py)
                     )
                     drawCircle(
                         color = kpColor,
-                        radius = 3.dp.toPx(),
+                        radius = 2.1.dp.toPx(),
                         center = Offset(px, py)
                     )
                 }

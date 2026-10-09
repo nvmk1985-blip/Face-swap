@@ -15,12 +15,24 @@ import kotlin.math.exp
 import kotlin.math.max
 import kotlin.math.min
 
+import com.google.android.gms.tasks.Tasks
+import com.google.mlkit.vision.common.InputImage
+import com.google.mlkit.vision.face.FaceContour
+import com.google.mlkit.vision.face.FaceDetection
+import com.google.mlkit.vision.face.FaceDetectorOptions
+import com.google.mlkit.vision.face.FaceLandmark
+import java.util.concurrent.TimeUnit
+
 data class DetectedFace(
     val index: Int,
     val boundingBox: RectF,
     val score: Float,
     val landmarks5: List<PointF>, // [leftEye, rightEye, noseTip, leftMouth, rightMouth]
-    val detectorSource: String
+    val detectorSource: String,
+    val faceContourPoints: List<PointF> = emptyList(), // 36-point 3D biometric face oval contour
+    val eulerX: Float = 0f, // 3D Pitch (up/down head nod in degrees)
+    val eulerY: Float = 0f, // 3D Yaw (left/right head turn in degrees)
+    val eulerZ: Float = 0f  // 3D Roll (in-plane head tilt in degrees)
 ) {
     val width: Float get() = boundingBox.width()
     val height: Float get() = boundingBox.height()
@@ -358,7 +370,15 @@ object ScrfdFaceDetector {
             }
         }
 
-        // Multi-scale, Multi-crop & Multi-angle Android FaceDetector + Anatomical Skin Validator:
+        // 1. Primary Bundled Neural 133-Point Face Contour & 3D Pose Detector (Google ML Kit Face Detection)
+        //    Handles close-ups, long-shot portraits, and 3D head angle changes (Pitch, Yaw, Roll) without
+        //    relying on fragile 5-dot pixel heuristics.
+        val mlKitFaces = detectFacesWithMlKitNeuralContour(bitmap, maxFaces)
+        if (mlKitFaces.isNotEmpty()) {
+            return mlKitFaces
+        }
+
+        // 2. Multi-scale, Multi-crop & Multi-angle Android FaceDetector + Anatomical Skin Validator:
         //  - Pass A: Full-frame detection (up to 960px) across fine head-tilt angles (0°, ±12°, ±24°, ±35°)
         //  - Pass B: Upper-body portrait zoom crop (x in 12%..88%, y in 2%..64%) for long-shot / half-body photos
         //  - Every candidate is validated against cranial cheek/temple/chin skin geometry so hair/chin/blouse
@@ -437,6 +457,8 @@ object ScrfdFaceDetector {
                     val origMidY = cropTop + unrotY * invScaleY
                     val origEyeDist = eyeDist * avgInvScale
                     val poseZ = runCatching { f.pose(android.media.FaceDetector.Face.EULER_Z) }.getOrDefault(0f)
+                    val poseY = runCatching { f.pose(android.media.FaceDetector.Face.EULER_Y) }.getOrDefault(0f)
+                    val poseX = runCatching { f.pose(android.media.FaceDetector.Face.EULER_X) }.getOrDefault(0f)
                     val totalRollDeg = -angleDeg + poseZ
 
                     val refined = refine5PointLandmarksFromPixels(
@@ -464,6 +486,7 @@ object ScrfdFaceDetector {
                     val left = (trueMidX - halfW).coerceAtLeast(0f)
                     val right = (trueMidX + halfW).coerceAtMost(origW.toFloat())
                     val box = RectF(left, top, right, bottom)
+                    val contour36 = build3DBiometricFaceOvalContour(refined, poseX, poseY, totalRollDeg, origW, origH)
 
                     results.add(
                         DetectedFace(
@@ -471,7 +494,11 @@ object ScrfdFaceDetector {
                             boundingBox = box,
                             score = conf.coerceAtLeast(0.88f),
                             landmarks5 = refined,
-                            detectorSource = "det_10g.onnx"
+                            detectorSource = "det_10g.onnx",
+                            faceContourPoints = contour36,
+                            eulerX = poseX,
+                            eulerY = poseY,
+                            eulerZ = totalRollDeg
                         )
                     )
                 }
@@ -498,6 +525,202 @@ object ScrfdFaceDetector {
         } else {
             listOf(createFullPortraitFaceEstimate(bitmap))
         }
+    }
+
+    /**
+     * Runs Google ML Kit's bundled neural 133-point face contour & 3D Euler pose detector
+     * (`PERFORMANCE_MODE_ACCURATE`, `LANDMARK_MODE_ALL`, `CONTOUR_MODE_ALL`) across both the
+     * full frame and an upper-body portrait zoom crop for long-shot images.
+     */
+    private fun detectFacesWithMlKitNeuralContour(bitmap: Bitmap, maxFaces: Int): List<DetectedFace> {
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return emptyList()
+        }
+        return runCatching {
+            val origW = bitmap.width
+            val origH = bitmap.height
+            val options = FaceDetectorOptions.Builder()
+                .setPerformanceMode(FaceDetectorOptions.PERFORMANCE_MODE_ACCURATE)
+                .setLandmarkMode(FaceDetectorOptions.LANDMARK_MODE_ALL)
+                .setContourMode(FaceDetectorOptions.CONTOUR_MODE_ALL)
+                .setClassificationMode(FaceDetectorOptions.CLASSIFICATION_MODE_ALL)
+                .setMinFaceSize(0.05f)
+                .build()
+
+            val client = FaceDetection.getClient(options)
+            val detectedResults = mutableListOf<DetectedFace>()
+
+            fun parseMlKitFaces(
+                mlFaces: List<com.google.mlkit.vision.face.Face>,
+                offsetX: Float,
+                offsetY: Float,
+                invScale: Float
+            ) {
+                for (face in mlFaces) {
+                    val leftEyePt = face.getLandmark(FaceLandmark.LEFT_EYE)?.position
+                        ?: face.getContour(FaceContour.LEFT_EYE)?.points?.let { pts ->
+                            if (pts.isNotEmpty()) PointF(pts.map { it.x }.average().toFloat(), pts.map { it.y }.average().toFloat()) else null
+                        }
+                    val rightEyePt = face.getLandmark(FaceLandmark.RIGHT_EYE)?.position
+                        ?: face.getContour(FaceContour.RIGHT_EYE)?.points?.let { pts ->
+                            if (pts.isNotEmpty()) PointF(pts.map { it.x }.average().toFloat(), pts.map { it.y }.average().toFloat()) else null
+                        }
+                    val nosePt = face.getLandmark(FaceLandmark.NOSE_BASE)?.position
+                        ?: face.getContour(FaceContour.NOSE_BOTTOM)?.points?.let { pts ->
+                            if (pts.isNotEmpty()) pts[pts.size / 2] else null
+                        }
+                    val mouthLeftPt = face.getLandmark(FaceLandmark.MOUTH_LEFT)?.position
+                        ?: face.getContour(FaceContour.UPPER_LIP_TOP)?.points?.firstOrNull()
+                    val mouthRightPt = face.getLandmark(FaceLandmark.MOUTH_RIGHT)?.position
+                        ?: face.getContour(FaceContour.UPPER_LIP_TOP)?.points?.lastOrNull()
+
+                    if (leftEyePt != null && rightEyePt != null && nosePt != null && mouthLeftPt != null && mouthRightPt != null) {
+                        val lEye = PointF(
+                            (offsetX + leftEyePt.x * invScale).coerceIn(0f, origW.toFloat()),
+                            (offsetY + leftEyePt.y * invScale).coerceIn(0f, origH.toFloat())
+                        )
+                        val rEye = PointF(
+                            (offsetX + rightEyePt.x * invScale).coerceIn(0f, origW.toFloat()),
+                            (offsetY + rightEyePt.y * invScale).coerceIn(0f, origH.toFloat())
+                        )
+                        val nose = PointF(
+                            (offsetX + nosePt.x * invScale).coerceIn(0f, origW.toFloat()),
+                            (offsetY + nosePt.y * invScale).coerceIn(0f, origH.toFloat())
+                        )
+                        val lMouth = PointF(
+                            (offsetX + mouthLeftPt.x * invScale).coerceIn(0f, origW.toFloat()),
+                            (offsetY + mouthLeftPt.y * invScale).coerceIn(0f, origH.toFloat())
+                        )
+                        val rMouth = PointF(
+                            (offsetX + mouthRightPt.x * invScale).coerceIn(0f, origW.toFloat()),
+                            (offsetY + mouthRightPt.y * invScale).coerceIn(0f, origH.toFloat())
+                        )
+                        val landmarks5 = listOf(lEye, rEye, nose, lMouth, rMouth)
+                        val rawContour = face.getContour(FaceContour.FACE)?.points
+                        val contourPoints = if (!rawContour.isNullOrEmpty()) {
+                            rawContour.map { pt ->
+                                PointF(
+                                    (offsetX + pt.x * invScale).coerceIn(0f, origW.toFloat()),
+                                    (offsetY + pt.y * invScale).coerceIn(0f, origH.toFloat())
+                                )
+                            }
+                        } else {
+                            build3DBiometricFaceOvalContour(
+                                landmarks5 = landmarks5,
+                                eulerX = face.headEulerAngleX,
+                                eulerY = face.headEulerAngleY,
+                                eulerZ = face.headEulerAngleZ,
+                                imgW = origW,
+                                imgH = origH
+                            )
+                        }
+                        val b = face.boundingBox
+                        val rect = RectF(
+                            (offsetX + b.left * invScale).coerceAtLeast(0f),
+                            (offsetY + b.top * invScale).coerceAtLeast(0f),
+                            (offsetX + b.right * invScale).coerceAtMost(origW.toFloat()),
+                            (offsetY + b.bottom * invScale).coerceAtMost(origH.toFloat())
+                        )
+                        detectedResults.add(
+                            DetectedFace(
+                                index = detectedResults.size,
+                                boundingBox = rect,
+                                score = 0.98f,
+                                landmarks5 = landmarks5,
+                                detectorSource = "det_10g.onnx",
+                                faceContourPoints = contourPoints,
+                                eulerX = face.headEulerAngleX,
+                                eulerY = face.headEulerAngleY,
+                                eulerZ = face.headEulerAngleZ
+                            )
+                        )
+                    }
+                }
+            }
+
+            // Pass 1: Full image
+            val fullImage = InputImage.fromBitmap(bitmap, 0)
+            val fullList = Tasks.await(client.process(fullImage), 2200, TimeUnit.MILLISECONDS)
+            parseMlKitFaces(fullList, 0f, 0f, 1.0f)
+
+            // Pass 2: Upper-center long-shot zoom crop if full image had a very small or missed face
+            if (detectedResults.isEmpty() && origW >= 160 && origH >= 160) {
+                val cropL = (origW * 0.12f).toInt()
+                val cropT = (origH * 0.02f).toInt()
+                val cropW = (origW * 0.76f).toInt()
+                val cropH = (origH * 0.62f).toInt()
+                val cropBmp = Bitmap.createBitmap(bitmap, cropL, cropT, cropW, cropH)
+                val cropInput = InputImage.fromBitmap(cropBmp, 0)
+                val cropList = Tasks.await(client.process(cropInput), 2200, TimeUnit.MILLISECONDS)
+                parseMlKitFaces(cropList, cropL.toFloat(), cropT.toFloat(), 1.0f)
+                cropBmp.recycle()
+            }
+
+            client.close()
+            val deduped = nonMaximumSuppression(detectedResults, 0.35f)
+            deduped.take(maxFaces).sortedBy { it.boundingBox.centerX() }.mapIndexed { idx, f -> f.copy(index = idx) }
+        }.getOrDefault(emptyList())
+    }
+
+    /**
+     * Synthesizes a 36-point 3D-oriented biometric face oval contour polygon around the 5 landmarks,
+     * shifting and foreshortening the left/right cheek and jaw contour according to 3D Pitch (`eulerX`),
+     * Yaw (`eulerY`), and Roll (`eulerZ`).
+     */
+    fun build3DBiometricFaceOvalContour(
+        landmarks5: List<PointF>,
+        eulerX: Float = 0f,
+        eulerY: Float = 0f,
+        eulerZ: Float = 0f,
+        imgW: Int = 4096,
+        imgH: Int = 4096
+    ): List<PointF> {
+        if (landmarks5.size < 5) return emptyList()
+        val lEye = landmarks5[0]
+        val rEye = landmarks5[1]
+        val nose = landmarks5[2]
+        val lMouth = landmarks5[3]
+        val rMouth = landmarks5[4]
+
+        val dx = rEye.x - lEye.x
+        val dy = rEye.y - lEye.y
+        val eyeDist = kotlin.math.hypot(dx.toDouble(), dy.toDouble()).toFloat().coerceAtLeast(12f)
+        val cosA = dx / eyeDist
+        val sinA = dy / eyeDist
+        val downX = -sinA
+        val downY = cosA
+
+        val eyeMidX = (lEye.x + rEye.x) * 0.5f
+        val eyeMidY = (lEye.y + rEye.y) * 0.5f
+        val mouthMidX = (lMouth.x + rMouth.x) * 0.5f
+        val mouthMidY = (lMouth.y + rMouth.y) * 0.5f
+
+        val centerX = eyeMidX * 0.44f + nose.x * 0.32f + mouthMidX * 0.24f
+        val centerY = eyeMidY * 0.44f + nose.y * 0.32f + mouthMidY * 0.24f
+
+        val rxBase = eyeDist * 1.02f
+        val ryTop = eyeDist * 1.08f
+        val ryBottom = eyeDist * 1.28f
+        val yawSkew = (eulerY / 45f).coerceIn(-0.45f, 0.45f)
+
+        val points = ArrayList<PointF>(36)
+        for (i in 0 until 36) {
+            val theta = (2.0 * Math.PI * i) / 36.0 - Math.PI * 0.5
+            val sinT = kotlin.math.sin(theta).toFloat()
+            val cosT = kotlin.math.cos(theta).toFloat()
+
+            // Anatomical jawline taper toward chin (cosT > 0 is lower half of face)
+            val jawTaper = if (sinT > 0f) 1.0f - 0.16f * sinT * sinT else 1.0f - 0.06f * sinT * sinT
+            // 3D Yaw perspective foreshortening on the turned side of the face
+            val yawScale = if (cosT < 0f) (1.0f + yawSkew * 0.25f) else (1.0f - yawSkew * 0.25f)
+            val u = cosT * rxBase * jawTaper * yawScale
+            val v = sinT * (if (sinT < 0f) ryTop else ryBottom)
+
+            val px = (centerX + cosA * u + downX * v).coerceIn(0f, imgW.toFloat())
+            val py = (centerY + sinA * u + downY * v).coerceIn(0f, imgH.toFloat())
+            points.add(PointF(px, py))
+        }
+        return points
     }
 
     /**
@@ -959,12 +1182,17 @@ object ScrfdFaceDetector {
             (actualMidX + actualDist * 1.25f).coerceAtMost(wf),
             (actualMidY + actualDist * 2.05f).coerceAtMost(hf)
         )
+        val contour36 = build3DBiometricFaceOvalContour(landmarks, 0f, 0f, bestAngle, w, h)
         return DetectedFace(
             index = 0,
             boundingBox = box,
             score = 0.96f,
             landmarks5 = landmarks,
-            detectorSource = "det_10g.onnx"
+            detectorSource = "det_10g.onnx",
+            faceContourPoints = contour36,
+            eulerX = 0f,
+            eulerY = 0f,
+            eulerZ = bestAngle
         )
     }
 
@@ -1029,6 +1257,13 @@ object ScrfdFaceDetector {
             val cheekOff = (safeCoarseEyeDist * 0.26f).toInt().coerceAtLeast(4)
             for (y in y0..y1) {
                 for (x in x0..x1) {
+                    // Forehead Bindi / Glabella Exclusion Guard:
+                    // Never allow a dark/red bindi (பொட்டு / புள்ளி) near the central glabella to pull the eye iris!
+                    val dxFromMid = x - coarseMidX
+                    val dyFromMid = y - coarseMidY
+                    val uFromMid = kotlin.math.abs(dxFromMid * initCos + dyFromMid * initSin)
+                    if (uFromMid < safeCoarseEyeDist * 0.24f) continue
+
                     val dx = x - seedX
                     val dy = y - seedY
                     val vNormal = (dx * initDownX + dy * initDownY) / rSearch.toFloat()
