@@ -516,7 +516,8 @@ object OnnxProtobufInspector {
                 ModelSlot.RECOGNIZER
             lower.contains("inswapper") || lower.contains("hyperswap") ->
                 ModelSlot.SWAPPER
-            lower.contains("segformer") || lower.contains("bisenet") || lower.contains("face_parsing") ->
+            lower.contains("segformer") || lower.contains("bisenet") || lower.contains("face_parsing") ||
+                lower.contains("face_occluder") || lower.contains("dfl_xseg") ->
                 ModelSlot.SEGMENTATION
             lower.contains("modnet") || lower.contains("stylematte") ->
                 ModelSlot.MATTING
@@ -526,6 +527,16 @@ object OnnxProtobufInspector {
                 ModelSlot.ENHANCEMENT
             else -> null
         }
+    }
+
+    private fun isAuxiliary3DOrOcclusionModel(fileName: String): Boolean {
+        val lower = fileName.trim().lowercase()
+        if (!lower.endsWith(".onnx")) return false
+        return lower.contains("1k3d68") ||
+            lower.contains("2d106det") ||
+            lower.contains("face_occluder") ||
+            lower.contains("dfl_xseg") ||
+            lower.contains("bisenet")
     }
 
     private data class DiscoveredDocEntry(
@@ -575,6 +586,7 @@ object OnnxProtobufInspector {
             val resolver = context.contentResolver
             val rootDocId = android.provider.DocumentsContract.getTreeDocumentId(treeUri)
             val rawDiscoveredOnnx = mutableListOf<Triple<String, String, Long>>() // (docId, displayName, size)
+            val rawAuxiliaryOnnx = mutableListOf<Triple<String, String, Long>>() // (docId, displayName, size)
             val dataFilesByName = mutableMapOf<String, Pair<String, Long>>() // lowercase name -> (docId, size)
 
             fun scanDocumentDirectory(parentDocId: String, depth: Int) {
@@ -615,8 +627,13 @@ object OnnxProtobufInspector {
                                 val lowerName = displayName.trim().lowercase()
                                 if (lowerName.endsWith(".onnx.data") || lowerName.endsWith(".data")) {
                                     dataFilesByName[lowerName] = docId to docSize
-                                } else if (matchSlotForFileName(displayName) != null) {
-                                    rawDiscoveredOnnx.add(Triple(docId, displayName, docSize))
+                                } else {
+                                    if (matchSlotForFileName(displayName) != null) {
+                                        rawDiscoveredOnnx.add(Triple(docId, displayName, docSize))
+                                    }
+                                    if (isAuxiliary3DOrOcclusionModel(displayName)) {
+                                        rawAuxiliaryOnnx.add(Triple(docId, displayName, docSize))
+                                    }
                                 }
                             }
                         }
@@ -634,6 +651,15 @@ object OnnxProtobufInspector {
                 val hasCompanion = dataFilesByName.containsKey(companionLower)
                 val priority = if (matchedSlot == ModelSlot.SWAPPER) {
                     computeSwapCandidatePriority(displayName, docSize, hasCompanion)
+                } else if (matchedSlot == ModelSlot.SEGMENTATION) {
+                    val lower = displayName.trim().lowercase()
+                    val segScore = when {
+                        lower.contains("segformer") -> 95
+                        lower.contains("bisenet") -> 90
+                        lower.contains("face_occluder") || lower.contains("dfl_xseg") -> 80
+                        else -> 70
+                    }
+                    if (docSize >= 1024L * 1024L || hasCompanion) segScore + 1000 else segScore
                 } else {
                     if (docSize >= 1024L * 1024L || hasCompanion) 1100 else 100
                 }
@@ -744,7 +770,30 @@ object OnnxProtobufInspector {
                 }
             }
 
-            if (importedSlots.isNotEmpty()) {
+            // Also import any auxiliary 3D landmark (1k3d68.onnx, 2d106det.onnx) or occlusion/parsing models
+            for ((docId, displayName, docSize) in rawAuxiliaryOnnx) {
+                val lower = displayName.trim().lowercase()
+                val auxSubDirName = if (lower.contains("1k3d68") || lower.contains("2d106det")) {
+                    "landmarks_3d"
+                } else {
+                    "segmentation"
+                }
+                val auxDir = File(rootDir, auxSubDirName).apply { if (!exists()) mkdirs() }
+                val auxDest = File(auxDir, displayName.trim())
+                if (auxDest.exists() && docSize > 1024L && auxDest.length() == docSize) {
+                    continue
+                }
+                if (docSize > 0L && rootDir.usableSpace < docSize + 32L * 1024L * 1024L) {
+                    continue
+                }
+                runCatching {
+                    onProgress("Importing 3D/Occlusion model: $displayName...")
+                    val docUri = android.provider.DocumentsContract.buildDocumentUriUsingTree(treeUri, docId)
+                    copyUriToFileSafely(context, docUri, auxDest)
+                }
+            }
+
+            if (importedSlots.isNotEmpty() || rawAuxiliaryOnnx.isNotEmpty()) {
                 saveLinkedModelsFolderUri(context, treeUri)
             }
             Result.success(importedSlots)
