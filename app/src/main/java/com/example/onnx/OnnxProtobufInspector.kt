@@ -315,6 +315,15 @@ object OnnxProtobufInspector {
      */
     fun getModelsDir(context: Context): File = getModelsRootDir(context)
 
+    private fun isSwapperModelComplete(file: File): Boolean {
+        if (!file.exists() || file.length() <= 1024L) return false
+        if (file.length() >= 8L * 1024L * 1024L) return true
+        val parent = file.parentFile ?: return false
+        return parent.listFiles()?.any { f ->
+            f.isFile && f.name.endsWith(".data", ignoreCase = true) && f.length() > 1024L * 1024L
+        } ?: false
+    }
+
     /**
      * Resolves the file location for a given `ModelSlot`. Checks the primary structured subdirectory first
      * (`filesDir/models/<subdirectory>/<canonicalFileName>`), then checks all other canonical subdirectories
@@ -324,7 +333,7 @@ object OnnxProtobufInspector {
     fun resolveModelFile(context: Context, slot: ModelSlot): File {
         val root = getModelsRootDir(context)
         val primaryFile = File(File(root, slot.subdirectory), slot.canonicalFileName)
-        if (primaryFile.exists() && primaryFile.length() > 1024L) {
+        if (slot != ModelSlot.SWAPPER && primaryFile.exists() && primaryFile.length() > 1024L) {
             return primaryFile
         }
         val candidateNames = if (slot == ModelSlot.SWAPPER) {
@@ -339,6 +348,22 @@ object OnnxProtobufInspector {
         } else {
             listOf(slot.canonicalFileName)
         }
+        if (slot == ModelSlot.SWAPPER) {
+            // Pass 1: Prefer complete swapper models (either self-contained >= 8MB or with companion .data weights)
+            for (fileName in candidateNames) {
+                for (sub in SUBDIRECTORIES) {
+                    val candidate = File(File(root, sub), fileName)
+                    if (isSwapperModelComplete(candidate)) {
+                        return candidate
+                    }
+                }
+                val legacyRootFile = File(root, fileName)
+                if (isSwapperModelComplete(legacyRootFile)) {
+                    return legacyRootFile
+                }
+            }
+        }
+        // Pass 2: Any existing model file > 1 KB
         for (fileName in candidateNames) {
             for (sub in SUBDIRECTORIES) {
                 val candidate = File(File(root, sub), fileName)
@@ -366,7 +391,7 @@ object OnnxProtobufInspector {
     /**
      * Loads and caches an [OrtSession] for [file] once and reuses it across subsequent calls.
      * To prevent native C++ OutOfMemory / Android lmkd SIGKILL on mobile devices, at most ONE
-     * heavy model session (> 30 MB) is kept resident in native RAM at a time alongside lightweight det_10g.
+     * heavy model session (> 25 MB including external .data weights) is kept resident in native RAM at a time.
      */
     fun getOrCreateCachedSession(
         ortEnv: OrtEnvironment?,
@@ -376,36 +401,42 @@ object OnnxProtobufInspector {
         if (ortEnv == null || !file.exists() || file.length() <= 1024L) return null
         val key = file.absolutePath
         val lastMod = file.lastModified()
-        val len = file.length()
+        val companionDataLen = file.parentFile?.listFiles()
+            ?.filter { it.isFile && it.name.startsWith(file.name, ignoreCase = true) && it.name.endsWith(".data", ignoreCase = true) }
+            ?.sumOf { it.length() } ?: 0L
+        val effectiveLen = file.length() + companionDataLen
         globalSessionCache[key]?.let { existing ->
-            if (existing.lastModified == lastMod && existing.fileLength == len) {
+            if (existing.lastModified == lastMod && existing.fileLength == effectiveLen) {
                 return existing.session
             }
         }
         synchronized(globalSessionLock) {
             globalSessionCache[key]?.let { existing ->
-                if (existing.lastModified == lastMod && existing.fileLength == len) {
+                if (existing.lastModified == lastMod && existing.fileLength == effectiveLen) {
                     return existing.session
                 }
                 runCatching { existing.session.close() }
                 globalSessionCache.remove(key)
             }
-            // If loading a heavy model (> 30 MB), evict other heavy sessions first so native C++ heap never spikes
-            val isHeavyModel = len > 30L * 1024L * 1024L
+            // If loading a heavy model (> 25 MB including .data), evict other heavy sessions first so native C++ heap never spikes
+            val isHeavyModel = effectiveLen > 25L * 1024L * 1024L
             if (isHeavyModel) {
                 val keysToEvict = globalSessionCache.entries
-                    .filter { it.key != key && it.value.fileLength > 30L * 1024L * 1024L }
+                    .filter { it.key != key && it.value.fileLength > 25L * 1024L * 1024L }
                     .map { it.key }
-                for (evictKey in keysToEvict) {
-                    globalSessionCache.remove(evictKey)?.let { entry ->
-                        runCatching { entry.session.close() }
+                if (keysToEvict.isNotEmpty()) {
+                    for (evictKey in keysToEvict) {
+                        globalSessionCache.remove(evictKey)?.let { entry ->
+                            runCatching { entry.session.close() }
+                        }
                     }
+                    System.gc()
                 }
             }
             return try {
                 createOptimizedSessionOptions(preferHardwareAcceleration).use { opts ->
                     val session = ortEnv.createSession(file.absolutePath, opts)
-                    globalSessionCache[key] = CachedOrtSessionEntry(session, lastMod, len)
+                    globalSessionCache[key] = CachedOrtSessionEntry(session, lastMod, effectiveLen)
                     session
                 }
             } catch (oom: OutOfMemoryError) {
@@ -449,7 +480,7 @@ object OnnxProtobufInspector {
         opts.setIntraOpNumThreads(intraOpThreads)
         opts.setMemoryPatternOptimization(false)
         opts.setCPUArenaAllocator(false)
-        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.BASIC_OPT)
+        opts.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.NO_OPT)
         return opts
     }
 
@@ -505,9 +536,13 @@ object OnnxProtobufInspector {
         val priorityScore: Int
     )
 
-    private fun computeSwapCandidatePriority(fileName: String): Int {
+    private fun computeSwapCandidatePriority(
+        fileName: String,
+        sizeBytes: Long,
+        hasCompanionData: Boolean
+    ): Int {
         val lower = fileName.trim().lowercase()
-        return when {
+        val baseScore = when {
             lower == "hyperswap_1b_256.onnx" || lower.contains("hyperswap_1b") -> 100
             lower.contains("hyperswap_1c") -> 90
             lower.contains("hyperswap_1a") -> 85
@@ -516,6 +551,9 @@ object OnnxProtobufInspector {
             lower.contains("inswapper_128") -> 60
             else -> 50
         }
+        // Self-contained models (>= 8MB) or split models that have their companion .data file get top priority
+        val isComplete = sizeBytes >= 8L * 1024L * 1024L || hasCompanionData
+        return if (isComplete) baseScore + 1000 else baseScore
     }
 
     /**
@@ -536,7 +574,7 @@ object OnnxProtobufInspector {
 
             val resolver = context.contentResolver
             val rootDocId = android.provider.DocumentsContract.getTreeDocumentId(treeUri)
-            val bestBySlot = mutableMapOf<ModelSlot, DiscoveredDocEntry>()
+            val rawDiscoveredOnnx = mutableListOf<Triple<String, String, Long>>() // (docId, displayName, size)
             val dataFilesByName = mutableMapOf<String, Pair<String, Long>>() // lowercase name -> (docId, size)
 
             fun scanDocumentDirectory(parentDocId: String, depth: Int) {
@@ -577,25 +615,8 @@ object OnnxProtobufInspector {
                                 val lowerName = displayName.trim().lowercase()
                                 if (lowerName.endsWith(".onnx.data") || lowerName.endsWith(".data")) {
                                     dataFilesByName[lowerName] = docId to docSize
-                                } else {
-                                    val matchedSlot = matchSlotForFileName(displayName)
-                                    if (matchedSlot != null) {
-                                        val priority = if (matchedSlot == ModelSlot.SWAPPER) {
-                                            computeSwapCandidatePriority(displayName)
-                                        } else {
-                                            100
-                                        }
-                                        val currentBest = bestBySlot[matchedSlot]
-                                        if (currentBest == null || priority > currentBest.priorityScore) {
-                                            bestBySlot[matchedSlot] = DiscoveredDocEntry(
-                                                docId = docId,
-                                                displayName = displayName,
-                                                sizeBytes = docSize,
-                                                slot = matchedSlot,
-                                                priorityScore = priority
-                                            )
-                                        }
-                                    }
+                                } else if (matchSlotForFileName(displayName) != null) {
+                                    rawDiscoveredOnnx.add(Triple(docId, displayName, docSize))
                                 }
                             }
                         }
@@ -605,6 +626,28 @@ object OnnxProtobufInspector {
 
             onProgress("Scanning folder for .onnx models...")
             scanDocumentDirectory(rootDocId, 0)
+
+            val bestBySlot = mutableMapOf<ModelSlot, DiscoveredDocEntry>()
+            for ((docId, displayName, docSize) in rawDiscoveredOnnx) {
+                val matchedSlot = matchSlotForFileName(displayName) ?: continue
+                val companionLower = "${displayName.trim().lowercase()}.data"
+                val hasCompanion = dataFilesByName.containsKey(companionLower)
+                val priority = if (matchedSlot == ModelSlot.SWAPPER) {
+                    computeSwapCandidatePriority(displayName, docSize, hasCompanion)
+                } else {
+                    if (docSize >= 1024L * 1024L || hasCompanion) 1100 else 100
+                }
+                val currentBest = bestBySlot[matchedSlot]
+                if (currentBest == null || priority > currentBest.priorityScore) {
+                    bestBySlot[matchedSlot] = DiscoveredDocEntry(
+                        docId = docId,
+                        displayName = displayName,
+                        sizeBytes = docSize,
+                        slot = matchedSlot,
+                        priorityScore = priority
+                    )
+                }
+            }
 
             // Import in priority order: Core Face Swap models first (DETECTOR, RECOGNIZER, SWAPPER), then optional models
             val orderedSlots = listOf(

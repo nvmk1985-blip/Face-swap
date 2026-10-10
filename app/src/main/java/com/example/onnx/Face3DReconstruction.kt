@@ -63,7 +63,8 @@ data class ReconstructedFace3D(
     val jawWidthCoeff: Float,
     val noseProjectionCoeff: Float,
     val mouthOpenRatio: Float,
-    val smileCurvatureCoeff: Float
+    val smileCurvatureCoeff: Float,
+    val anatomicalPoints34: List<AnatomicalLandmark3D> = emptyList()
 )
 
 object Face3DReconstruction {
@@ -510,7 +511,7 @@ object Face3DReconstruction {
         val noseProjCoeff = (noseToMouthDist / (eyeDist * 0.52f)).coerceIn(0.75f, 1.30f)
         val smileCurve = (((mouthMidY - (lMouth.y + rMouth.y) * 0.5f)) / (eyeDist * 0.15f)).coerceIn(-0.5f, 0.8f)
 
-        return ReconstructedFace3D(
+        val baseRecon = ReconstructedFace3D(
             landmarks106 = pts106,
             vertices3D = verts3D,
             headPose = headPose,
@@ -518,6 +519,9 @@ object Face3DReconstruction {
             noseProjectionCoeff = noseProjCoeff,
             mouthOpenRatio = (innerRy / eyeDist).coerceIn(0.02f, 0.35f),
             smileCurvatureCoeff = smileCurve
+        )
+        return baseRecon.copy(
+            anatomicalPoints34 = LatentFeatureFusionEngine.extract34NamedAnatomicalPoints(baseRecon)
         )
     }
 

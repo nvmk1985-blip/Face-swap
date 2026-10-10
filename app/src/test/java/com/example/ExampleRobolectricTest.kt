@@ -702,7 +702,12 @@ class ExampleRobolectricTest {
 
         // Obtain the winning candidate C (hyperswap_1b_256.onnx) raw 256x256 swap output and run the exact production FaceBlender 512x512 pipeline
         val tSwap0 = System.currentTimeMillis()
-        val srcCrop256 = FaceAlignment.warpAffineCrop(srcPair.first, m256Src, 256)
+        val srcCrop256 = FaceAlignment.warpSourceToTargetPose(
+            sourceBitmap = srcPair.first,
+            sourceLandmarks5 = srcPair.second.landmarks5,
+            targetLandmarks5 = tgtPair.second.landmarks5,
+            dstSize = 256
+        )
         val tgtCrop256 = FaceAlignment.warpAffineCrop(tgtPair.first, m256Tgt, 256)
         val rawHyperSwap1b256 = com.example.onnx.VisualValidationBenchmark.synthesizeRawSwapCandidateCrop(
             candidate = com.example.onnx.SwapModelCandidate.C_HYPERSWAP_1B_256,

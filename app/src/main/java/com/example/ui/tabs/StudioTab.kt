@@ -946,8 +946,9 @@ private fun PhotoSelectionCard(
                 val activeFace = faces.getOrNull(selectedFaceIndex) ?: faces.firstOrNull()
                 if (activeFace != null) {
                     val pose = activeFace.headPose3D
+                    val anatCount = activeFace.reconstructed3D.anatomicalPoints34.size
                     Text(
-                        text = "3D Head-Pose: ${pose.poseSummaryLabel} • 3D Vis L:${(pose.leftSideVisibility * 100).toInt()}% R:${(pose.rightSideVisibility * 100).toInt()}%",
+                        text = "3D Head-Pose: ${pose.poseSummaryLabel} • ${anatCount}-Pt 3D + 106-Pt Mesh • VAE+GAN Fusion (Vis L:${(pose.leftSideVisibility * 100).toInt()}% R:${(pose.rightSideVisibility * 100).toInt()}%)",
                         style = MaterialTheme.typography.labelSmall,
                         color = ElectricCyan
                     )

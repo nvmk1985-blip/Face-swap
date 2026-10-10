@@ -278,25 +278,25 @@ object FaceAlignment {
         val srcPts5 = List(5) { i -> mapPt(mSrc, sourceLandmarks5[i]) }
         val tgtPts5 = List(5) { i -> mapPt(mTgt, targetLandmarks5[i]) }
 
-        // Reconstruct 106-point dense 3D meshes and 3D Head-Poses in canonical crop space
+        // Reconstruct 106-point dense 3D meshes, 34 Named Anatomical Feature Points, and 3D Head-Poses
         val srcRecon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(srcPts5)
         val tgtRecon3D = Face3DReconstruction.reconstruct3DFaceAnd106Landmarks(tgtPts5)
         val srcPts106 = srcRecon3D.landmarks106
         val tgtPts106 = tgtRecon3D.landmarks106
         val tgtVerts3D = tgtRecon3D.vertices3D
+        val tgtAnatByIdx = tgtRecon3D.anatomicalPoints34.associateBy { it.pointType.index106 }
 
-        // Select 36 evenly distributed 3D-pose-aware control points from the 106-point topology
-        // (jawline/chin, eyebrows, eye canthi/iris, nose bridge/alar wings, outer/inner lips)
+        // Select 13 well-separated 3D anatomical anchors from the 34/106-point topology
+        // (Jawline/Chin, Eyebrow Midpoints, Eye/Orbital Centers, Glabella/NoseBridge, NoseTip, MouthCorners & Oral Center)
         val sampledIndices = intArrayOf(
-            0, 4, 8, 12, 16, 20, 24, 28, 32,   // 9 Jawline & Chin Contour points
-            33, 35, 37, 43, 45, 47,            // 6 Left & Right Eyebrow Arch points
-            53, 55, 57, 59, 61,                // 5 Left Eye Canthi, Lids & Iris Center
-            63, 65, 67, 69, 71,                // 5 Right Eye Canthi, Lids & Iris Center
-            73, 76, 77, 81, 85,                // 5 Nose Nasion, Tip, Left/Right Alar Wings & Subnasale
-            86, 89, 92, 95, 100, 104           // 6 Mouth Corners, Cupid's Bow, Lower Lip & Inner Oral Center
+            3, 9, 16, 23, 29,     // 5 Jawline & Chin Contour anchors (RJawEnd, Chin, LJawEnd)
+            35, 45,               // 2 REyebrowMid & LEyebrowMid anchors
+            61, 71,               // 2 Right & Left Orbital/Eye Centers
+            73, 76,               // 2 Glabella/NoseBridge & NoseTip anchors
+            86, 92, 100           // 3 RMouthCorner, LMouthCorner & Lip Center anchors
         )
         val numCtrl = sampledIndices.size
-        val maxShift = dstSize * 0.22f
+        val maxShift = dstSize * 0.075f
         val ctrlTgtX = FloatArray(numCtrl)
         val ctrlTgtY = FloatArray(numCtrl)
         val ctrlWeight = FloatArray(numCtrl)
@@ -308,20 +308,27 @@ object FaceAlignment {
             val sPt = srcPts106[idx106]
             val tPt = tgtPts106[idx106]
             val tVert = tgtVerts3D[idx106]
+            val anatVis = tgtAnatByIdx[idx106]?.visibility ?: tVert.nz
             ctrlTgtX[i] = tPt.x
             ctrlTgtY[i] = tPt.y
-            // Weight each 106-point anchor by its 3D surface normal visibility (nz) so foreshortened side-view edges never over-stretch
-            ctrlWeight[i] = tVert.nz.coerceIn(0.35f, 1.0f)
-            dispX[i] = ((sPt.x - tPt.x) * ctrlWeight[i]).coerceIn(-maxShift, maxShift)
-            dispY[i] = ((sPt.y - tPt.y) * ctrlWeight[i]).coerceIn(-maxShift, maxShift)
+            // Weight each 3D anatomical anchor by its self-occlusion visibility and damp nose-tip horizontal shear
+            val poseDamp = when (idx106) {
+                76 -> 0.45f
+                3, 9, 16, 23, 29 -> 0.55f
+                else -> 0.78f
+            }
+            ctrlWeight[i] = anatVis.coerceIn(0.45f, 1.0f)
+            dispX[i] = ((sPt.x - tPt.x) * ctrlWeight[i] * poseDamp).coerceIn(-maxShift, maxShift)
+            dispY[i] = ((sPt.y - tPt.y) * ctrlWeight[i] * poseDamp).coerceIn(-maxShift, maxShift)
         }
 
-        // Evaluate smooth 3D-pose-weighted Radial-Basis displacement on a 32x32 control grid
+        // Evaluate smooth 3D-pose-weighted Gaussian Radial-Basis displacement on a 32x32 control grid
+        // with wide regularization (eps = 0.14 * dstSize) so neighboring features never pinch or fold
         val gridDiv = 32
         val gridSize = gridDiv + 1
         val step = dstSize.toFloat() / gridDiv.toFloat()
-        val sigmaSq = (dstSize * 0.13f) * (dstSize * 0.13f)
-        val epsSq = (dstSize * 0.016f) * (dstSize * 0.016f)
+        val sigmaSq = (dstSize * 0.24f) * (dstSize * 0.24f)
+        val epsSq = (dstSize * 0.14f) * (dstSize * 0.14f)
         val gridSrcX = FloatArray(gridSize * gridSize)
         val gridSrcY = FloatArray(gridSize * gridSize)
         val halfS = dstSize * 0.5f
@@ -335,12 +342,12 @@ object FaceAlignment {
                     kotlin.math.abs(xf - halfS) / halfS,
                     kotlin.math.abs(yf - halfS) / halfS
                 )
-                val borderTaper = if (borderNorm <= 0.72f) {
+                val borderTaper = if (borderNorm <= 0.68f) {
                     1.0f
-                } else if (borderNorm >= 0.98f) {
+                } else if (borderNorm >= 0.96f) {
                     0.0f
                 } else {
-                    val t = (borderNorm - 0.72f) / 0.26f
+                    val t = (borderNorm - 0.68f) / 0.28f
                     (0.5f * (1.0 + cos(Math.PI * t))).toFloat()
                 }
 
@@ -407,7 +414,7 @@ object FaceAlignment {
                     w01 * gridSrcY[gRow1 + gx0] +
                     w11 * gridSrcY[gRow1 + gx1]
 
-                dstPixels[dstRow + dx] = sampleBilinearClamped(srcPixels, srcW, srcH, sx, sy)
+                dstPixels[dstRow + dx] = sampleBicubicClamped(srcPixels, srcW, srcH, sx, sy)
             }
         }
 

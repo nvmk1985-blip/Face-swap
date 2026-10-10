@@ -267,10 +267,15 @@ object InSwapperEngine {
         val srcM256 = FaceAlignment.estimateNorm(sourceFace.landmarks5, DEFAULT_SWAP_SIZE)
         val alignedSource256 = FaceAlignment.warpAffineCrop(sourceBitmap, srcM256, DEFAULT_SWAP_SIZE)
 
+        var activeSwapFile = swapFile
         val executeWithSwapSession: (OrtSession?) -> Unit = { swapSession ->
             var targetInputName = "target"
             var sourceInputName = "source"
-            var detectedCropSize = DEFAULT_SWAP_SIZE
+            var detectedCropSize = if (activeSwapFile.name.lowercase().contains("128")) {
+                CANONICAL_ALIGN_SIZE
+            } else {
+                DEFAULT_SWAP_SIZE
+            }
             if (swapSession != null) {
                 for ((name, nodeInfo) in swapSession.inputInfo) {
                     val tInfo = nodeInfo.info as? ai.onnxruntime.TensorInfo ?: continue
@@ -492,11 +497,29 @@ object InSwapperEngine {
             executeWithSwapSession(preloadedSwapSession)
         } else if (swapFile.exists() && swapFile.length() > 1024L) {
             val tLoad0 = System.currentTimeMillis()
-            val cachedSession = OnnxProtobufInspector.getOrCreateCachedSession(
+            var cachedSession = OnnxProtobufInspector.getOrCreateCachedSession(
                 ortEnv = ortEnv,
                 file = swapFile,
                 preferHardwareAcceleration = preferHardwareAccel
             )
+            if (cachedSession == null) {
+                val siblingCandidates = swapFile.parentFile?.listFiles()
+                    ?.filter { it.isFile && it.name.endsWith(".onnx", ignoreCase = true) && it.absolutePath != swapFile.absolutePath && it.length() > 1024L }
+                    ?.sortedByDescending { it.length() }
+                    .orEmpty()
+                for (sibling in siblingCandidates) {
+                    val altSession = OnnxProtobufInspector.getOrCreateCachedSession(
+                        ortEnv = ortEnv,
+                        file = sibling,
+                        preferHardwareAcceleration = preferHardwareAccel
+                    )
+                    if (altSession != null) {
+                        activeSwapFile = sibling
+                        cachedSession = altSession
+                        break
+                    }
+                }
+            }
             totalModelLoadingMs += (System.currentTimeMillis() - tLoad0)
             executeWithSwapSession(cachedSession)
         } else {

@@ -264,6 +264,19 @@ fun FaceDetectionCanvas(
                     }
                 }
 
+                // Highlight the 34 Named 3D Anatomical Feature Points (NoseBridge, NoseTip, NostrilBulges, LipUpper, Puffers, Chin, JawEnds)
+                val anat34 = face.reconstructed3D.anatomicalPoints34
+                anat34.forEach { anatPt ->
+                    val px = offsetX + anatPt.x * scale
+                    val py = offsetY + anatPt.y * scale
+                    val visAlpha = (anatPt.visibility * (if (isSelected) 0.95f else 0.55f)).coerceIn(0.25f, 1.0f)
+                    drawCircle(
+                        color = Color(0xFF00E5FF).copy(alpha = visAlpha),
+                        radius = if (isSelected) 2.2.dp.toPx() else 1.5.dp.toPx(),
+                        center = Offset(px, py)
+                    )
+                }
+
                 // Highlight the 5 primary anchor keypoints (Iris Centers, Nose Tip, Mouth Corners)
                 face.landmarks5.forEachIndexed { ptIdx, pt ->
                     val px = offsetX + pt.x * scale

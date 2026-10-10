@@ -134,9 +134,13 @@ object VisualValidationBenchmark {
         val candidateOutputs = SwapModelCandidate.entries.mapIndexed { idx, candidate ->
             val t0 = System.currentTimeMillis()
             val nativeRes = candidate.nativeResolution
-            val mNativeSrc = FaceAlignment.estimateNorm(sourceFace.landmarks5, nativeRes)
             val mNativeTgt = FaceAlignment.estimateNorm(targetFace.landmarks5, nativeRes)
-            val srcCropNative = FaceAlignment.warpAffineCrop(sourceBitmap, mNativeSrc, nativeRes)
+            val srcCropNative = FaceAlignment.warpSourceToTargetPose(
+                sourceBitmap = sourceBitmap,
+                sourceLandmarks5 = sourceFace.landmarks5,
+                targetLandmarks5 = targetFace.landmarks5,
+                dstSize = nativeRes
+            )
             val tgtCropNative = FaceAlignment.warpAffineCrop(targetBitmap, mNativeTgt, nativeRes)
 
             // Synthesize raw neural swap crop at model's native resolution (128x128 for A, 256x256 for B/C/D)
@@ -378,8 +382,8 @@ object VisualValidationBenchmark {
         }
 
         val cx = cropSize * 0.50f
-        val cy = cropSize * 0.53f
-        val rx = cropSize * 0.40f
+        val cy = cropSize * 0.56f
+        val rx = cropSize * 0.41f
         val ry = cropSize * 0.43f
 
         // Canonical 128-normalized coordinates scaled to cropSize
@@ -390,7 +394,7 @@ object VisualValidationBenchmark {
         val rEyeY = 51.5014f * scale
         val eyeIrisRx = 6.8f * scale
         val eyeIrisRy = 4.0f * scale
-        val lowPassStep = (cropSize / 18).coerceAtLeast(5)
+        val lowPassStep = (cropSize / 12).coerceAtLeast(8)
 
         fun sampleLowPassRGB(px: IntArray, x: Int, y: Int): FloatArray {
             val xL = (x - lowPassStep).coerceIn(0, cropSize - 1)
@@ -431,21 +435,37 @@ object VisualValidationBenchmark {
                     outPx[idx] = tgtPx[idx]
                     continue
                 }
-                val mask = if (r <= 0.62f) {
+                val mask = if (r <= 0.72f) {
                     1.0f
                 } else {
-                    val t = (r - 0.62f) / 0.38f
+                    val t = (r - 0.72f) / 0.28f
                     (0.5f * (1.0f + cos(Math.PI * t))).toFloat()
                 }
 
                 val sc = srcPx[idx]
                 val tc = tgtPx[idx]
-                val sR = (sc ushr 16) and 0xFF
-                val sG = (sc ushr 8) and 0xFF
-                val sB = sc and 0xFF
+                var sR = (sc ushr 16) and 0xFF
+                var sG = (sc ushr 8) and 0xFF
+                var sB = sc and 0xFF
                 val tR = (tc ushr 16) and 0xFF
                 val tG = (tc ushr 8) and 0xFF
                 val tB = tc and 0xFF
+
+                val sLow = sampleLowPassRGB(srcPx, x, y)
+                val tLow = sampleLowPassRGB(tgtPx, x, y)
+
+                // Heal any isolated Source forehead bindi / kungumam spot above the eyebrows (yf < 43*scale, central forehead)
+                // so a donor forehead mark never stamps onto the target forehead
+                if (yf < 43f * scale && xf in (48f * scale)..(80f * scale)) {
+                    val rawSLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
+                    val lowSLum = 0.299f * sLow[0] + 0.587f * sLow[1] + 0.114f * sLow[2]
+                    val isSourceForeheadMark = (rawSLum < lowSLum - 14f) || ((sR - sG) > (sLow[0] - sLow[1]) + 16f)
+                    if (isSourceForeheadMark) {
+                        sR = sLow[0].toInt().coerceIn(0, 255)
+                        sG = sLow[1].toInt().coerceIn(0, 255)
+                        sB = sLow[2].toInt().coerceIn(0, 255)
+                    }
+                }
 
                 // Inner Ocular Iris/Sclera Gaze Protection (prevents double-pupil ghosting when gaze differs)
                 val lIrisD = ((xf - lEyeX) / eyeIrisRx) * ((xf - lEyeX) / eyeIrisRx) +
@@ -462,26 +482,25 @@ object VisualValidationBenchmark {
                 // Outside the eyes/eyebrows (y in 28..58*scale), reject non-skin foreign colors (e.g. green blouse
                 // where sG > sR, blue background where sB > sR + 6, or outer Source hair on the cheek perimeter)
                 val isOcularOrBrowZone = yf in (26f * scale)..(60f * scale) && xf in (26f * scale)..(102f * scale)
-                val isForeignNonSkin = !isOcularOrBrowZone && (sG > sR + 2 || sB > sR + 8)
+                val isCentralNoseOrMouth = yf in (58f * scale)..(104f * scale) && xf in (38f * scale)..(90f * scale)
+                val isForeignNonSkin = !isOcularOrBrowZone && !isCentralNoseOrMouth && (sG > sR + 2 || sB > sR + 8)
                 val sLum = 0.299f * sR + 0.587f * sG + 0.114f * sB
                 val tLum = 0.299f * tR + 0.587f * tG + 0.114f * tB
-                val isOuterSourceHair = !isOcularOrBrowZone && r > 0.44f && sLum < 52f && tLum > sLum + 24f
+                val isOuterSourceHair = !isOcularOrBrowZone && !isCentralNoseOrMouth && r > 0.52f && sLum < 52f && tLum > sLum + 24f
                 val sourceValidityGate = when {
                     isForeignNonSkin -> 0.0f
-                    isOuterSourceHair -> (1.0f - ((52f - sLum) / 38f) * ((r - 0.44f) / 0.56f)).coerceIn(0.10f, 1.0f)
+                    isOuterSourceHair -> (1.0f - ((52f - sLum) / 38f) * ((r - 0.52f) / 0.48f)).coerceIn(0.10f, 1.0f)
                     else -> 1.0f
                 }
 
                 // Frequency-separated synthesis:
-                // Use 100% of Source's high-frequency anatomical structure (single nose, single eyebrows, single eyelids)
-                // combined with smooth low-frequency 3D pose shading so Target's high-frequency nose/eyes NEVER ghost!
-                val sLow = sampleLowPassRGB(srcPx, x, y)
-                val tLow = sampleLowPassRGB(tgtPx, x, y)
+                // Use 100% of Source's high-frequency anatomical structure (single nose, single eyebrows, single eyelids, single lips)
+                // combined with smooth low-frequency 3D pose shading so Target's high-frequency nose/eyes/lips NEVER ghost!
                 val sHighR = (sR - sLow[0]) * detailPreservation
                 val sHighG = (sG - sLow[1]) * detailPreservation
                 val sHighB = (sB - sLow[2]) * detailPreservation
 
-                val shadeMix = 0.22f
+                val shadeMix = 0.24f
                 val innerR = (sLow[0] * (1f - shadeMix) + tLow[0] * shadeMix + sHighR).coerceIn(0f, 255f)
                 val innerG = (sLow[1] * (1f - shadeMix) + tLow[1] * shadeMix + sHighG).coerceIn(0f, 255f)
                 val innerB = (sLow[2] * (1f - shadeMix) + tLow[2] * shadeMix + sHighB).coerceIn(0f, 255f)
